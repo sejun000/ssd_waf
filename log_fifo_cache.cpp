@@ -2,10 +2,11 @@
 #include <cassert>
 #include <algorithm>
 
-#define EVICTED_BLOCK_SIZE (16) // 64k
+//#define EVICTED_BLOCK_SIZE (16) // 64k
+#define EVICTED_BLOCK_SIZE (1) // 64k
 
-LogFIFOCache::LogFIFOCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file)
-    : ICache(cold_capacity), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace),
+LogFIFOCache::LogFIFOCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file)
+    : ICache(cold_capacity, waf_log_file), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace),
       write_ptr(0), old_write_ptr(0)
 {
     if (cache_trace) {
@@ -86,6 +87,9 @@ void LogFIFOCache::batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op
                 log_buffer[pos].valid = false;
                 mapping.erase(it);
             }
+        }
+        else{
+            _invalidate_cold_block(key * cache_block_size, lba_size, OP_TYPE::TRIM);
         }
         // 새 항목 삽입 전에, write_ptr 위치가 유효하면 그룹 전체 evict
         if (log_buffer[write_ptr].valid) {

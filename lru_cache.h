@@ -10,7 +10,7 @@
 class LRUCache : public ICache {
 public:
     // 생성자: capacity는 블록 단위 최대 개수
-    LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file);
+    LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file);
     ~LRUCache();
 
     void evict_one_block();

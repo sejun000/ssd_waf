@@ -3,7 +3,7 @@
 
 #define EVICTED_BLOCK_SIZE (16) // 64k
 
-FIFOCache::FIFOCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file) : ICache(cold_capacity), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace), allocator(capacity * _cache_block_size, _cache_block_size) {
+FIFOCache::FIFOCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_name) : ICache(cold_capacity, waf_log_name), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace), allocator(capacity * _cache_block_size, _cache_block_size) {
     cache_trace_fp = nullptr;
     printf("FIFO cache created with capacity: %ld\n", capacity);
     if (cache_trace) {

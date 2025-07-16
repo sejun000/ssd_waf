@@ -4,7 +4,7 @@
 
 class NoCache : public ICache {
 public:
-    NoCache(uint64_t cold_capacity, int cache_block_size) : ICache(cold_capacity), cache_block_size(cache_block_size) {
+    NoCache(uint64_t cold_capacity, int cache_block_size, std::string& waf_log_file) : ICache(cold_capacity, waf_log_file), cache_block_size(cache_block_size) {
         // NoCache는 캐시를 사용하지 않으므로 cold_capacity는 무시됩니다.
     }
     ~NoCache(){}

@@ -32,7 +32,7 @@ void signal_handler(int signum) {
         }
         std::cerr << '\n';
     }
-    std::_Exit(EXIT_FAILURE);
+    exit(signum);
 }
 
 // LRU 정책: 주어진 lba 범위의 블록들을 캐시에 추가
@@ -108,6 +108,7 @@ int main(int argc, char* argv[]) {
     std::string cache_trace_output = "";
     std::string cold_trace_output = "";
     std::string cache_policy = "LRU";
+    std::string waf_log_file = "";
     bool cache_trace = false;
     uint64_t cold_capacity = 0;
 
@@ -130,7 +131,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--cold_capacity" && i + 1 < argc) {
             // cold_capacity는 바이트 단위로 입력받음
             cold_capacity = std::stoll(argv[++i]); 
-        } else {
+        } else if (arg == "--waf_log_file" && i + 1 < argc) {
+            waf_log_file = argv[++i];
+        }else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             return 1;
         }
@@ -150,7 +153,7 @@ int main(int argc, char* argv[]) {
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    ICache* cache = createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output);
+    ICache* cache = createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file);
     // 통계 변수 초기화
     long long total_read = 0, total_write = 0;
     long long total_read_size = 0, total_write_size = 0;
@@ -166,8 +169,8 @@ int main(int argc, char* argv[]) {
     
     std::string line;
     long long line_count = 0;
-    const long long line_count_limit = 2700000000000000ULL;
-    const long long cache_write_size_limit = 15949828171264;
+    const long long line_count_limit = 270000000000000000ULL;
+    const long long cache_write_size_limit = 15000000000000ULL;
     
     while (std::getline(infile, line) && line_count < line_count_limit) {
         line_count++;

@@ -22,7 +22,7 @@ public:
      * @param _cache_trace: 캐시 trace 기록 여부
      * @param trace_file: trace 기록 파일 경로
      */
-    LogFIFOCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file);
+    LogFIFOCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_name);
     virtual ~LogFIFOCache();
 
     bool exists(long key) override;

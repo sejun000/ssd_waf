@@ -1,7 +1,7 @@
 #include "lru_cache.h"
 #include <cassert>
 
-LRUCache::LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file) : ICache(cold_capacity), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace), allocator(capacity * _cache_block_size, _cache_block_size) {
+LRUCache::LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file) : ICache(cold_capacity, waf_log_file), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace), allocator(capacity * _cache_block_size, _cache_block_size) {
     cache_trace_fp = nullptr;
     //printf("LRU cache created with capacity: %ld\n", capacity);
     if (cache_trace) {

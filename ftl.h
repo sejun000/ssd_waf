@@ -13,8 +13,8 @@
 // ---------------------------------------------------------------------------
 // Tunable geometry parameters (override before including if you wish)
 // ---------------------------------------------------------------------------
-#ifndef PAGE_SIZE
-#define PAGE_SIZE          (4 * 1024)            // bytes – 4 KiB mapping granularity
+#ifndef NAND_PAGE_SIZE
+#define NAND_PAGE_SIZE          (4 * 1024)            // bytes – 4 KiB mapping granularity
 #endif
 #ifndef SECTOR_SIZE
 #define SECTOR_SIZE        512                   // bytes – typical logical sector (LBA)
@@ -22,17 +22,14 @@
 #ifndef NAND_BLOCK_SIZE
 #define NAND_BLOCK_SIZE         (32 * 1024 * 1024)    // bytes – 32 MiB physical block
 #endif
-#ifndef TOTAL_BLOCKS
-#define TOTAL_BLOCKS       1024                  // 1024 × 32 MiB ≈ 32 GiB SSD
-#endif
+
 #define NOT_ALLOCATED 0xFFFFFFFFFFFFFFFFULL
-#define ONE_GB (1 * 1024ULL * 1024ULL * 1024ULL / PAGE_SIZE)
 #define GC_TRIGGER_THRESHOLD (4)
 // ---------------------------------------------------------------------------
 // Derived constants (do not touch)
 // ---------------------------------------------------------------------------
-static constexpr uint64_t SECTORS_PER_PAGE = PAGE_SIZE / SECTOR_SIZE;
-static constexpr uint64_t PAGES_PER_BLOCK  = NAND_BLOCK_SIZE / PAGE_SIZE;
+static constexpr uint64_t SECTORS_PER_PAGE = NAND_PAGE_SIZE / SECTOR_SIZE;
+static constexpr uint64_t PAGES_PER_BLOCK  = NAND_BLOCK_SIZE / NAND_PAGE_SIZE;
 
 using u64 = uint64_t;
 
@@ -81,24 +78,12 @@ public:
     using Handle = Heap::handle_type;
     Heap minHeap;
     std::vector<Handle> handle; 
-    GreedyGcPolicy() : handle(TOTAL_BLOCKS, Heap::handle_type()) {}
+    GreedyGcPolicy(u64 total_bytes) : handle(total_bytes / NAND_BLOCK_SIZE , Heap::handle_type()) { total_blocks = total_bytes / NAND_BLOCK_SIZE; }
     u64 ChooseVictim(const std::vector<Block>& blocks,
                      const std::vector<u64>& freePool) override;
 
-    void OnValidChange(uint64_t id, uint64_t newLive) {
-        if (handle[id] == Heap::handle_type()) {            // 아직 없음
-            if (newLive > 0)
-                handle[id] = minHeap.push({newLive, id});
-            return;
-        }
-        if (newLive <= 0) {                   // ★ 즉시 삭제
-            minHeap.erase(handle[id]);
-            handle[id] = Heap::handle_type();
-        } else {                                            // key update
-            minHeap.update(handle[id], {newLive, id});
-        }
-        minHeap.push({newLive, id});
-    }
+    void OnValidChange(uint64_t id, uint64_t newLive);
+    u64 total_blocks;
 };
 
 // ---------------------------------------------------------------------------
@@ -107,27 +92,31 @@ public:
 class PageMappingFTL {
 public:
     explicit PageMappingFTL(u64 totalBytes,
-                            IGcPolicy* policy, std::string wafLogFileName);
+                            IGcPolicy* policy);
 
     void Write(u64 lbaOffset, u64 byteSize, int streamId);
     void Trim (u64 lbaOffset, u64 byteSize);
-
     void PrintStats() const;
-    void PrintWafs();
+    u64 GetHostWritePages();
+    u64 GetNandWritePages();
 
 private:
     // helpers
+    u64 GetPpn(u64 lpn);
+    u64 GetLpn(u64 ppn);
+    void Unmap(u64 lpn);
+    void SetPpn(u64 lpn, u64 ppn);
     void InvalidatePpn(u64 ppn);
     u64  AllocateNewGCActiveBlock(int streamId);
     u64  AllocateNewActiveBlock(int streamId);
     u64  GetOrAllocateGCActiveBlock(int streamId) ;
     u64  GetOrAllocateActiveBlock(int streamId);
     void RunGC();
-    u64  FindLpnByPpn(u64 ppn) const;
 
     // state
     std::vector<Block>                       blocks_;
-    std::unordered_map<u64,u64>              lpnToPpn_;
+    u64*              lpnToPpn_;
+    u64*               ppnToLpn_;
     std::vector<u64>                         freePool_;
     std::unordered_map<int,u64>              activeBlk_;
     std::unordered_map<int,u64>              gcActiveBlk_;
@@ -135,7 +124,7 @@ private:
 
     u64 nand_write_pages;
     u64 host_write_pages;
-    u64 next_write_pages;
+    u64 total_nand_pages;
 
     FILE *wafLogFile = NULL;
 };
