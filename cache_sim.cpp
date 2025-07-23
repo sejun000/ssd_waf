@@ -53,7 +53,7 @@ void issue_op_to_cache(ICache& cache, long long lba_offset, int lba_size, OP_TYP
         }
         newBlocks[block] = right_offset - left_offset;
     }
-    cache.batch_insert(newBlocks, op_type);
+    cache.batch_insert(0, newBlocks, op_type);
 }
 
 // Read/Write hit ratio 계산 (퍼센트)

@@ -3,7 +3,10 @@
 #include "fifo_cache.h"
 #include "log_fifo_cache.h"
 #include "no_cache.h"
+#include "log_cache.h"
+#include "evict_policy_fifo.h"
 #include "ftl.h"
+#include "istream.h"
 #include <cassert>
 #include <string>
 
@@ -21,19 +24,33 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     else if (cache_type == "NO_CACHE") {
         return new NoCache(cold_capacity, cache_block_size, waf_log_file);
     }
+    else if (cache_type == "LOG_GREEDY") {
+        return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file);
+    }
+    else if (cache_type == "LOG_FIFO_SEPBIT") {
+        IStream *input_stream_policy = createIstreamPolicy("sepbit");
+        return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>(), nullptr, input_stream_policy);
+    }
+    else if (cache_type == "LOG_GREEDY_SEPBIT"){
+        IStream *input_stream_policy = createIstreamPolicy("sepbit");
+        return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<GreedyEvictPolicy>(), nullptr, input_stream_policy);
+    }
+    else if (cache_type == "LOG_FIFO") {
+        return new LogFIFOCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file);
+    }
     else {
         assert(false);
     }
     return nullptr;
 }
 
-ICache::ICache(uint64_t cold_capacity, std::string& waf_log_file):ftl(cold_capacity, new GreedyGcPolicy(cold_capacity)) {
+ICache::ICache(uint64_t cold_capacity, const std::string& waf_log_file):ftl(cold_capacity, new GreedyGcPolicy(cold_capacity)) {
     write_size_to_cache = 0;
     evicted_blocks = 0;
     write_hit_size = 0;
     next_write_size_to_cache = TEN_GB;
     fp = fopen(waf_log_file.c_str(), "w");
-    //printf("%s\n",waf_log_file.c_str());
+    printf("%s\n",waf_log_file.c_str());
     assert(fp != NULL);
 }
 
@@ -45,6 +62,7 @@ void ICache::_evict_one_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type
     if (write_size_to_cache > next_write_size_to_cache) {
         next_write_size_to_cache += TEN_GB;
         fprintf(fp, "%lld %lld %ld %ld\n", write_size_to_cache, evicted_blocks * get_block_size(), ftl.GetHostWritePages() * NAND_PAGE_SIZE, ftl.GetNandWritePages() * NAND_PAGE_SIZE);
+        fflush(fp);
     }
 }
 

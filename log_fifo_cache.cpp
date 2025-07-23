@@ -75,7 +75,7 @@ void LogFIFOCache::evict_one_block(){
     }
 }
 
-void LogFIFOCache::batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op_type) {
+void LogFIFOCache::batch_insert(int streamd_id, const std::map<long, int> &newBlocks, OP_TYPE op_type) {
     old_write_ptr = write_ptr;
     for (auto iter : newBlocks) {
         long key = iter.first;

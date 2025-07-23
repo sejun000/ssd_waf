@@ -10,6 +10,8 @@
 //#include <queue>
 #include <boost/heap/d_ary_heap.hpp>
 
+#include "segment.h"
+
 // ---------------------------------------------------------------------------
 // Tunable geometry parameters (override before including if you wish)
 // ---------------------------------------------------------------------------
@@ -36,16 +38,15 @@ using u64 = uint64_t;
 // ---------------------------------------------------------------------------
 // Block metadata
 // ---------------------------------------------------------------------------
-struct Block {
+struct Block : public Segment {
     u64 id;
     std::vector<bool> valid;
-    u64 writePtr    = 0;
-    u64 validCount  = 0;
     bool isFree     = true;
 
     explicit Block(u64 id_);
 
-    bool Full() const;
+    void reset() override;
+    bool full() override;
     u64  NextPpn() const;
 };
 

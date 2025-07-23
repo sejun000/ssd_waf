@@ -96,7 +96,7 @@ void LRUCache::evict_one_block() {
     fprintf(cold_trace_fp, "%ld,%s,%ld,%d,%ld\n", DUMMY_VALUE, "W", oldest * cache_block_size, cache_block_size, DUMMY_VALUE);
 }
 
-void LRUCache::batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op_type) {
+void LRUCache::batch_insert(int stream_id, const std::map<long, int> &newBlocks, OP_TYPE op_type) {
     for (auto iter : newBlocks) {
         long block = iter.first;
         int lba_size = iter.second;

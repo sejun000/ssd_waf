@@ -10,7 +10,7 @@ public:
     ~NoCache(){}
     bool exists(long key) override { return false; }
     void touch(long key, OP_TYPE op_type) override { /* No operation */ }
-    void batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op_type) override {
+    void batch_insert(int stream_id, const std::map<long, int> &newBlocks, OP_TYPE op_type) override {
         for (const auto& iter : newBlocks) {
             long block = iter.first;
             int lba_size = iter.second;

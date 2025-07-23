@@ -9,11 +9,18 @@
 #include <cstring> 
 
 // ---------------- Block helpers ----------------
-Block::Block(u64 id_) : id(id_), valid(PAGES_PER_BLOCK,false) {}
+Block::Block(u64 id_) : Segment(0), id(id_), valid(PAGES_PER_BLOCK,false) {}
 
-bool Block::Full() const { return writePtr >= PAGES_PER_BLOCK; }
+void Block::reset() {  
+    isFree = true;      
+    write_ptr = 0;
+    valid_cnt = 0;
+}
+bool Block::full() { 
+    return write_ptr >= PAGES_PER_BLOCK; 
+}
 
-u64 Block::NextPpn() const { return id * PAGES_PER_BLOCK + writePtr; }
+u64 Block::NextPpn() const { return id * PAGES_PER_BLOCK + write_ptr; }
 
 
 void GreedyGcPolicy::OnValidChange(uint64_t id, uint64_t newLive) {
@@ -70,8 +77,8 @@ void PageMappingFTL::InvalidatePpn(u64 ppn) {
     Block& blk = blocks_[blkId];
     if (blk.valid[pageIdx]) {
         blk.valid[pageIdx] = false;
-        --blk.validCount;
-        gcPolicy_->OnValidChange(blkId, blk.validCount);
+        --blk.valid_cnt;
+        gcPolicy_->OnValidChange(blkId, blk.valid_cnt);
     }
 }
 
@@ -124,16 +131,16 @@ void PageMappingFTL::Write(u64 lbaOffset, u64 byteSize, int streamId) {
         InvalidatePpn(old);
 
         u64 blkId = GetOrAllocateActiveBlock(streamId);
-        if (blocks_[blkId].Full()) {
+        if (blocks_[blkId].full()) {
             assert(false);
         }
         Block& ab = blocks_[blkId];
         u64 ppn = ab.NextPpn();
-        ab.valid[ab.writePtr] = true;
-        ++ab.validCount;
-        ++ab.writePtr;
-        if (ab.Full()) {
-            gcPolicy_->OnValidChange(ab.id, ab.validCount);
+        ab.valid[ab.write_ptr] = true;
+        ++ab.valid_cnt;
+        ++ab.write_ptr;
+        if (ab.full()) {
+            gcPolicy_->OnValidChange(ab.id, ab.valid_cnt);
         }
         ab.isFree = false;
         SetPpn(curLpn, ppn);
@@ -171,14 +178,14 @@ void PageMappingFTL::PrintStats() const {
 // ---------------- helper paths -----------------
 u64 PageMappingFTL::GetOrAllocateActiveBlock(int streamId) {
     auto it = activeBlk_.find(streamId);
-    if (it!=activeBlk_.end() && !blocks_[it->second].Full()) return it->second;
+    if (it!=activeBlk_.end() && !blocks_[it->second].full()) return it->second;
     return AllocateNewActiveBlock(streamId);
 }
 
 // ---------------- helper paths -----------------
 u64 PageMappingFTL::GetOrAllocateGCActiveBlock(int streamId) {
     auto it = gcActiveBlk_.find(streamId);
-    if (it!=gcActiveBlk_.end() && !blocks_[it->second].Full()) return it->second;
+    if (it!=gcActiveBlk_.end() && !blocks_[it->second].full()) return it->second;
     return AllocateNewGCActiveBlock(streamId);
 }
 
@@ -189,8 +196,8 @@ u64 PageMappingFTL::AllocateNewActiveBlock(int streamId) {
     u64 blkId = freePool_.back();
     freePool_.pop_back();
     Block& b = blocks_[blkId];
-    b.writePtr = 0;
-    b.validCount = 0;
+    b.write_ptr = 0;
+    b.valid_cnt = 0;
     b.isFree = false;
     std::fill(b.valid.begin(), b.valid.end(), false);
     activeBlk_[streamId] = blkId;
@@ -203,8 +210,8 @@ u64 PageMappingFTL::AllocateNewGCActiveBlock(int streamId) {
     u64 blkId = freePool_.back();
     freePool_.pop_back();
     Block& b = blocks_[blkId];
-    b.writePtr = 0;
-    b.validCount = 0;
+    b.write_ptr = 0;
+    b.valid_cnt = 0;
     b.isFree = false;
     std::fill(b.valid.begin(), b.valid.end(), false);
     gcActiveBlk_[streamId] = blkId;
@@ -223,7 +230,7 @@ void PageMappingFTL::RunGC() {
     for (u64 idx = 0; idx < PAGES_PER_BLOCK; ++idx) {
         if (!src.valid[idx]) continue;
         u64 blkId = GetOrAllocateGCActiveBlock(0);
-        if (blocks_[blkId].Full()) {
+        if (blocks_[blkId].full()) {
             assert(false);
         }
         Block& dest = blocks_[blkId];
@@ -233,17 +240,15 @@ void PageMappingFTL::RunGC() {
         assert (lpn != NOT_ALLOCATED);
 
         // copy to dest
-        u64 newPpn = dest.id * PAGES_PER_BLOCK + dest.writePtr;
-        dest.valid[dest.writePtr] = true;
-        ++dest.validCount;
-        ++dest.writePtr;
+        u64 newPpn = dest.id * PAGES_PER_BLOCK + dest.write_ptr;
+        dest.valid[dest.write_ptr] = true;
+        ++dest.valid_cnt;
+        ++dest.write_ptr;
         SetPpn(lpn, newPpn);
     }
 
     // Erase source block
-    src.isFree     = true;
-    src.writePtr   = 0;
-    src.validCount = 0;
+    src.reset();
     assert (src.id == victimId);
     std::fill(src.valid.begin(), src.valid.end(), false);
     freePool_.push_back(victimId);

@@ -21,14 +21,14 @@ public:
         evicted_blocks = 0;
         write_hit_size = 0;
     }
-    ICache(uint64_t cold_capacity, std::string& waf_log_file);
+    ICache(uint64_t cold_capacity, const std::string& waf_log_file);
     
     virtual bool exists(long key) = 0;
     virtual void touch(long key, OP_TYPE op_type) = 0;
-    virtual void batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op_type) = 0;
+    virtual void batch_insert(int stream_id, const std::map<long, int> &newBlocks, OP_TYPE op_type) = 0;
     virtual bool is_cache_filled() = 0;
     virtual int get_block_size() = 0;
-    virtual void print_cache_trace(long long lba_offset, int lba_size, OP_TYPE op_type) = 0;
+    virtual void print_cache_trace(long long lba_offset, int lba_size, OP_TYPE op_type){};
     void _evict_one_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type);
     void _invalidate_cold_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type);
     virtual void evict_one_block() = 0;

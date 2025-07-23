@@ -16,7 +16,7 @@ public:
     bool exists(long key);
     void touch(long key, OP_TYPE op_type);
     void evict_one_block();
-    void batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op_type);
+    void batch_insert(int streamd_id, const std::map<long, int> &newBlocks, OP_TYPE op_type);
     bool is_cache_filled();
     int get_block_size();
     void print_cache_trace(long long lba_offset, int lba_size, OP_TYPE op_type);

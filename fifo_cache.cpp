@@ -99,7 +99,7 @@ void FIFOCache::evict_one_block() {
     //fprintf(cold_trace_fp, "%ld,%s,%ld,%ld,%ld\n", DUMMY_VALUE, "W", oldest * cache_block_size, cache_block_size, DUMMY_VALUE);
 }
 
-void FIFOCache::batch_insert(const std::map<long, int> &newBlocks, OP_TYPE op_type) {
+void FIFOCache::batch_insert(int stream_id, const std::map<long, int> &newBlocks, OP_TYPE op_type) {
     for (auto iter : newBlocks) {
         long block = iter.first;
         long lba_size = iter.second;
