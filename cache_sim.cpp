@@ -170,12 +170,13 @@ int main(int argc, char* argv[]) {
     std::string line;
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
-    const long long cache_write_size_limit = 15000000000000ULL;
+    const long long cache_write_size_limit = 4000000000000ULL;
     
     while (std::getline(infile, line) && line_count < line_count_limit) {
         line_count++;
         if (line_count % 1000000 == 0) {
             print_stats(true, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
+            cache->print_stats();
         }
         if (cache_write_size > cache_write_size_limit) {
             break;
@@ -220,6 +221,7 @@ int main(int argc, char* argv[]) {
     calc_hit_ratio(read_hit_size, total_read_size, write_hit_size, total_write_size, final_read_hit_ratio, final_write_hit_ratio);
     
     print_stats(false, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
+    cache->print_stats();
     
     return 0;
 }

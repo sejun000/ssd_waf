@@ -7,10 +7,12 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
+
 //#include <queue>
 #include <boost/heap/d_ary_heap.hpp>
 
 #include "segment.h"
+#include "evict_policy.h"
 
 // ---------------------------------------------------------------------------
 // Tunable geometry parameters (override before including if you wish)
@@ -59,41 +61,12 @@ struct HeapNode {
 };
 
 // ---------------------------------------------------------------------------
-// GC policy interface
-// ---------------------------------------------------------------------------
-class IGcPolicy {
-public:
-    virtual ~IGcPolicy() = default;
-    virtual u64 ChooseVictim(const std::vector<Block>& blocks,
-                             const std::vector<u64>& freePool) = 0; // return TOTAL_BLOCKS if none
-    virtual void OnValidChange(uint64_t id, uint64_t newLive) = 0; // called when valid count changes
-};
-
-class GreedyGcPolicy final : public IGcPolicy {
-public:
-    using Heap = boost::heap::d_ary_heap<
-                    HeapNode,
-                    boost::heap::arity<4>,
-                    boost::heap::mutable_<true>,
-                    boost::heap::compare<std::greater<>>>;
-    using Handle = Heap::handle_type;
-    Heap minHeap;
-    std::vector<Handle> handle; 
-    GreedyGcPolicy(u64 total_bytes) : handle(total_bytes / NAND_BLOCK_SIZE , Heap::handle_type()) { total_blocks = total_bytes / NAND_BLOCK_SIZE; }
-    u64 ChooseVictim(const std::vector<Block>& blocks,
-                     const std::vector<u64>& freePool) override;
-
-    void OnValidChange(uint64_t id, uint64_t newLive);
-    u64 total_blocks;
-};
-
-// ---------------------------------------------------------------------------
 // Page‑mapping FTL (log‑structured; per‑stream active block)
 // ---------------------------------------------------------------------------
 class PageMappingFTL {
 public:
     explicit PageMappingFTL(u64 totalBytes,
-                            IGcPolicy* policy);
+                            EvictPolicy* policy);
 
     void Write(u64 lbaOffset, u64 byteSize, int streamId);
     void Trim (u64 lbaOffset, u64 byteSize);
@@ -121,7 +94,7 @@ private:
     std::vector<u64>                         freePool_;
     std::unordered_map<int,u64>              activeBlk_;
     std::unordered_map<int,u64>              gcActiveBlk_;
-    std::unique_ptr<IGcPolicy>               gcPolicy_;
+    std::unique_ptr<EvictPolicy>               gcPolicy_;
 
     u64 nand_write_pages;
     u64 host_write_pages;

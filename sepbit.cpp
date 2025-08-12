@@ -11,14 +11,17 @@ SepBIT::SepBIT() {
     mMetadata = new Metadata();
 }
 
-int SepBIT::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp) {
+int SepBIT::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+  static uint64_t hot = 0, cold = 0;
   if (!isGcAppend) {
     uint64_t lifespan = mLba2Fifo->Query(blockAddr);
     if (lifespan != UINT64_MAX && lifespan < mAvgLifespan) {
-      //printf("0 Classify: %lu, lifespan: %lu, avg lifespan: %f\n", blockAddr, lifespan, mAvgLifespan);
+     // printf("0 Classify: %lu, lifespan: %lu, avg lifespan: %f\n", blockAddr, lifespan, mAvgLifespan);
+      hot++;
       return 0;
     } else {
-      //printf("1 Classify: %lu, lifespan: %lu, avg lifespan: %f\n", blockAddr, lifespan, mAvgLifespan);
+     // printf("1 Classify: %lu, lifespan: %lu, avg lifespan: %f %lu %lu\n", blockAddr, lifespan, mAvgLifespan, hot, cold++);
+      cold++;
       return 1;
     }
   } else {
@@ -41,6 +44,7 @@ void SepBIT::CollectSegment(Segment *segment, uint64_t global_timestamp) {
   static int totLifespan = 0;
   static int nCollects = 0;
   if (segment->get_class_num() == 0) {
+    printf("CollectSegment: %lu, class_num: %d\n mAvgLifespan %f\n", segment->get_create_time(), segment->get_class_num(), mAvgLifespan);
     totLifespan += global_timestamp - segment->get_create_time();
     nCollects += 1;
   }

@@ -12,7 +12,10 @@ void FifoEvictPolicy::add(Segment* seg)
 void FifoEvictPolicy::remove(Segment* seg)
 {
     auto it = handle.find(seg);
-    if (it == handle.end()) return;            // 이미 제거됨
+    if (it == handle.end()) {
+        //assert(false);
+        return;            // 이미 제거됨
+    }
     queue.erase(it->second);                   // O(1) 삭제
     handle.erase(it);
 }

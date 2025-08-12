@@ -26,4 +26,5 @@ public:
     virtual int get_class_num() {
         return class_num;
     }
+    static const int GC_STREAM_START = 2;
 };

@@ -4,21 +4,22 @@
 #include <unordered_map>
 
 struct HeapNode_Cache {
-    std::size_t      cnt;   // valid page 수
-    Segment* seg;
+    std::size_t cnt;
+    Segment*    seg;
 
-    /* min-heap용 비교 */
+    // cnt 가 작을수록 우선순위 ↑
     bool operator>(const HeapNode_Cache& o) const noexcept {
         return cnt > o.cnt || (cnt == o.cnt && seg > o.seg);
     }
 };
 
-/* 4-ary min-heap + mutable handles */
+// C++11 호환
 using Heap = boost::heap::d_ary_heap<
                  HeapNode_Cache,
                  boost::heap::arity<4>,
                  boost::heap::mutable_<true>,
-                 boost::heap::compare<std::greater<>>>;
+                 boost::heap::compare<std::greater<HeapNode_Cache>>
+>;
 
 class GreedyEvictPolicy : public EvictPolicy {
 public:

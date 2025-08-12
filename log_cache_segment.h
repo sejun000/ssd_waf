@@ -14,6 +14,7 @@ public:
     {
         long key  = 0;   ///< LBA(block) index
         bool valid = false;
+        uint64_t create_timestamp = UINT64_MAX; ///< 생성 시각
     };
 
     explicit LogCacheSegment(std::size_t blocks_per_segment, uint64_t create_timestamp)

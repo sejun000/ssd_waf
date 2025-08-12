@@ -22,33 +22,8 @@ bool Block::full() {
 
 u64 Block::NextPpn() const { return id * PAGES_PER_BLOCK + write_ptr; }
 
-
-void GreedyGcPolicy::OnValidChange(uint64_t id, uint64_t newLive) {
-    assert (id < total_blocks);
-    if (handle[id] == Heap::handle_type()) {            // 아직 없음
-        if (newLive > 0)
-            handle[id] = minHeap.push({newLive, id});
-        return;
-    }
-    if (newLive > 0) {                                             // key update
-        minHeap.update(handle[id], {newLive, id});
-    }
-}
-
-// ---------------- GC: greedy -------------------
-u64 GreedyGcPolicy::ChooseVictim(const std::vector<Block>& blocks,
-                                 const std::vector<u64>& /*freePool*/) {
-                                    
-    if (minHeap.empty()) assert(false); // should not be called if no valid blocks
-    auto top = minHeap.top();
-    minHeap.pop();
-    assert (blocks[top.id].isFree == false);
-    handle[top.id] = Heap::handle_type();
-    return top.id; // return victim block ID
-}
-
 // ---------------- FTL ctor ---------------------
-PageMappingFTL::PageMappingFTL(u64 totalBytes, IGcPolicy* policy)
+PageMappingFTL::PageMappingFTL(u64 totalBytes, EvictPolicy* policy)
     : blocks_(), gcPolicy_(std::move(policy)) {
     u64 totalBlocks = totalBytes / NAND_BLOCK_SIZE;
     blocks_.reserve(totalBlocks);
@@ -78,7 +53,7 @@ void PageMappingFTL::InvalidatePpn(u64 ppn) {
     if (blk.valid[pageIdx]) {
         blk.valid[pageIdx] = false;
         --blk.valid_cnt;
-        gcPolicy_->OnValidChange(blkId, blk.valid_cnt);
+        gcPolicy_->update(&blk);
     }
 }
 
@@ -140,7 +115,7 @@ void PageMappingFTL::Write(u64 lbaOffset, u64 byteSize, int streamId) {
         ++ab.valid_cnt;
         ++ab.write_ptr;
         if (ab.full()) {
-            gcPolicy_->OnValidChange(ab.id, ab.valid_cnt);
+            gcPolicy_->add(&ab);
         }
         ab.isFree = false;
         SetPpn(curLpn, ppn);
@@ -221,8 +196,13 @@ u64 PageMappingFTL::AllocateNewGCActiveBlock(int streamId) {
 
 // ---------------- Garbage Collection ----------
 void PageMappingFTL::RunGC() {
-    u64 victimId = gcPolicy_->ChooseVictim(blocks_, freePool_);
-
+    Block* victim = (Block*)gcPolicy_->choose_segment();
+    u64 victimId = victim ? victim->id : NOT_ALLOCATED;
+    if (victimId == NOT_ALLOCATED) {
+        // No victim found, nothing to do
+        printf("No victim found for GC\n");
+        return;
+    }
     // Allocate destination (spare) block
 
     // Migrate live pages

@@ -1,6 +1,7 @@
 import argparse
 import subprocess
 import trace_parser
+from datetime import datetime
 
 def estimate_device_size(file_path, trace_format):
     """트레이스를 한 번 훑어서 유니크한 LBA 개수를 세어 디바이스 크기를 근사"""
@@ -52,12 +53,13 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
             input_cache_policy = "NO_CACHE"
         print(f"\nRunning analysis with cache size: {cache_size} bytes ({ratio*100:.5f}% trace_format {trace_format})")
         # print command line 
-        print(f"./cache_sim {trace_file} {cache_size} --rw_policy {rw_policy} --trace_format {trace_format} --cache_policy {cache_policy} --cache_trace {str(ratio) + '.trace'} --cold_trace {str(ratio) + '.cold.trace'}")
+        #print("["./cache_sim", trace_file, str(cache_size), "--rw_policy", rw_policy, "--trace_format", trace_format, "--cache_policy", input_cache_policy, "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace", \
+        #                "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace", "--cold_capacity", str(int(device_size * 1.07)), "--waf_log_file", waf_log_file]")
+        print (f"./cache_sim {trace_file} {cache_size} --rw_policy {rw_policy} --trace_format {trace_format} --cache_policy {input_cache_policy} --cache_trace /mnt/nvme2n2/{cache_policy}_{ratio}.trace --cold_trace /mnt/nvme2n2/{cache_policy}_{ratio}.cold.trace --cold_capacity {int(device_size * 1.07)} --waf_log_file {cache_policy}_{ratio}.waf.log")
         # run command line
-        waf_log_file = cache_policy + "_" + str(ratio) + ".3.waf.log"
-        # if waf_log_file exists, .2 is added to the file name
-        if (waf_log_file in subprocess.getoutput("ls")):
-            waf_log_file = cache_policy + "_" + str(ratio) + ".2.waf.log"
+        ts = datetime.now().strftime('%y%m%d_%H%M%S')
+        waf_log_file = f"{cache_policy}_{ratio}_{ts}.waf.log"
+        
         subprocess.run(["./cache_sim", trace_file, str(cache_size), "--rw_policy", rw_policy, "--trace_format", trace_format, "--cache_policy", input_cache_policy, "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace", \
                         "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace", "--cold_capacity", str(int(device_size * 1.07)), "--waf_log_file", waf_log_file])
 
@@ -66,7 +68,7 @@ if __name__ == "__main__":
     parser.add_argument("trace_file", type=str, help="Path to the block trace file")
     
     parser.add_argument("--rw_policy", type=str, choices=['all', 'write-only', 'read-only'], default='all', help="Cache policy: all (default) or write-only")
-    parser.add_argument("--cache_policy", type=str, choices=['LRU', 'FIFO', "LOG_FIFO", "LOG_GREEDY", "LOG_FIFO_SEPBIT", "LOG_GREEDY_SEPBIT", "LOG_FIFO_SEPBIT_COLD_FIRST"], default='all', help="Cache policy: all (default) or write-only")
+    parser.add_argument("--cache_policy", type=str, default='all', help="Cache policy: all (default) or write-only")
     parser.add_argument("--trace_format", type=str, choices=['csv', 'blktrace'], default='csv', help="Trace format: csv (default) or blktrace")
     #parser.add_argument("--device_size", type=int, default=130599218053120, help="Device size in bytes")
     #parser.add_argument("--device_size", type=int, default=17491254312960, help="Device size in bytes")

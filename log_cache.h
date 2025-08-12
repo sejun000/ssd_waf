@@ -21,7 +21,7 @@ public:
     struct Config
     {
         std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
-        double      free_ratio_low = 0.10;                ///< 10 %
+        double      free_ratio_low = 0.01;                ///< 1 %
     };
 
 
@@ -35,7 +35,10 @@ public:
              std::unique_ptr<EvictPolicy> ev =
                  std::make_unique<GreedyEvictPolicy>(),
              const Config*         cfg           = nullptr,
-             IStream *input_stream_policy = nullptr
+             IStream *input_stream_policy = nullptr,
+             double target_valid_blk_rate = 0.0,
+             std::unique_ptr<EvictPolicy> compactor = nullptr,
+             double max_age_ratio_by_gc = 0.0
             );
 
     ~LogCache();
@@ -51,6 +54,12 @@ public:
     int get_block_size() override;
     void evict_one_block() override;
     bool is_cache_filled() override;
+    virtual void print_stats() override;
+    void print_objects(std::string prefix, uint64_t value);
+    void invalidate(long key, int lba_sz);
+    void reset_segment(LogCacheSegment *seg);
+    void dummy_fill_segment(LogCacheSegment* s);
+    
 
 
 private:
@@ -62,17 +71,27 @@ private:
     std::deque<LogCacheSegment*>                free_pool;
     std::list<std::unique_ptr<LogCacheSegment>> all_segments; // owner
     std::unordered_map<int, LogCacheSegment*>   active_seg;   // stream→seg
+    std::unordered_map<int, LogCacheSegment*>   gc_active_seg;   // stream→seg
 
     /* page lookup ********************************************************/
-    struct Loc { LogCacheSegment* seg; std::size_t idx; };
+    struct Loc { LogCacheSegment* seg; std::size_t idx;};
     std::unordered_map<long, Loc>                mapping;
+    std::unordered_map<long, uint64_t>                evicted_timestamp; // for GC
 
     /* helpers ************************************************************/
     std::unique_ptr<EvictPolicy> evictor;
 
-    LogCacheSegment* alloc_segment();
+    LogCacheSegment* alloc_segment(bool shrink = true);
     void             check_and_evict_if_needed();
     void             evict_segment(LogCacheSegment* s);
+    Segment*         compaction(LogCacheSegment* s, int gc_stream_id = 0);
+    Segment*         evict_and_compaction(LogCacheSegment* s, uint64_t threshold, int gc_stream_id = 0);
+
+    void             evict_policy_add(LogCacheSegment *s);
+    void             evict_policy_remove(LogCacheSegment *s);
+    void             evict_policy_update(LogCacheSegment *s);
+    LogCacheSegment* alloc_segment_to_active_stream(bool gc, int stream, bool shrink = true);
+
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -80,7 +99,19 @@ private:
     FILE* cold_trace_fp_ = nullptr;
     std::size_t segment_size_blocks;
     std::size_t total_segments;
+    uint64_t total_cache_block_count = 0;
+
+    uint64_t total_capacity_bytes = 0;
     uint64_t log_cache_timestamp = 0; // per 4kB block
     IStream *stream_policy = nullptr;
     uint64_t global_valid_blocks = 0;
+    uint64_t compacted_blocks = 0;
+    uint64_t invalidate_blocks = 0;
+    uint64_t reinsert_blocks = 0;
+
+    uint64_t evicted_segment_age = 0;
+
+    double target_valid_blk_rate = 0.0; // ratio of write to QLC
+    std::unique_ptr<EvictPolicy> compactor;
+    double additional_free_blks_ratio_by_gc;
 };

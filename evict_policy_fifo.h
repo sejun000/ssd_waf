@@ -8,7 +8,7 @@ public:
     /* EvictPolicy API */
     void add   (Segment* seg) override;
     void remove(Segment* seg) override;
-    void update(Segment* /*seg*/) override {}   // FIFO는 no-op
+    void update(Segment* seg) override {}   // FIFO는 no-op
     Segment* choose_segment() override;
 
 private:
