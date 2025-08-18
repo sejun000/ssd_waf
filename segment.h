@@ -16,6 +16,7 @@ public:
     std::size_t        write_ptr = 0;
     std::size_t        valid_cnt = 0;
     int class_num = 0;
+    bool hot = false;
     uint64_t create_timestamp;
     /* helpers */
     virtual bool full() = 0;
@@ -26,5 +27,5 @@ public:
     virtual int get_class_num() {
         return class_num;
     }
-    static const int GC_STREAM_START = 2;
+    static const int GC_STREAM_START = 10;
 };

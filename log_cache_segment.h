@@ -12,8 +12,10 @@ class LogCacheSegment : public Segment
 public:
     struct Block
     {
-        long key  = 0;   ///< LBA(block) index
-        bool valid = false;
+        struct {
+            long key = 0;      ///< LBA(block) index (63비트)
+            bool valid = false; ///< 유효성 플래그 (1비트)
+        };
         uint64_t create_timestamp = UINT64_MAX; ///< 생성 시각
     };
 

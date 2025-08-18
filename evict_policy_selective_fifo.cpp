@@ -54,7 +54,7 @@ Segment* SelectiveFifoEvictPolicy::choose_segment()
         for (int i = 0; i < MAX_QUEUE_SIZE; ++i) {
           int seq_id = i;
           if (seq != nullptr && !gc) {
-            if (seq->size() <= i) {
+            if (seq->size() <= (size_t)i) {
                 break;
             }
             seq_id = (*seq)[i];

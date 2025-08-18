@@ -4,6 +4,7 @@
 #include "evict_policy.h"
 #include "evict_policy_greedy.h"
 #include "istream.h"
+#include "histogram.h"
 
 #include <unordered_map>
 #include <deque>
@@ -38,7 +39,8 @@ public:
              IStream *input_stream_policy = nullptr,
              double target_valid_blk_rate = 0.0,
              std::unique_ptr<EvictPolicy> compactor = nullptr,
-             double max_age_ratio_by_gc = 0.0
+             double max_age_ratio_by_gc = 0.0,
+             bool input_only_compact = false
             );
 
     ~LogCache();
@@ -59,6 +61,8 @@ public:
     void invalidate(long key, int lba_sz);
     void reset_segment(LogCacheSegment *seg);
     void dummy_fill_segment(LogCacheSegment* s);
+    //void do_evict_and_compaction_with_same_policy();
+    
     
 
 
@@ -84,13 +88,13 @@ private:
     LogCacheSegment* alloc_segment(bool shrink = true);
     void             check_and_evict_if_needed();
     void             evict_segment(LogCacheSegment* s);
-    Segment*         compaction(LogCacheSegment* s, int gc_stream_id = 0);
     Segment*         evict_and_compaction(LogCacheSegment* s, uint64_t threshold, int gc_stream_id = 0);
 
     void             evict_policy_add(LogCacheSegment *s);
     void             evict_policy_remove(LogCacheSegment *s);
     void             evict_policy_update(LogCacheSegment *s);
-    LogCacheSegment* alloc_segment_to_active_stream(bool gc, int stream, bool shrink = true);
+    LogCacheSegment* get_segment_to_active_stream(bool gc, int stream, bool check_only = false);
+    LogCacheSegment* get_segment_with_stream_policy(bool gc, uint64_t key, bool check_only = false);
 
 
     /* trace(optional) *****************************************************/
@@ -114,4 +118,14 @@ private:
     double target_valid_blk_rate = 0.0; // ratio of write to QLC
     std::unique_ptr<EvictPolicy> compactor;
     double additional_free_blks_ratio_by_gc;
+    
+    std::unique_ptr<Histogram> evicted_ages_histogram;
+    std::unique_ptr<Histogram> evicted_blocks_histogram;
+    std::unique_ptr<Histogram> compacted_blocks_histogram;
+    std::unique_ptr<Histogram> evicted_ages_with_segment_histogram;
+    std::unique_ptr<Histogram> compacted_ages_with_segment_histogram;
+    static const int HISTOGRAM_BUCKETS = 20;
+    bool only_compact = false;
+    uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
+
 };

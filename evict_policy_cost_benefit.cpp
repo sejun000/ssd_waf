@@ -36,7 +36,10 @@ Segment* CbEvictPolicy::choose_segment()
     for (int i = 0; i < K_VALIDATE && !heap_.empty(); ++i) {
         CBNode top = heap_.top();
         double cur = score(top.seg);
-        if (cur == top.score) return top.seg;        // 여전히 1등
+        if (cur == top.score) {
+            remove(top.seg);
+            return top.seg;        // 여전히 1등
+        }
         heap_.pop();                                 // 순위 달라짐
         auto h = heap_.push({ cur, top.seg });       // 재삽입
         h_[top.seg] = h;

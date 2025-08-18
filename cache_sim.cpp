@@ -13,6 +13,7 @@
 #include <boost/stacktrace.hpp>
 #include <iostream>
 #include <cstring>
+#include <memory>
 
 void signal_handler(int signum) {
     std::cerr << "Received signal " << signum << ", stack trace:\n";
@@ -153,7 +154,7 @@ int main(int argc, char* argv[]) {
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    ICache* cache = createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file);
+    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file));
     // 통계 변수 초기화
     long long total_read = 0, total_write = 0;
     long long total_read_size = 0, total_write_size = 0;
@@ -170,7 +171,7 @@ int main(int argc, char* argv[]) {
     std::string line;
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
-    const long long cache_write_size_limit = 4000000000000ULL;
+    const long long cache_write_size_limit = 30000000000000ULL;
     
     while (std::getline(infile, line) && line_count < line_count_limit) {
         line_count++;
@@ -222,6 +223,5 @@ int main(int argc, char* argv[]) {
     
     print_stats(false, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
     cache->print_stats();
-    
     return 0;
 }

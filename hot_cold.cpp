@@ -27,6 +27,7 @@ void HotCold::CollectSegment(Segment *segment, uint64_t global_timestamp) {
 }
 
 void HotCold::Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) {
+  
   // Do nothing
 }
 

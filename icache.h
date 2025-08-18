@@ -22,7 +22,7 @@ struct CacheEntry {
 class ICache {
 public:
     // 생성자: capacity는 블록 단위 최대 개수
-    ~ICache(){
+    virtual ~ICache(){
         write_size_to_cache = 0;
         evicted_blocks = 0;
         write_hit_size = 0;

@@ -8,7 +8,10 @@ public:
     virtual void Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) = 0;
     virtual void GcAppend(uint64_t blockAddr) = 0;
     virtual void CollectSegment(Segment *segment, uint64_t global_timestamp) = 0;
-static const int MAX_STREAMS = 10;
+    virtual int GetVictimStreamId(uint64_t global_timestamp, uint64_t threshold){
+        return -1;
+    }
+static const int MAX_STREAMS = 40;
 };
 
 IStream* createIstreamPolicy(std::string policy_type);
