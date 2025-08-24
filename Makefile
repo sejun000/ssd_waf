@@ -20,13 +20,16 @@ SRCS_cache_sim     := cache_sim.cpp trace_parser.cpp allocator.cpp \
 
 SRCS_trace_replayer:= trace_replayer.cpp trace_parser.cpp
 
+SRCS_mrc_calculator := mrc_calculator.cpp mrc_main.cpp trace_parser.cpp
+
 # ▣ 자동 파생 객체 목록 ------------------------------------------------
 OBJS_cache_sim      := $(SRCS_cache_sim:.cpp=.o)
 OBJS_trace_replayer := $(SRCS_trace_replayer:.cpp=.o)
+OBJS_mrc_calculator := $(SRCS_mrc_calculator:.cpp=.o)
 
 # ▣ 기본 규칙 ----------------------------------------------------------
 .PHONY: all clean
-all: cache_sim trace_replayer
+all: cache_sim trace_replayer mrc_calculator
 
 cache_sim: $(OBJS_cache_sim)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
@@ -34,8 +37,11 @@ cache_sim: $(OBJS_cache_sim)
 trace_replayer: $(OBJS_trace_replayer)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
 
+mrc_calculator: $(OBJS_mrc_calculator)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LIBS)
+
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
-	$(RM) $(OBJS_cache_sim) $(OBJS_trace_replayer) cache_sim trace_replayer
+	$(RM) $(OBJS_cache_sim) $(OBJS_trace_replayer) $(OBJS_mrc_calculator) cache_sim trace_replayer mrc_calculator
