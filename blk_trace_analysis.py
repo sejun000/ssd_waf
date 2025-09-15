@@ -2,6 +2,7 @@ import argparse
 import subprocess
 import trace_parser
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed  # ← 추가
 
 def estimate_device_size(file_path, trace_format):
     """트레이스를 한 번 훑어서 유니크한 LBA 개수를 세어 디바이스 크기를 근사"""
@@ -27,44 +28,57 @@ def estimate_device_size(file_path, trace_format):
     
     return max_value  # 블록 크기를 4KB로 가정하고 크기 근사
 
-def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU"):
+def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate=''):
     """캐시 크기를 1%, 5%, 10%, 15%, 20%, 25%, 30%로 변경하며 실행"""
-    #cache_ratios = [0.023, 0.047, 0.105, 0.176]
-    #cache_ratios = [0.023255814,0.023809524,0.024390244,0.025,0.051282051,0.052631579,0.054054054,0.055555556,0.085714286,0.088235294,0.090909091,0.09375,0.129032258,0.133333333,0.137931034,0.142857143]
-    #cache_ratios = [0.0116, 0.024, 0.038, 0.054] # paper
-    #cache_ratios = [0.070, 0.090]
-    #cache_ratios = [0.090]
     cache_ratios = [0.18]
-#    cache_ratios = [0.070]
-    #cache_ratios = [0.0116]
-    #cache_ratios = [0.0116, 0.023, 0.038, 0.054, 0.070, 0.090] # paper
-    #cache_ratios = [0.038, 0.054]
-    #cache_ratios = [0, 0.054]
-    #cache_ratios = [0.054]
-    #cache_ratios = [0.075, 0.085, 0.095, 0.105]
-    #cache_ratios = [0.05618, 0.075, 0.085, 0.095, 0.105]
-    #cache_ratios = [0.105]
-    #cache_ratios = [0.05618, 0.075, 0.085, 0.095, 0.105]
-    #cache_ratios = [0.0123, 0.0164, 0.0186, 0.021, 0.023]
-    #cache_ratios = [0.105]
-    #cache_ratios = [0.01642, 0.01862, 0.023]
-    
-    for ratio in cache_ratios:
-        cache_size = int(device_size * ratio)
-        input_cache_policy = cache_policy
-        if (ratio == 0):
-            input_cache_policy = "NO_CACHE"
-        print(f"\nRunning analysis with cache size: {cache_size} bytes ({ratio*100:.5f}% trace_format {trace_format})")
-        # print command line 
-        #print("["./cache_sim", trace_file, str(cache_size), "--rw_policy", rw_policy, "--trace_format", trace_format, "--cache_policy", input_cache_policy, "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace", \
-        #                "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace", "--cold_capacity", str(int(device_size * 1.07)), "--waf_log_file", waf_log_file]")
-        print (f"./cache_sim {trace_file} {cache_size} --rw_policy {rw_policy} --trace_format {trace_format} --cache_policy {input_cache_policy} --cache_trace /mnt/nvme2n2/{cache_policy}_{ratio}.trace --cold_trace /mnt/nvme2n2/{cache_policy}_{ratio}.cold.trace --cold_capacity {int(device_size * 1.07)} --waf_log_file {cache_policy}_{ratio}.waf.log")
-        # run command line
-        ts = datetime.now().strftime('%y%m%d_%H%M%S')
-        waf_log_file = f"{cache_policy}_{ratio}_{ts}.waf.log"
-        
-        subprocess.run(["./cache_sim", trace_file, str(cache_size), "--rw_policy", rw_policy, "--trace_format", trace_format, "--cache_policy", input_cache_policy, "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace", \
-                        "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace", "--cold_capacity", str(int(device_size * 1.07)), "--waf_log_file", waf_log_file])
+    if (valid_rate == ''):
+        valid_ratio_ranges = [0.8]
+    else:
+        front = [float(x) for x in valid_rate.split(',')][0]
+        back = [float(x) for x in valid_rate.split(',')][1]
+        valid_ratio_ranges = [float(x)/100.0 for x in range(int(front*100), int(back*100)+1, 1)]
+
+    # ---- 병렬화: valid_ratio 단위로 20개 동시 실행 ----
+    def _run_for_valid_ratio(valid_ratio):
+        for ratio in cache_ratios:
+            cache_size = int(device_size * ratio)
+            input_cache_policy = cache_policy
+            if (ratio == 0):
+                input_cache_policy = "NO_CACHE"
+            print(f"\nRunning analysis with cache size: {cache_size} bytes ({ratio*100:.5f}% trace_format {trace_format})")
+            print (f"./cache_sim {trace_file} {cache_size} --rw_policy {rw_policy} --trace_format {trace_format} --cache_policy {input_cache_policy} --cache_trace /mnt/nvme2n2/{cache_policy}_{ratio}.trace --cold_trace /mnt/nvme2n2/{cache_policy}_{ratio}.cold.trace --cold_capacity {int(device_size * 1.07)} --waf_log_file {cache_policy}_{ratio}.waf.log")
+            ts = datetime.now().strftime('%y%m%d_%H%M%S')
+            waf_log_file = f"{cache_policy}_{ratio}_{ts}.waf.log"
+            if (valid_rate != ''):
+                subprocess.run([
+                    "./cache_sim", trace_file, str(cache_size),
+                    "--rw_policy", rw_policy,
+                    "--trace_format", trace_format,
+                    "--cache_policy", input_cache_policy,
+                    "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace",
+                    "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace",
+                    "--cold_capacity", str(int(device_size * 1.07)),
+                    "--waf_log_file", waf_log_file,
+                    "--valid_ratio", str(valid_ratio),
+                    "--stat_log_file", "dp."+str(valid_ratio)
+                ])
+            else:
+                subprocess.run([
+                    "./cache_sim", trace_file, str(cache_size),
+                    "--rw_policy", rw_policy,
+                    "--trace_format", trace_format,
+                    "--cache_policy", input_cache_policy,
+                    "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace",
+                    "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace",
+                    "--cold_capacity", str(int(device_size * 1.07)),
+                    "--waf_log_file", waf_log_file
+                ])
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = [ex.submit(_run_for_valid_ratio, vr) for vr in valid_ratio_ranges]
+        for _ in as_completed(futures):
+            pass
+    # -----------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Automate Block Cache Analysis for Different Cache Sizes")
@@ -73,18 +87,9 @@ if __name__ == "__main__":
     parser.add_argument("--rw_policy", type=str, choices=['all', 'write-only', 'read-only'], default='all', help="Cache policy: all (default) or write-only")
     parser.add_argument("--cache_policy", type=str, default='all', help="Cache policy: all (default) or write-only")
     parser.add_argument("--trace_format", type=str, choices=['csv', 'blktrace'], default='csv', help="Trace format: csv (default) or blktrace")
-    #parser.add_argument("--device_size", type=int, default=130599218053120, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=17491254312960, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=21083994456064, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=21083994456064, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=512_000_000_000, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=8_377_333_710_848, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=5003636899840, help="Device size in bytes")
-    #parser.add_argument("--device_size", type=int, default=137010594691, help="Device size in bytes")
+    parser.add_argument("--valid_rate", type=str, default='', help="Valid rate threshold for LOG_GREEDY_COST_BENEFIT_11 policy (two decimal number with comma)")
     parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes")
     args = parser.parse_args()
-    #estimated_device_size = estimate_device_size(args.trace_file, args.trace_format)
     estimated_device_size = args.device_size
     print(f"Estimated Device Size: {estimated_device_size} bytes")
-    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy)
-
+    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate)

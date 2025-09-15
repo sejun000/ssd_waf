@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
     signal(SIGFPE, signal_handler);
     signal(SIGINT, signal_handler);
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " trace_file cache_size [--block_size N] [--rw_policy all|write-only] [--trace_format csv|blktrace] [--cache_policy LRU/FIFO] [--cache_trace] [--cold_capacity [bytes]]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " trace_file cache_size [--block_size N] [--rw_policy all|write-only] [--trace_format csv|blktrace] [--cache_policy LRU/FIFO] [--cache_trace] [--cold_capacity [bytes]] [--waf_log_file [filename]] [--valid_ratio [%]] [--stat_log_file [filename]]" << std::endl;
         return 1;
     }
     std::string trace_file = argv[1];
@@ -110,6 +110,8 @@ int main(int argc, char* argv[]) {
     std::string cold_trace_output = "";
     std::string cache_policy = "LRU";
     std::string waf_log_file = "";
+    std::string stat_log_file = "";
+    double valid_ratio = 0.0;
     bool cache_trace = false;
     uint64_t cold_capacity = 0;
 
@@ -134,7 +136,12 @@ int main(int argc, char* argv[]) {
             cold_capacity = std::stoll(argv[++i]); 
         } else if (arg == "--waf_log_file" && i + 1 < argc) {
             waf_log_file = argv[++i];
-        }else {
+        } else if (arg == "--valid_ratio" && i + 1 < argc) {
+            valid_ratio = std::stod(argv[++i]);
+        } else if (arg == "--stat_log_file" && i + 1 < argc) {
+             stat_log_file = argv[++i];
+        }
+        else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             return 1;
         }
@@ -154,7 +161,7 @@ int main(int argc, char* argv[]) {
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file));
+    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file));
     // 통계 변수 초기화
     long long total_read = 0, total_write = 0;
     long long total_read_size = 0, total_write_size = 0;
@@ -171,14 +178,14 @@ int main(int argc, char* argv[]) {
     std::string line;
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
-    const long long cache_write_size_limit = 30000000000000ULL;
+    const long long cache_write_size_limit = 4000000000000ULL;
     
     while (std::getline(infile, line) && line_count < line_count_limit) {
         line_count++;
         if (line_count % 1000000 == 0) {
             print_stats(true, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
-            cache->print_stats();
         }
+        cache->print_stats();
         if (cache_write_size > cache_write_size_limit) {
             break;
         }

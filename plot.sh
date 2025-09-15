@@ -88,8 +88,8 @@ python plot_metrics.py \
     --output "compacted_blocks_2.png"
 
   python plot_metrics.py \
-    --files stat.log.20250818_214512,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250818_231203 \
-    --labels FIFO,Age_Active_93%,Age_Active_80%,Greedy_80% \
+    --files stat.log.20250818_214512,stat.log.20250818_231203,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250825_235728 \
+    --labels FIFO,Greedy_80%,Age_Active_93%,Age_Active_80%,Age_Active_Dynamic \
     --y 'evicted_blocks * 4096' \
     --ylabel 'Evicted Bytes (GB)' \
     --x 'write_size_to_cache' \
@@ -100,8 +100,8 @@ python plot_metrics.py \
     --output "evicted_blocks_3.png"
 
    python plot_metrics.py \
-    --files stat.log.20250818_214512,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250818_231203 \
-    --labels FIFO,Age_Active_93%,Age_Active_80%,Greedy_80% \
+    --files stat.log.20250818_214512,stat.log.20250818_231203,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250825_235728 \
+    --labels FIFO,Greedy_80%,Age_Active_93%,Age_Active_80%,Age_Active_Dynamic \
     --y 'compacted_blocks * 4096' \
     --ylabel 'Compacted Bytes (GB)' \
     --x 'write_size_to_cache' \
@@ -112,8 +112,8 @@ python plot_metrics.py \
     --output "compacted_blocks_3.png"
 
    python plot_metrics.py \
-    --files stat.log.20250818_214512,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250818_231203 \
-    --labels FIFO,Age_Active_93%,Age_Active_80%,Greedy_80% \
+    --files stat.log.20250818_214512,stat.log.20250818_231203,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250825_235728 \
+    --labels FIFO,Greedy_80%,Age_Active_93%,Age_Active_80%,Age_Active_Dynamic \
     --y 'global_valid_blocks/total_cache_size*4096*4096 * 100' \
     --ylabel '%' \
     --x 'write_size_to_cache' \
@@ -123,8 +123,8 @@ python plot_metrics.py \
     --output "valid_block_rate_3.png"
 
     python histogram.py \
-    --files stat.log.20250818_214512,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250818_231203 \
-    --labels FIFO,Age_Active_93%,Age_Active_80%,Greedy_80% \
+    --files stat.log.20250818_214512,stat.log.20250818_231203,stat.log.20250818_210101,stat.log.20250818_223352 \
+    --labels FIFO,Greedy_80%,Age_Active_93%,Age_Active_80% \
     --histogram_metric compacted_ages_with_segment \
     --rank 20 \
     --ylabel "count" \
@@ -132,8 +132,8 @@ python plot_metrics.py \
 
 
     python histogram.py \
-    --files stat.log.20250818_214512,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250818_231203 \
-    --labels FIFO,Age_Active_93%,Age_Active_80%,Greedy_80% \
+    --files stat.log.20250818_214512,stat.log.20250818_231203,stat.log.20250818_210101,stat.log.20250818_223352 \
+    --labels FIFO,Greedy_80%,Age_Active_93%,Age_Active_80% \
     --histogram_metric evicted_ages \
     --rank 40 \
     --ylabel "count" \
@@ -141,8 +141,8 @@ python plot_metrics.py \
 
 
  python plot_metrics.py \
-    --files stat.log.20250818_214512,stat.log.20250818_210101,stat.log.20250818_223352,stat.log.20250818_231203 \
-    --labels FIFO,Age_Active_93%,Age_Active_80%,Greedy_80% \
+    --files stat.log.20250818_214512,stat.log.20250818_231203,stat.log.20250818_210101,stat.log.20250818_223352 \
+    --labels FIFO,Greedy_80%,Age_Active_93%,Age_Active_80% \
     --y 'reinsert_blocks * 4096' \
     --ylabel 'Reinserted Bytes (GB)' \
     --x 'write_size_to_cache' \

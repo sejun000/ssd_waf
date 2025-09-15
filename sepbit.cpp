@@ -26,25 +26,25 @@ int SepBIT::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timest
     }
   } else {
     if (mClassNumOfLastCollectedSegment == 0) {
-      return 2;
+      return 2 + Segment::GC_STREAM_START;
     } else {
       uint64_t age = global_timestamp - mMetadata->Query(blockAddr);
       if (age < 4 * mAvgLifespan) {
-        return 3;
+        return 3 + Segment::GC_STREAM_START;
       } else if (age < 16 * mAvgLifespan) {
-        return 4;
+        return 4 + Segment::GC_STREAM_START;
       } else {
-        return 5;
+        return 5 + Segment::GC_STREAM_START;
       }
     }
   }
 }
 
 void SepBIT::CollectSegment(Segment *segment, uint64_t global_timestamp) {
-  static int totLifespan = 0;
+  static uint64_t totLifespan = 0;
   static int nCollects = 0;
   if (segment->get_class_num() == 0) {
-    printf("CollectSegment: %lu, class_num: %d\n mAvgLifespan %f\n", segment->get_create_time(), segment->get_class_num(), mAvgLifespan);
+    //printf("CollectSegment: %lu, class_num: %d\n mAvgLifespan %f\n", segment->get_create_time(), segment->get_class_num(), mAvgLifespan);
     totLifespan += global_timestamp - segment->get_create_time();
     nCollects += 1;
   }

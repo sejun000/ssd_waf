@@ -1,158 +1,224 @@
-#include "mrc_calculator.h" // mrc_calculator.h에 MrcCalculator 클래스와 AlgorithmType enum이 선언되어 있다고 가정합니다.
-#include <iostream>
+#include "mrc_calculator.h"
 #include <unordered_map>
-#include <algorithm>
+#include <vector>
+#include <map>
 #include <limits>
 #include <cmath>
+#include <cstddef>
+#include <sys/mman.h>
 
-// O(log N) 시간 복잡도로 구간 합을 계산하기 위한 Fenwick Tree (BIT)
+// ===== 코어덤프 크기 절약 유틸 =====
+template <typename T>
+static inline void dontdump_vec(std::vector<T>& v) {
+#if defined(__linux__) && defined(MADV_DONTDUMP)
+    if (!v.empty()) {
+        (void)madvise((void*)v.data(), v.size()*sizeof(T), MADV_DONTDUMP);
+    }
+#endif
+}
+
+// ===== Fenwick Tree (size_t 인덱스) =====
 class FenwickTree {
-private:
-    // [IMPROVEMENT] 매우 큰 트레이스(> 2^31)에서 발생할 수 있는 정수 오버플로우를 방지하기 위해 long long으로 변경
     std::vector<long long> tree;
-
+    static inline size_t lowbit(size_t x) { return x & (~x + 1); }
 public:
-    FenwickTree(int size) : tree(size + 1, 0) {}
-
-    void update(int index, int delta) {
-        index++; // 1-based index
-        while ((size_t)index < tree.size()) {
-            tree[index] += delta;
-            index += index & -index;
-        }
+    explicit FenwickTree(size_t n) : tree(n + 1, 0) {}
+    void update(size_t i, long long delta) {
+        ++i;
+        while (i < tree.size()) { tree[i] += delta; i += lowbit(i); }
     }
-
-    // [IMPROVEMENT] 반환 타입을 long long으로 변경
-    long long query(int index) {
-        if (index < 0) {
-            return 0; // 0 미만 인덱스 쿼리는 0을 반환
-        }
-        index++; // 1-based index
-        long long sum = 0;
-        while (index > 0) {
-            sum += tree[index];
-            index -= index & -index;
-        }
-        return sum;
+    long long query(size_t i) {
+        long long s = 0;
+        ++i;
+        while (i > 0) { s += tree[i]; i -= lowbit(i); }
+        return s;
     }
+    void mark_dontdump() { dontdump_vec(tree); }
 };
 
-// [수정됨] build_mrc_from_distances 함수
-// total_dataset_size를 파라미터로 받아서 버킷 크기를 계산합니다.
-std::map<long long, double> MrcCalculator::build_mrc_from_distances(const std::vector<long long>& distances, size_t total_accesses, long long total_dataset_size, int num_buckets) {
-    if (total_accesses == 0 || total_dataset_size == 0) {
-        return {};
+// ===== 내부 유틸: distances 계산 (LRU/OPT) =====
+static void compute_distances(const std::vector<long long>& trace,
+                              AlgorithmType type,
+                              std::vector<long long>& distances)
+{
+    const size_t n = trace.size();
+    distances.assign(n, 0);
+    dontdump_vec(distances);
+
+    // 이전/다음 위치
+    std::vector<long long> link(n, -1);
+    dontdump_vec(link);
+
+    std::unordered_map<long long, size_t> last;
+    last.reserve(n / 8 + 1);
+
+    if (type == AlgorithmType::LRU) {
+        for (size_t i = 0; i < n; ++i) {
+            auto it = last.find(trace[i]);
+            link[i] = (it == last.end() ? -1 : static_cast<long long>(it->second));
+            last[trace[i]] = i;
+        }
+    } else { // OPT
+        for (size_t i = n; i-- > 0; ) {
+            auto it = last.find(trace[i]);
+            link[i] = (it == last.end() ? -1 : static_cast<long long>(it->second));
+            last[trace[i]] = i;
+        }
     }
 
-    // [변경점!] max_dist 대신 total_dataset_size를 기준으로 bin_size를 계산합니다.
-    long long bin_size = std::ceil(static_cast<double>(total_dataset_size) / num_buckets);
-    if (bin_size == 0) bin_size = 1;
+    FenwickTree ft(n);
+    ft.mark_dontdump();
+    std::unordered_map<long long, size_t> occ;
+    occ.reserve(n / 8 + 1);
 
-    std::vector<long long> binned_histogram(num_buckets, 0);
-    for (long long dist : distances) {
-        if (dist != std::numeric_limits<long long>::max()) {
-            // dist가 total_dataset_size를 넘더라도 마지막 버킷에 포함시킵니다.
-            int bin_index = (dist - 1) / bin_size;
-            if (bin_index >= num_buckets) {
-                bin_index = num_buckets - 1;
+    if (type == AlgorithmType::LRU) {
+        for (size_t i = 0; i < n; ++i) {
+            long long prev = link[i];
+            if (prev == -1) {
+                distances[i] = std::numeric_limits<long long>::max();
+            } else {
+                size_t p = static_cast<size_t>(prev);
+                long long unique_count = ft.query(i - 1) - ft.query(p);
+                distances[i] = unique_count + 1;
             }
-            if (bin_index >= 0) {
-                 binned_histogram[bin_index]++;
-            }
+            auto it = occ.find(trace[i]);
+            if (it != occ.end()) ft.update(it->second, -1);
+            ft.update(i, +1);
+            occ[trace[i]] = i;
         }
+    } else { // OPT
+        for (size_t i = n; i-- > 0; ) {
+            long long nextp = link[i];
+            if (nextp == -1) {
+                distances[i] = std::numeric_limits<long long>::max();
+            } else {
+                size_t np = static_cast<size_t>(nextp);
+                long long unique_count = ft.query(np - 1) - ft.query(i);
+                distances[i] = unique_count + 1;
+            }
+            auto it = occ.find(trace[i]);
+            if (it != occ.end()) ft.update(it->second, -1);
+            ft.update(i, +1);
+            occ[trace[i]] = i;
+        }
+    }
+}
+
+// ===== 기존 단일 MRC =====
+std::map<long long, double>
+MrcCalculator::build_mrc_from_distances(const std::vector<long long>& distances,
+                                        size_t total_accesses,
+                                        long long total_dataset_size,
+                                        int num_buckets)
+{
+    if (total_accesses == 0 || total_dataset_size <= 0 || num_buckets <= 0) return {};
+
+    long long bin_size = std::llround(std::ceil((double)total_dataset_size / num_buckets));
+    if (bin_size <= 0) bin_size = 1;
+
+    std::vector<long long> bins(num_buckets, 0);
+    for (size_t i = 0; i < total_accesses; ++i) {
+        long long d = distances[i];
+        if (d == std::numeric_limits<long long>::max()) continue;
+        long long idx = (d - 1) / bin_size;
+        if (idx < 0) idx = 0;
+        if (idx >= num_buckets) idx = num_buckets - 1;
+        ++bins[(size_t)idx];
     }
 
     std::map<long long, double> mrc;
-    long long cumulative_hits = 0;
-    for (int i = 0; i < num_buckets; ++i) {
-        cumulative_hits += binned_histogram[i];
-        long long current_cache_size = (i + 1) * bin_size;
-        
-        // 캐시 크기가 데이터셋 크기를 넘지 않도록 조정
-        if (current_cache_size > total_dataset_size) {
-            current_cache_size = total_dataset_size;
-        }
-
-        long long miss_count = total_accesses - cumulative_hits;
-        mrc[current_cache_size] = static_cast<double>(miss_count) / total_accesses;
-        
-        if (current_cache_size == total_dataset_size) break;
+    long long hit_cum = 0;
+    for (int b = 0; b < num_buckets; ++b) {
+        hit_cum += bins[b];
+        long long cache_blocks = (long long)(b + 1) * bin_size;
+        if (cache_blocks > total_dataset_size) cache_blocks = total_dataset_size;
+        long long miss_cnt = (long long)total_accesses - hit_cum;
+        mrc[cache_blocks] = (double)miss_cnt / (double)total_accesses;
+        if (cache_blocks == total_dataset_size) break;
     }
-
     return mrc;
 }
 
+std::map<long long, double>
+MrcCalculator::calculate_mrc(const std::vector<long long>& trace,
+                             long long total_dataset_size,
+                             AlgorithmType type,
+                             int num_buckets)
+{
+    std::vector<long long> distances;
+    compute_distances(trace, type, distances);
+    return build_mrc_from_distances(distances, trace.size(), total_dataset_size, num_buckets);
+}
 
-// [수정됨] calculate_mrc 함수
-// total_dataset_size 파라미터를 추가하여 build_mrc_from_distances로 전달합니다.
-std::map<long long, double> MrcCalculator::calculate_mrc(const std::vector<long long>& trace, long long total_dataset_size, AlgorithmType type, int num_buckets) {
+// ===== 새로 추가: 구간별 MRC =====
+std::vector<std::pair<size_t, std::map<long long,double>>>
+MrcCalculator::calculate_mrc_intervals(const std::vector<long long>& trace,
+                                       long long total_dataset_size,
+                                       AlgorithmType type,
+                                       int num_buckets,
+                                       const std::vector<size_t>& checkpoints)
+{
     const size_t n = trace.size();
-    if (n == 0) {
-        return {};
+    std::vector<std::pair<size_t, std::map<long long,double>>> out;
+    if (n == 0 || checkpoints.empty()) return out;
+
+    // 1) 거리 계산 1회
+    std::vector<long long> distances;
+    compute_distances(trace, type, distances);
+
+    // 2) 히스토그램 누적하며 체크포인트마다 MRC 산출
+    if (total_dataset_size <= 0) return out;
+    long long bin_size = std::llround(std::ceil((double)total_dataset_size / num_buckets));
+    if (bin_size <= 0) bin_size = 1;
+
+    std::vector<long long> bins(num_buckets, 0);
+    size_t cp_idx = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        long long d = distances[i];
+        if (d != std::numeric_limits<long long>::max()) {
+            long long idx = (d - 1) / bin_size;
+            if (idx < 0) idx = 0;
+            if (idx >= num_buckets) idx = num_buckets - 1;
+            ++bins[(size_t)idx];
+        }
+
+        // i+1 (처리된 접근 수)가 체크포인트에 도달하면 MRC 한 번 출력
+        while (cp_idx < checkpoints.size() && (i + 1) == checkpoints[cp_idx]) {
+            const size_t total_accesses = checkpoints[cp_idx];
+
+            // 누적 hits → 미스율로 변환
+            std::map<long long,double> mrc;
+            long long hit_cum = 0;
+            for (int b = 0; b < num_buckets; ++b) {
+                hit_cum += bins[b];
+                long long cache_blocks = (long long)(b + 1) * bin_size;
+                if (cache_blocks > total_dataset_size) cache_blocks = total_dataset_size;
+                long long miss_cnt = (long long)total_accesses - hit_cum;
+                mrc[cache_blocks] = (double)miss_cnt / (double)total_accesses;
+                if (cache_blocks == total_dataset_size) break;
+            }
+
+            out.emplace_back(total_accesses, std::move(mrc));
+            ++cp_idx;
+        }
+        if (cp_idx >= checkpoints.size()) break;
     }
 
-    std::vector<long long> next_or_prev_pos(n);
-    std::unordered_map<long long, long long> last_pos;
-
-    if (type == AlgorithmType::LRU) {
-        for (size_t i = 0; i < n; ++i) {
-            long long block = trace[i];
-            if (last_pos.count(block)) {
-                next_or_prev_pos[i] = last_pos[block];
-            } else {
-                next_or_prev_pos[i] = -1;
-            }
-            last_pos[block] = i;
+    // 혹시 마지막 체크포인트가 n보다 크거나 같도록 들어왔을 때도 안전
+    for (; cp_idx < checkpoints.size(); ++cp_idx) {
+        size_t total_accesses = std::min(checkpoints[cp_idx], n);
+        std::map<long long,double> mrc;
+        long long hit_cum = 0;
+        for (int b = 0; b < num_buckets; ++b) {
+            hit_cum += bins[b];
+            long long cache_blocks = (long long)(b + 1) * bin_size;
+            if (cache_blocks > total_dataset_size) cache_blocks = total_dataset_size;
+            long long miss_cnt = (long long)total_accesses - hit_cum;
+            mrc[cache_blocks] = (double)miss_cnt / (double)total_accesses;
+            if (cache_blocks == total_dataset_size) break;
         }
-    } else { // OPT
-        for (long long i = n - 1; i >= 0; --i) {
-            long long block = trace[i];
-            if (last_pos.count(block)) {
-                next_or_prev_pos[i] = last_pos[block];
-            } else {
-                next_or_prev_pos[i] = -1;
-            }
-            last_pos[block] = i;
-        }
+        out.emplace_back(total_accesses, std::move(mrc));
     }
-
-    std::vector<long long> distances(n);
-    FenwickTree ft(n);
-    std::unordered_map<long long, int> last_occurrence;
-
-    if (type == AlgorithmType::LRU) {
-        for (size_t i = 0; i < n; ++i) {
-            long long prev_pos = next_or_prev_pos[i];
-            if (prev_pos == -1) {
-                distances[i] = std::numeric_limits<long long>::max();
-            } else {
-                long long unique_count = ft.query(i - 1) - ft.query(prev_pos);
-                distances[i] = unique_count + 1;
-            }
-            long long current_block = trace[i];
-            if (last_occurrence.count(current_block)) {
-                ft.update(last_occurrence.at(current_block), -1);
-            }
-            ft.update(i, 1);
-            last_occurrence[current_block] = i;
-        }
-    } else { // OPT
-        for (long long i = n - 1; i >= 0; --i) {
-            long long next_pos = next_or_prev_pos[i];
-            if (next_pos == -1) {
-                distances[i] = std::numeric_limits<long long>::max();
-            } else {
-                long long unique_count = ft.query(next_pos - 1) - ft.query(i);
-                distances[i] = unique_count + 1;
-            }
-            long long current_block = trace[i];
-            if (last_occurrence.count(current_block)) {
-                ft.update(last_occurrence.at(current_block), -1);
-            }
-            ft.update(i, 1);
-            last_occurrence[current_block] = i;
-        }
-    }
-
-    return build_mrc_from_distances(distances, n, total_dataset_size, num_buckets);
+    return out;
 }

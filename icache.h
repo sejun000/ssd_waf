@@ -27,7 +27,7 @@ public:
         evicted_blocks = 0;
         write_hit_size = 0;
     }
-    ICache(uint64_t cold_capacity, const std::string& waf_log_file);
+    ICache(uint64_t cold_capacity, const std::string& waf_log_file, const std::string& stat_log_file = "");
     std::string get_timestamp() {
         auto     now   = std::chrono::system_clock::now();
         std::time_t tt = std::chrono::system_clock::to_time_t(now);
@@ -66,4 +66,4 @@ public:
     FILE *fp_object = nullptr;
 };
 
-ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file);
+ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "");

@@ -16,7 +16,8 @@ SRCS_cache_sim     := cache_sim.cpp trace_parser.cpp allocator.cpp \
 					  evict_policy_selective_fifo.cpp evict_policy_k_cost_benefit.cpp evict_policy_multiqueue.cpp \
 					  ftl.cpp log_fifo_cache.cpp \
 					  histogram.cpp \
-					  istream.cpp sepbit.cpp hot_cold.cpp multi_hot_cold.cpp
+					  istream.cpp sepbit.cpp hot_cold.cpp multi_hot_cold.cpp \
+					  emwa.cpp ghost_cache.cpp
 
 SRCS_trace_replayer:= trace_replayer.cpp trace_parser.cpp
 

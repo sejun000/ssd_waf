@@ -5,6 +5,8 @@
 #include "evict_policy_greedy.h"
 #include "istream.h"
 #include "histogram.h"
+#include "emwa_ratio.h"
+#include "ghost_cache.h"
 
 #include <unordered_map>
 #include <deque>
@@ -23,6 +25,7 @@ public:
     {
         std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
         double      free_ratio_low = 0.01;                ///< 1 %
+        int         evicted_blk_size = 4;
     };
 
 
@@ -40,7 +43,8 @@ public:
              double target_valid_blk_rate = 0.0,
              std::unique_ptr<EvictPolicy> compactor = nullptr,
              double max_age_ratio_by_gc = 0.0,
-             bool input_only_compact = false
+             bool input_ghost_cache = false,
+             std::string stat_log_file = ""
             );
 
     ~LogCache();
@@ -55,6 +59,7 @@ public:
                       OP_TYPE                   op_type = OP_TYPE::WRITE);
     int get_block_size() override;
     void evict_one_block() override;
+    void evict(LogCacheSegment::Block &blk);
     bool is_cache_filled() override;
     virtual void print_stats() override;
     void print_objects(std::string prefix, uint64_t value);
@@ -95,7 +100,7 @@ private:
     void             evict_policy_update(LogCacheSegment *s);
     LogCacheSegment* get_segment_to_active_stream(bool gc, int stream, bool check_only = false);
     LogCacheSegment* get_segment_with_stream_policy(bool gc, uint64_t key, bool check_only = false);
-
+    void periodic();
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -112,10 +117,13 @@ private:
     uint64_t compacted_blocks = 0;
     uint64_t invalidate_blocks = 0;
     uint64_t reinsert_blocks = 0;
+    uint64_t ghost_cache_evicted_blocks = 0;
+    uint64_t read_blocks_in_partial_write = 0;
 
     uint64_t evicted_segment_age = 0;
 
     double target_valid_blk_rate = 0.0; // ratio of write to QLC
+    double valid_blk_rate_hard_limit = 0.0;
     std::unique_ptr<EvictPolicy> compactor;
     double additional_free_blks_ratio_by_gc;
     
@@ -124,8 +132,13 @@ private:
     std::unique_ptr<Histogram> compacted_blocks_histogram;
     std::unique_ptr<Histogram> evicted_ages_with_segment_histogram;
     std::unique_ptr<Histogram> compacted_ages_with_segment_histogram;
+    std::unique_ptr<Histogram> evicted_cache_blocks_per_evict;
     static const int HISTOGRAM_BUCKETS = 20;
-    bool only_compact = false;
+    static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = 262144 * 4;
+    bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
-
+    EwmaRatio compaction_ratio;
+    EwmaRatio eviction_ratio;
+    EwmaRatio eviction_ratio_in_ghost_cache;
+    GhostCache ghost_cache;
 };
