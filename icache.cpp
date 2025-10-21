@@ -28,9 +28,9 @@ double score_hot_and_greedy(Segment *seg) {
 double score_age_evict(Segment *seg) {
     return -seg->create_timestamp;
 }
-
+double segments = 8192.0;
 double score_age(Segment *seg) {
-    if (seg->valid_cnt > 8190) {
+    if (seg->valid_cnt > segments - 2) {
         return -UINT64_MAX;
     }
     return seg->create_timestamp;
@@ -38,16 +38,17 @@ double score_age(Segment *seg) {
 
 uint64_t g_threshold = 0;
 uint64_t g_timestamp = 0;
+
 double score_hot_first(Segment *seg) {
     assert(g_threshold > 0 && g_timestamp > 0);
-    double u = seg->valid_cnt / 8192.0;
+    double u = seg->valid_cnt / segments;
     return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / (u);
 }
 
 
 double score_cold_first(Segment *seg) {
     assert(g_threshold > 0 && g_timestamp > 0);
-    double u = seg->valid_cnt / 8192.0;
+    double u = seg->valid_cnt / segments;
     return (g_timestamp - seg->create_timestamp) * (1 - u) / (u);
 }
 
@@ -56,7 +57,7 @@ double score_warm_first(Segment *seg) {
         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
         assert(g_threshold > 0 && g_timestamp > 0);
     }
-    double u = seg->valid_cnt / 8192.0;
+    double u = seg->valid_cnt / segments;
     return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
 }
 
@@ -65,7 +66,7 @@ double score_warm_first_hot_last(Segment *seg) {
         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
         assert(g_threshold > 0 && g_timestamp > 0);
     }
-    double u = seg->valid_cnt / 8192.0;
+    double u = seg->valid_cnt / segments;
     if (seg->hot) {
         return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
     }
@@ -75,7 +76,7 @@ double score_warm_first_hot_last(Segment *seg) {
 double score_sepbit_age(Segment *seg) {
     
     assert(g_threshold > 0 && g_timestamp > 0);
-    double u = seg->valid_cnt / 8192.0;
+    double u = seg->valid_cnt / segments;
     return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / (u);
 }
 
@@ -244,13 +245,44 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, input_stream_policy, valid_rate_threshold, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false, stat_log_file);
     }
+    else if (cache_type == "LOG_FIFO_2") {
+        Config cfg  ={
+           // .segment_bytes  = 32ull * 1024 * 1024, ///< default 32 MB
+            .segment_bytes  = 32ull * 1024 * 1024, ///< default 32 MB
+            .free_ratio_low = 0.01,                ///< 1 %
+            .evicted_blk_size = 16,                 ///< 64k eviction
+            .print_stats_interval = TEN_GB,
+        };
+        return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>(), &cfg);
+    }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_12") { // for 64k eviction
+        Config cfg  ={
+            //.segment_bytes  = 32ull * 1024 * 1024, ///< default 32 MB
+            .segment_bytes  = 32ull * 1024 * 1024, ///< default 32 MB
+            .free_ratio_low = 0.01,                ///< 1 %
+            .evicted_blk_size = 16,                 ///< 64k eviction
+            .print_stats_interval = TEN_GB,
+        };
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
-            nullptr, input_stream_policy, valid_rate_threshold, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false, stat_log_file);
+            &cfg, input_stream_policy, 0.8, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false);
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_13") { // for 64k eviction
+        Config cfg  ={
+            //.segment_bytes  = 32ull * 1024 * 1024, ///< default 32 MB
+            .segment_bytes  = 32ull * 1024 * 1024, ///< default 32 MB
+            .free_ratio_low = 0.01,                ///< 1 %
+            .evicted_blk_size = 16,                 ///< 64k eviction
+            .print_stats_interval = TEN_GB,
+        };
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            &cfg, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true);
     }
     else if (cache_type == "LOG_SEPBIT_FIFO") {
+        
         IStream *input_stream_policy = createIstreamPolicy("sepbit");
         return new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
             cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>(), nullptr, input_stream_policy,

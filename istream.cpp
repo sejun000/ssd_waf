@@ -5,7 +5,8 @@
 #include <string>
 #include <cassert>
 
-uint64_t interval = 8000000;
+//uint64_t interval = 8000000;
+uint64_t interval = 10000000;
 
 IStream* createIstreamPolicy(std::string policy_type) {
     if (policy_type == "sepbit") {

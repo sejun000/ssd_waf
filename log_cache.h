@@ -18,17 +18,18 @@
 /**
  * Multi‑stream append‑only Log Cache (세그먼트 단위)
  */
+struct Config
+{
+    //std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
+    std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
+    
+    double      free_ratio_low = 0.01;                ///< 1 %
+    int         evicted_blk_size = 1;    // 4k eviction
+    uint64_t         print_stats_interval = 10 * 1024ull * 1024 * 1024; // 10 GB
+};
 class LogCache final : public ICache
 {
 public:
-    struct Config
-    {
-        std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
-        double      free_ratio_low = 0.01;                ///< 1 %
-        int         evicted_blk_size = 4;
-    };
-
-
     LogCache(uint64_t              cold_capacity,
              uint64_t              cache_block_count,
              int                   cache_block_size,

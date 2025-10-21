@@ -33,47 +33,50 @@ PageMappingFTL::PageMappingFTL(u64 totalBytes, EvictPolicy* policy)
     nand_write_pages = 0;
     host_write_pages = 0;
     total_nand_pages = totalBytes / NAND_PAGE_SIZE;
-    printf("total_nand_pages : %ld \n", total_nand_pages);
-    lpnToPpn_ = (u64 *)calloc(total_nand_pages * 2, sizeof(u64));
-    ppnToLpn_ = (u64 *)calloc(total_nand_pages, sizeof(u64));
-    memset(lpnToPpn_, 0xFF, total_nand_pages * 2 * sizeof(u64));
-    memset(ppnToLpn_, 0xFF, total_nand_pages * sizeof(u64));
+    printf("total_nand_pages : %llu \n", (unsigned long long)total_nand_pages);
 
-    //gc_active_block_id = NOT_ALLOCATED;
+    // ▶▶ 희소 매핑: 필요한 만큼만 저장
+    lpnToPpn_.reserve(total_nand_pages); // 동시에 유효한 LPN 수는 PPN 수를 넘지 않음
+    ppnToLpn_.reserve(total_nand_pages);
 }
 
 // ---------------- invalidate helper ------------
 void PageMappingFTL::InvalidatePpn(u64 ppn) {
-    if (ppn == NOT_ALLOCATED) {
-        return;
-    }
+    if (ppn == NOT_ALLOCATED) return;
+
     u64 blkId   = ppn / PAGES_PER_BLOCK;
     u64 pageIdx = ppn % PAGES_PER_BLOCK;
     Block& blk = blocks_[blkId];
+
     if (blk.valid[pageIdx]) {
         blk.valid[pageIdx] = false;
         --blk.valid_cnt;
         gcPolicy_->update(&blk);
     }
+    // ▶▶ 역매핑 정리 (유효하지 않은 PPN은 더 이상 LPN을 가리키지 않음)
+    ppnToLpn_.erase(ppn);
 }
 
 u64 PageMappingFTL::GetPpn(u64 lpn) {
-    assert (lpn < total_nand_pages * 2);
-    return lpnToPpn_[lpn];
+    //assert(lpn < total_nand_pages * 2);
+    auto it = lpnToPpn_.find(lpn);
+    return (it == lpnToPpn_.end()) ? NOT_ALLOCATED : it->second;
 }
 
 void PageMappingFTL::Unmap(u64 lpn) {
-    lpnToPpn_[lpn] = NOT_ALLOCATED;
+    // LPN → PPN 제거 (Trim 용도)
+    lpnToPpn_.erase(lpn);
 }
 
 u64 PageMappingFTL::GetLpn(u64 ppn) {
-    assert (ppn < total_nand_pages);
-    return ppnToLpn_[ppn];
+    assert(ppn < total_nand_pages);
+    auto it = ppnToLpn_.find(ppn);
+    return (it == ppnToLpn_.end()) ? NOT_ALLOCATED : it->second;
 }
 
 void PageMappingFTL::SetPpn(u64 lpn, u64 ppn) {
-    assert (lpn < total_nand_pages * 2);
-    assert (ppn < total_nand_pages);
+//    assert(lpn < total_nand_pages * 2);
+    assert(ppn < total_nand_pages);
     lpnToPpn_[lpn] = ppn;
     ppnToLpn_[ppn] = lpn;
 }
@@ -126,7 +129,10 @@ void PageMappingFTL::Write(u64 lbaOffset, u64 byteSize, int streamId) {
 
 // ---------------- Trim (fixed span calc) -------
 void PageMappingFTL::Trim(u64 lbaOffset, u64 byteSize) {
-    assert(lbaOffset % SECTOR_SIZE == 0 && byteSize % SECTOR_SIZE == 0);
+    if (!(lbaOffset % SECTOR_SIZE == 0 && byteSize % SECTOR_SIZE == 0)){
+        printf("%lu %lu\n", lbaOffset, byteSize);
+        assert(lbaOffset % SECTOR_SIZE == 0 && byteSize % SECTOR_SIZE == 0);
+    }
     if (byteSize == 0) return;
 
     const u64 firstSector = lbaOffset / SECTOR_SIZE;

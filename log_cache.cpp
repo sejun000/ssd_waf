@@ -164,20 +164,19 @@ void LogCache::periodic() {
                 eviction_ratio_in_ghost_cache.has_value()){
                 if (2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.02);
-                    printf("rise cache !!!!!!!! %.2f\n", target_valid_blk_rate);
+                    /*printf("rise cache !!!!!!!! %.2f\n", target_valid_blk_rate);
                     printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
                     printf ("compaction value : %.6f\n", compaction_ratio.value());
                     printf ("eviction_ratio : %.6f\n", eviction_ratio.value());
-                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());
-                    // Trigger some action
+                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());*/
                 }
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.02);
-                    printf("lower cache !!!!!!!! %.2f\n", target_valid_blk_rate);
+                    /*printf("lower cache !!!!!!!! %.2f\n", target_valid_blk_rate);
                     printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
                     printf ("compaction value : %.6f\n", compaction_ratio.value());
                     printf ("eviction_ratio : %.6f\n", eviction_ratio.value());
-                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());
+                    printf ("eviction_ratio_in_ghost_cache : %.6f\n", eviction_ratio_in_ghost_cache.value());*/
                 }
             }
         }
@@ -464,9 +463,8 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
                 ghost_cache.push(blk.key);
             }
             print_objects("evict", log_cache_timestamp - blk.create_timestamp);
-            evicted_blocks += 1;
+            evicted_blocks += cfg_.evicted_blk_size;
             evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
-            global_valid_blocks -= 1;
             evicted_timestamp[blk.key] = log_cache_timestamp;
             evicted_blocks_for_victim += 1;
             // map erase and blk valid false is done in this function
@@ -482,6 +480,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
             // add previous segment count 
             evict_policy_add(target_seg);
             int assigned_class_num = target_seg->get_class_num();
+            assert(assigned_class_num >= 0);
             gc_active_seg.erase(target_seg->get_class_num());
             target_seg = get_segment_to_active_stream(true, assigned_class_num);
         }
@@ -502,14 +501,14 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
         blk.valid = false;
     }
     assert((target_seg == nullptr && compacted_blocks_for_victim == 0) || target_seg);
-    if (target_seg) {
-        //printf("Compaction and Evict: %lu blocks moved from segment %p to segment %p, free_pool_size %ld, valid ratio %.4f age %lu target_seg_write_ptr %lu target_create_timestamp %lu threshold %lu stream_id %d\n", 
-       // s->valid_cnt, s, target_seg, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, target_seg->write_ptr, s->create_timestamp, threshold, target_seg->get_class_num());
+    /*if (target_seg) {
+        printf("Compaction and Evict: %lu blocks moved from segment %p to segment %p, free_pool_size %ld, valid ratio %.4f age %lu target_seg_write_ptr %lu target_create_timestamp %lu threshold %lu stream_id %d\n", 
+        s->valid_cnt, s, target_seg, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, target_seg->write_ptr, s->create_timestamp, threshold, target_seg->get_class_num());
     }
     else {
-      //  printf("Evict: %lu blocks free_pool_size %ld, valid ratio %.4f age %lu, create_time %lu \n", 
-      //  s->valid_cnt, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, s->create_timestamp);
-    }
+        printf("Evict: %lu blocks free_pool_size %ld, valid ratio %.4f age %lu, create_time %lu \n", 
+        s->valid_cnt, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, s->create_timestamp);
+    }*/
     reset_segment(s);
     evicted_blocks_histogram->inc(evicted_blocks_for_victim);
     compacted_blocks_histogram->inc(compacted_blocks_for_victim);
@@ -535,9 +534,8 @@ void LogCache::evict_segment(LogCacheSegment* s)
         }
         print_objects("evict", log_cache_timestamp - blk.create_timestamp);
         evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
-        evicted_blocks += 1;
+        evicted_blocks += cfg_.evicted_blk_size;
         evicted_blocks_for_victim += 1;
-        global_valid_blocks -= 1;
         evicted_timestamp[blk.key] = log_cache_timestamp;
 
         // map erase and blk valid false is done in this function    
@@ -545,7 +543,7 @@ void LogCache::evict_segment(LogCacheSegment* s)
         
     }
   //  printf("Evict: %lu blocks free_pool_size %ld, valid ratio %.4f age %lu, create_time %lu \n",
-    //    s->valid_cnt, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, s->create_timestamp);
+  //      s->valid_cnt, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, s->create_timestamp);
     reset_segment(s);
     evicted_blocks_histogram->inc(evicted_blocks_for_victim);
 }
@@ -571,17 +569,20 @@ void LogCache::evict(LogCacheSegment::Block &blk) {
         if (it != mapping.end()) {
             
             mapping.erase(index_64k);
-            blk.valid = false;
+            auto &other_blk = it->second.seg->blocks[it->second.idx];
+            other_blk.valid = false;
+            global_valid_blocks -= 1;
+            evicted_blocks_per_evict += 1;
         }
         else {
             read_blocks_in_partial_write += 1;
-            evicted_blocks_per_evict += 1;
         }
     }
     evicted_cache_blocks_per_evict->inc(evicted_blocks_per_evict);
     _evict_one_block(start_index_64k  * cache_block_size /* 64k aligend */, cache_block_size * EVICTED_BLOCK_SIZE /* 64k */, OP_TYPE::WRITE);
     mapping.erase(blk.key);
     blk.valid = false;
+    global_valid_blocks -= 1;
 }
 
 void LogCache::print_objects(std::string prefix, uint64_t value) {
@@ -589,11 +590,11 @@ void LogCache::print_objects(std::string prefix, uint64_t value) {
 }
 
 void LogCache::print_stats() {
-    static uint64_t written_window_bytes = cfg_.segment_bytes;
+    static uint64_t written_window_bytes = cfg_.print_stats_interval;
     static uint64_t next_written_bytes = cfg_.segment_bytes;
     if ((uint64_t)write_size_to_cache >= next_written_bytes) {
-        fprintf (fp_stats, "invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu\n",
-                invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes * cache_block_size, reinsert_blocks);
+        fprintf (fp_stats, "invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu\n",
+                invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes * cache_block_size, reinsert_blocks, read_blocks_in_partial_write);
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }

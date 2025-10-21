@@ -65,8 +65,7 @@ struct HeapNode {
 // ---------------------------------------------------------------------------
 class PageMappingFTL {
 public:
-    explicit PageMappingFTL(u64 totalBytes,
-                            EvictPolicy* policy);
+    explicit PageMappingFTL(u64 totalBytes, EvictPolicy* policy);
 
     void Write(u64 lbaOffset, u64 byteSize, int streamId);
     void Trim (u64 lbaOffset, u64 byteSize);
@@ -83,18 +82,19 @@ private:
     void InvalidatePpn(u64 ppn);
     u64  AllocateNewGCActiveBlock(int streamId);
     u64  AllocateNewActiveBlock(int streamId);
-    u64  GetOrAllocateGCActiveBlock(int streamId) ;
+    u64  GetOrAllocateGCActiveBlock(int streamId);
     u64  GetOrAllocateActiveBlock(int streamId);
     void RunGC();
 
     // state
-    std::vector<Block>                       blocks_;
-    u64*              lpnToPpn_;
-    u64*               ppnToLpn_;
-    std::vector<u64>                         freePool_;
-    std::unordered_map<int,u64>              activeBlk_;
-    std::unordered_map<int,u64>              gcActiveBlk_;
-    std::unique_ptr<EvictPolicy>               gcPolicy_;
+    std::vector<Block>                  blocks_;
+    // ▶▶ 배열 → 해시맵
+    std::unordered_map<u64,u64>         lpnToPpn_;   // LPN → PPN
+    std::unordered_map<u64,u64>         ppnToLpn_;   // PPN → LPN
+    std::vector<u64>                    freePool_;
+    std::unordered_map<int,u64>         activeBlk_;
+    std::unordered_map<int,u64>         gcActiveBlk_;
+    std::unique_ptr<EvictPolicy>        gcPolicy_;
 
     u64 nand_write_pages;
     u64 host_write_pages;

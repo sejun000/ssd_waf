@@ -53,11 +53,13 @@ static void print_usage() {
     std::cerr << "  --interval   : Compute MRC every <write_bytes> written (by write data size).\n";
     std::cerr << "  --miss-out   : Output CSV file path (default: stdout).\n";
     std::cerr << "  --miss-append: Append to output file.\n";
+    std::cerr << "  --trace-type : Trace format type for parser (csv, blktrace).\n";
 }
 
 int main(int argc, char* argv[]) {
     std::string file_path;
     std::string algo_str;
+    std::string trace_type;
     int num_buckets = 1000;
     uint64_t capacity_bytes = 0;
 
@@ -87,8 +89,15 @@ int main(int argc, char* argv[]) {
             interval_bytes = std::stoull(argv[++i]);
         } else if (arg == "--miss-out" && i + 1 < argc) {
             miss_out_path = argv[++i];
-        } else if (arg == "--miss-append") {
+        } else if (arg == "--miss-append" && i + 1 < argc) {
             miss_append = true;
+        } else if (arg == "--trace-type" && i + 1 < argc) {
+            trace_type = argv[++i];
+        }
+        else {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            print_usage();
+            return 1;
         }
     }
     assert(capacity_bytes > 0);
@@ -125,7 +134,8 @@ int main(int argc, char* argv[]) {
     std::string line;
 
     std::cout << "Parsing and blockifying trace file...\n";
-    std::unique_ptr<ITraceParser> parser(createTraceParser("csv"));
+    printf("trace_type = %s\n", trace_type.c_str());
+    std::unique_ptr<ITraceParser> parser(createTraceParser(trace_type));
     uint64_t byte_limit = 20000000000000ULL; // 10TB (주의: 0 하나 줄임)
     uint64_t written_bytes = 0ULL;
     uint64_t next_print_written_bytes = 100000000000ULL; // 100GB
@@ -133,6 +143,8 @@ int main(int argc, char* argv[]) {
 
     while (std::getline(trace_file, line)) {
         ParsedRow parsed = parser->parseTrace(line);
+        //printf("parsed.op_type: %s\n", parsed.op_type.c_str());
+        //printf("line %s \n", line.c_str());
         if (parsed.op_type == "W" || parsed.op_type == "WS") {
             if (parsed.lba_size <= 0) continue;
 
