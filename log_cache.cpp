@@ -162,7 +162,7 @@ void LogCache::periodic() {
             if (compaction_ratio.has_value() &&
                 eviction_ratio.has_value() && 
                 eviction_ratio_in_ghost_cache.has_value()){
-                if (2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
+                if (6.73 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.02);
                     /*printf("rise cache !!!!!!!! %.2f\n", target_valid_blk_rate);
                     printf ("eviction value : %.6f\n", 2.34 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()));
@@ -593,8 +593,10 @@ void LogCache::print_stats() {
     static uint64_t written_window_bytes = cfg_.print_stats_interval;
     static uint64_t next_written_bytes = cfg_.segment_bytes;
     if ((uint64_t)write_size_to_cache >= next_written_bytes) {
-        fprintf (fp_stats, "invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu\n",
-                invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes * cache_block_size, reinsert_blocks, read_blocks_in_partial_write);
+        const std::string& prefix = stats_prefix();
+        const char* prefix_cstr = prefix.empty() ? "LOG_CACHE" : prefix.c_str();
+        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu\n",
+                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes * cache_block_size, reinsert_blocks, read_blocks_in_partial_write);
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }

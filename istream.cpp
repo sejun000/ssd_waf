@@ -2,6 +2,7 @@
 #include "sepbit.h"
 #include "hot_cold.h"
 #include "multi_hot_cold.h"
+#include "hot_cold_midas.h"
 #include <string>
 #include <cassert>
 
@@ -25,6 +26,9 @@ IStream* createIstreamPolicy(std::string policy_type) {
     }
     else if (policy_type == "multi_hotcold_3") {
         return new MultiHotCold(20, interval, true, true, true);
+    }
+    else if (policy_type == "midas_hotcold") {
+        return new MiDASHotCold();
     }
     else {
         assert(false);

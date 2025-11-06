@@ -178,7 +178,7 @@ int main(int argc, char* argv[]) {
     std::string line;
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
-    const long long cache_write_size_limit = 6000000000000ULL;
+    const long long cache_write_size_limit = 40000000000000ULL;
     
     while (std::getline(infile, line) && line_count < line_count_limit) {
         line_count++;

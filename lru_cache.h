@@ -31,5 +31,10 @@ private:
     FILE *cold_trace_fp;
     int cache_block_size;
     bool cache_trace;
+    PageMappingFTL cache_ftl;
+    FILE *cache_ftl_log_fp = nullptr;
+    uint64_t cache_ftl_log_interval_bytes = 0;
+    uint64_t next_cache_ftl_log_bytes = 0;
+    void maybe_log_cache_ftl_stats();
     DummyAllocator allocator;
 };

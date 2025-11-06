@@ -31,7 +31,7 @@ def estimate_device_size(file_path, trace_format):
 def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate=''):
     """캐시 크기를 1%, 5%, 10%, 15%, 20%, 25%, 30%로 변경하며 실행"""
     #cache_ratios = [0.18]
-    cache_ratios = [0.18]
+    cache_ratios = [0.25]
     if (valid_rate == ''):
         valid_ratio_ranges = [0.8]
     else:
@@ -89,8 +89,8 @@ if __name__ == "__main__":
     parser.add_argument("--cache_policy", type=str, default='all', help="Cache policy: all (default) or write-only")
     parser.add_argument("--trace_format", type=str, choices=['csv', 'blktrace'], default='csv', help="Trace format: csv (default) or blktrace")
     parser.add_argument("--valid_rate", type=str, default='', help="Valid rate threshold for LOG_GREEDY_COST_BENEFIT_11 policy (two decimal number with comma)")
-    #parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes")
-    parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes")
+    parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes") # alibaba trace
+    #parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes") # lsmtree
     args = parser.parse_args()
     estimated_device_size = args.device_size
     print(f"Estimated Device Size: {estimated_device_size} bytes")

@@ -51,7 +51,9 @@ void PageMappingFTL::InvalidatePpn(u64 ppn) {
     if (blk.valid[pageIdx]) {
         blk.valid[pageIdx] = false;
         --blk.valid_cnt;
-        gcPolicy_->update(&blk);
+        if (blk.full()) {
+            gcPolicy_->update(&blk);
+        }
     }
     // ▶▶ 역매핑 정리 (유효하지 않은 PPN은 더 이상 LPN을 가리키지 않음)
     ppnToLpn_.erase(ppn);
@@ -213,6 +215,7 @@ void PageMappingFTL::RunGC() {
 
     // Migrate live pages
     Block& src = blocks_[victimId];
+    int valid_page = 0;
     for (u64 idx = 0; idx < PAGES_PER_BLOCK; ++idx) {
         if (!src.valid[idx]) continue;
         u64 blkId = GetOrAllocateGCActiveBlock(0);
@@ -230,11 +233,15 @@ void PageMappingFTL::RunGC() {
         dest.valid[dest.write_ptr] = true;
         ++dest.valid_cnt;
         ++dest.write_ptr;
+        if (dest.full()) {
+            gcPolicy_->add(&dest);
+        }
+        ++valid_page;
         SetPpn(lpn, newPpn);
     }
-
     // Erase source block
     src.reset();
+    gcPolicy_->remove(&src);
     assert (src.id == victimId);
     std::fill(src.valid.begin(), src.valid.end(), false);
     freePool_.push_back(victimId);

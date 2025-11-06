@@ -56,6 +56,8 @@ public:
     virtual size_t size() = 0;
     virtual bool is_no_cache() { return false; }
     std::tuple<long long, long long, long long> get_status();
+    void set_stats_prefix(const std::string& prefix);
+    const std::string& stats_prefix() const;
     PageMappingFTL ftl;
     long long write_size_to_cache;
     long long evicted_blocks;
@@ -64,6 +66,8 @@ public:
     FILE *fp;
     FILE *fp_stats = nullptr;
     FILE *fp_object = nullptr;
+protected:
+    std::string stats_prefix_;
 };
 
 ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "");

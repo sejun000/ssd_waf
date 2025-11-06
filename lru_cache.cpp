@@ -1,7 +1,36 @@
 #include "lru_cache.h"
+#include "evict_policy_greedy.h"
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
 
-LRUCache::LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file) : ICache(cold_capacity, waf_log_file), capacity_(capacity), cache_block_size(_cache_block_size), cache_trace(_cache_trace), allocator(capacity * _cache_block_size, _cache_block_size) {
+namespace {
+constexpr double kCacheOpRatio = 0.07;
+
+long EffectiveCapacity(long base) {
+    if (base <= 0) return 0;
+    long op_blocks = static_cast<long>(std::ceil(base * kCacheOpRatio));
+    if (op_blocks == 0) op_blocks = 1;
+    long effective = base - op_blocks;
+    return effective > 0 ? effective : 1;
+}
+}
+
+LRUCache::LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file)
+    : ICache(cold_capacity, waf_log_file),
+      capacity_(EffectiveCapacity(capacity)),
+      cache_filled(false),
+      cache_trace_fp(nullptr),
+      cold_trace_fp(nullptr),
+      cache_block_size(_cache_block_size),
+      cache_trace(_cache_trace),
+      cache_ftl(static_cast<uint64_t>(capacity) * cache_block_size, new GreedyEvictPolicy()),
+      cache_ftl_log_fp(nullptr),
+      cache_ftl_log_interval_bytes(10ull * 1024 * 1024 * 1024),
+      next_cache_ftl_log_bytes(10ull * 1024 * 1024 * 1024),
+      allocator(static_cast<size_t>(capacity_) * _cache_block_size, _cache_block_size) {
     cache_trace_fp = nullptr;
     //printf("LRU cache created with capacity: %ld\n", capacity);
     if (cache_trace) {
@@ -18,6 +47,9 @@ LRUCache::~LRUCache() {
     }
     if (cold_trace_fp) {
         fclose(cold_trace_fp);
+    }
+    if (cache_ftl_log_fp) {
+        fclose(cache_ftl_log_fp);
     }
 }
 
@@ -91,9 +123,15 @@ void LRUCache::evict_one_block() {
     size_t id = second.allocated_id;
     cacheMap.erase(oldest);
     allocator.free(id);
+    cache_ftl.Trim(id * cache_block_size, static_cast<uint64_t>(cache_block_size));
     cache_filled = true;
-    const uint64_t DUMMY_VALUE = 0;
-    fprintf(cold_trace_fp, "%ld,%s,%ld,%d,%ld\n", DUMMY_VALUE, "W", oldest * cache_block_size, cache_block_size, DUMMY_VALUE);
+    if (cold_trace_fp) {
+        const uint64_t DUMMY_VALUE = 0;
+        fprintf(cold_trace_fp, "%ld,%s,%ld,%d,%ld\n",
+                DUMMY_VALUE, "W", oldest * cache_block_size, cache_block_size, DUMMY_VALUE);
+    }
+    maybe_log_cache_ftl_stats();
+    _evict_one_block(oldest * cache_block_size, cache_block_size, OP_TYPE::WRITE);
 }
 
 void LRUCache::batch_insert(int stream_id, const std::map<long, int> &newBlocks, OP_TYPE op_type) {
@@ -102,6 +140,11 @@ void LRUCache::batch_insert(int stream_id, const std::map<long, int> &newBlocks,
         int lba_size = iter.second;
         if (exists(block)) {
             touch(block, op_type);
+            if (op_type == OP_TYPE::WRITE && lba_size > 0) {
+                auto &entry = cacheMap[block];
+                size_t alloc_id = entry.allocated_id;
+                cache_ftl.Write(alloc_id * cache_block_size, static_cast<uint64_t>(lba_size), stream_id);
+            }
         } else {
             while (cacheMap.size() >= static_cast<size_t>(capacity_)) {
                 evict_one_block();
@@ -114,8 +157,14 @@ void LRUCache::batch_insert(int stream_id, const std::map<long, int> &newBlocks,
                 .allocated_id = alloc_id
             };
             cacheMap[block] = cacheEntry;
+            if (op_type == OP_TYPE::WRITE && lba_size > 0) {
+                cache_ftl.Write(alloc_id * cache_block_size, static_cast<uint64_t>(lba_size), stream_id);
+            }
         }
         write_size_to_cache += lba_size;
+    }
+    if (op_type == OP_TYPE::WRITE) {
+        maybe_log_cache_ftl_stats();
     }
 }
 
@@ -126,4 +175,47 @@ bool LRUCache::is_cache_filled() {
 size_t LRUCache::size(){
     //printf("cacheMap.size() = %ld\n", cacheMap.size());
     return cacheMap.size();
+}
+
+void LRUCache::maybe_log_cache_ftl_stats() {
+    if (cache_ftl_log_interval_bytes == 0) {
+        return;
+    }
+    if (!cache_ftl_log_fp) {
+        const std::string& prefix = stats_prefix();
+        std::string cache_ftl_log_name = "stat.log." + (prefix.empty() ? std::string("LRU") : prefix) + "." + get_timestamp();
+        cache_ftl_log_fp = fopen(cache_ftl_log_name.c_str(), "w");
+        if (cache_ftl_log_fp == nullptr) {
+            printf("whyyyyyy\n");
+            std::cerr << "Cannot open file: " << cache_ftl_log_name << std::endl;
+            return;
+        }
+    }
+    const uint64_t host_bytes = cache_ftl.GetHostWritePages() * static_cast<uint64_t>(NAND_PAGE_SIZE);
+    if (host_bytes < next_cache_ftl_log_bytes) {
+        return;
+    }
+    const uint64_t nand_bytes = cache_ftl.GetNandWritePages() * static_cast<uint64_t>(NAND_PAGE_SIZE);
+
+    const auto compacted_blocks_value = (cache_ftl.GetNandWritePages() - cache_ftl.GetHostWritePages())
+        * static_cast<unsigned long long>(NAND_PAGE_SIZE)
+        / static_cast<unsigned long long>(cache_block_size);
+    const std::string& prefix = stats_prefix();
+    const char* prefix_cstr = prefix.empty() ? "LRU" : prefix.c_str();
+    fprintf(cache_ftl_log_fp,
+            "%s invalidate_blocks: %lld compacted_blocks: %llu global_valid_blocks: %llu write_size_to_cache: %lld evicted_blocks: %lld write_hit_size: %lld total_cache_size: %llu reinsert_blocks: %d read_blocks_in_partial_write %d waf_host_bytes: %llu waf_nand_bytes: %llu\n",
+            prefix_cstr,
+            evicted_blocks,
+            static_cast<unsigned long long>(compacted_blocks_value),
+            static_cast<unsigned long long>(cacheMap.size()),
+            write_size_to_cache,
+            evicted_blocks,
+            write_hit_size,
+            static_cast<unsigned long long>(static_cast<uint64_t>(capacity_) * static_cast<uint64_t>(cache_block_size)),
+            0,
+            0,
+            static_cast<unsigned long long>(host_bytes),
+            static_cast<unsigned long long>(nand_bytes));
+    fflush(cache_ftl_log_fp);
+    next_cache_ftl_log_bytes += cache_ftl_log_interval_bytes;
 }
