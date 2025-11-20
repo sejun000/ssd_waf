@@ -15,3 +15,4 @@ static const int MAX_STREAMS = 40;
 };
 
 IStream* createIstreamPolicy(std::string policy_type);
+void set_stream_interval(uint64_t cache_block_count);

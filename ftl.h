@@ -84,7 +84,7 @@ private:
     u64  AllocateNewActiveBlock(int streamId);
     u64  GetOrAllocateGCActiveBlock(int streamId);
     u64  GetOrAllocateActiveBlock(int streamId);
-    void RunGC();
+    bool RunGC();
 
     // state
     std::vector<Block>                  blocks_;

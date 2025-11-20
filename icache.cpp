@@ -4,6 +4,7 @@
 #include "log_fifo_cache.h"
 #include "no_cache.h"
 #include "log_cache.h"
+#include "fairywren_cache.h"
 #include "evict_policy_fifo.h"
 #include "evict_policy_fifo_zero.h"
 #include "evict_policy_greedy.h"
@@ -105,6 +106,10 @@ T* attach_prefix(T* cache, const std::string& prefix) {
 }
 
 ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold, std::string stat_log_file) {
+    if (capacity <= 0) {
+        capacity = 1;
+    }
+    set_stream_interval(static_cast<uint64_t>(capacity));
     if (cache_type == "LRU") {
         return attach_prefix(new LRUCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file), cache_type);
     }
@@ -125,6 +130,19 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     }
     else if (cache_type == "LOG_COST_BENEFIT") {
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>()), cache_type);
+    }
+    else if (cache_type == "FAIRYWREN") {
+        FairyWrenConfig cfg;
+        return attach_prefix(new FairyWrenCache(cold_capacity,
+                                                capacity,
+                                                cache_block_size,
+                                                _cache_trace,
+                                                trace_file,
+                                                cold_trace_file,
+                                                waf_log_file,
+                                                cfg,
+                                                stat_log_file),
+                             cache_type);
     }
     else if (cache_type == "LOG_MIDAS_DEFAULT") {
         IStream *input_stream_policy = createIstreamPolicy("midas_hotcold");
@@ -251,6 +269,12 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, input_stream_policy, 0.93, std::make_unique<CbEvictPolicy>(score_cold_first), 0, false), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_8_3") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.90, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_9") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");

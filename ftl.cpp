@@ -6,7 +6,8 @@
 #include <cassert>
 #include <iostream>
 #include <string>
-#include <cstring> 
+#include <cstring>
+#include <stdexcept>
 
 // ---------------- Block helpers ----------------
 Block::Block(u64 id_) : Segment(0), id(id_), valid(PAGES_PER_BLOCK,false) {}
@@ -174,7 +175,13 @@ u64 PageMappingFTL::GetOrAllocateGCActiveBlock(int streamId) {
 
 
 u64 PageMappingFTL::AllocateNewActiveBlock(int streamId) {
-    while (freePool_.size() < GC_TRIGGER_THRESHOLD) RunGC();
+    while (freePool_.size() < GC_TRIGGER_THRESHOLD) {
+        std::size_t before = freePool_.size();
+        bool progressed = RunGC();
+        if (!progressed || freePool_.size() <= before) {
+            throw std::runtime_error("GC could not reclaim space (free pool stalled)");
+        }
+    }
     if (freePool_.empty()) throw std::runtime_error("Out of space even after GC");
     u64 blkId = freePool_.back();
     freePool_.pop_back();
@@ -203,13 +210,19 @@ u64 PageMappingFTL::AllocateNewGCActiveBlock(int streamId) {
 
 
 // ---------------- Garbage Collection ----------
-void PageMappingFTL::RunGC() {
+bool PageMappingFTL::RunGC() {
     Block* victim = (Block*)gcPolicy_->choose_segment();
     u64 victimId = victim ? victim->id : NOT_ALLOCATED;
     if (victimId == NOT_ALLOCATED) {
         // No victim found, nothing to do
         printf("No victim found for GC\n");
-        return;
+        return false;
+    }
+    if (victim->valid_cnt == PAGES_PER_BLOCK) {
+        // No reclaimable space (all valid). Avoid spinning forever.
+        printf("GC victim %llu is full (%zu valid); no space can be reclaimed. Need TRIM/OP.\n",
+               (unsigned long long)victimId, victim->valid_cnt);
+        return false;
     }
     // Allocate destination (spare) block
 
@@ -247,6 +260,7 @@ void PageMappingFTL::RunGC() {
     freePool_.push_back(victimId);
 
     // Optionally: reclaim dest block if not fully used and almost empty etc.
+    return true;
 }
 
 // ---------------- Demo main (compile with -DFTL_DEMO) -----

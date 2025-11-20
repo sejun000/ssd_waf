@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <list>
 
-extern int interval;
+extern uint64_t interval;
 /* ------------------------------------------------------------------ */
 /* ctor / dtor                                                        */
 /* ------------------------------------------------------------------ */
@@ -362,6 +362,7 @@ void LogCache::check_and_evict_if_needed()
             else {
                 // addtional_free_blks_ratio_by_gc is on 
                 // and threshold < log_cache_timestamp - victim->create_timestamp
+                // exception path
                 compact = false; 
             }
         }
@@ -596,7 +597,7 @@ void LogCache::print_stats() {
         const std::string& prefix = stats_prefix();
         const char* prefix_cstr = prefix.empty() ? "LOG_CACHE" : prefix.c_str();
         fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu\n",
-                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes * cache_block_size, reinsert_blocks, read_blocks_in_partial_write);
+                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write);
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }

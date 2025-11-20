@@ -65,6 +65,48 @@ void calc_hit_ratio(long long read_hit_size, long long total_read_size,
     write_hit_ratio = (total_write_size > 0) ? (static_cast<double>(write_hit_size) / total_write_size) * 100 : 0;
 }
 
+// Fill only addresses observed in the trace up to a byte limit; aligns to block/sector.
+static void trace_prefill(ICache& cache,
+                          const std::string& trace_file,
+                          ITraceParser& parser,
+                          uint64_t byte_limit,
+                          int block_size) {
+    const uint64_t align_unit = std::max<uint64_t>(block_size, SECTOR_SIZE);
+    const uint64_t aligned_limit = (byte_limit / align_unit) * align_unit;
+    if (aligned_limit == 0) {
+        std::cout << "[prefill] skip: byte_limit too small\n";
+        return;
+    }
+
+    std::ifstream infile(trace_file);
+    if (!infile) {
+        std::cerr << "[prefill] cannot open trace: " << trace_file << std::endl;
+        return;
+    }
+
+    uint64_t written = 0;
+    uint64_t next_log = 1ULL << 40; // 1 TB
+    std::string line;
+    while (std::getline(infile, line) && written < aligned_limit) {
+        ParsedRow parsed = parser.parseTrace(line);
+        if (parsed.dev_id.empty()) continue;
+        uint64_t aligned_size = (static_cast<uint64_t>(parsed.lba_size) / align_unit) * align_unit;
+        if (aligned_size == 0) continue;
+        uint64_t aligned_offset = (static_cast<uint64_t>(parsed.lba_offset) / align_unit) * align_unit;
+
+        uint64_t to_write = std::min<uint64_t>(aligned_size, aligned_limit - written);
+        issue_op_to_cache(cache, static_cast<long long>(aligned_offset), static_cast<int>(to_write), OP_TYPE::WRITE);
+        written += to_write;
+
+        while (written >= next_log) {
+            std::cout << "[prefill] written " << (next_log >> 40) << "T" << std::endl;
+            next_log += (1ULL << 40);
+        }
+    }
+
+    std::cout << "[prefill] done, total " << written << " bytes (limit " << aligned_limit << ", align " << align_unit << ")" << std::endl;
+}
+
 // =======================
 // main() 함수
 // =======================
@@ -97,7 +139,7 @@ int main(int argc, char* argv[]) {
     signal(SIGFPE, signal_handler);
     signal(SIGINT, signal_handler);
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " trace_file cache_size [--block_size N] [--rw_policy all|write-only] [--trace_format csv|blktrace] [--cache_policy LRU/FIFO] [--cache_trace] [--cold_capacity [bytes]] [--waf_log_file [filename]] [--valid_ratio [%]] [--stat_log_file [filename]]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " trace_file cache_size [--block_size N] [--rw_policy all|write-only] [--trace_format csv|blktrace] [--cache_policy LRU/FIFO] [--cache_trace] [--cold_capacity [bytes]] [--waf_log_file [filename]] [--valid_ratio [%]] [--stat_log_file [filename]] [--no_fill]" << std::endl;
         return 1;
     }
     std::string trace_file = argv[1];
@@ -113,7 +155,9 @@ int main(int argc, char* argv[]) {
     std::string stat_log_file = "";
     double valid_ratio = 0.0;
     bool cache_trace = false;
+    bool no_fill = false;
     uint64_t cold_capacity = 0;
+    const long long cache_write_size_limit = 40000000000000ULL;
 
     // 추가 인자 파싱
     for (int i = 3; i < argc; i++) {
@@ -140,6 +184,8 @@ int main(int argc, char* argv[]) {
             valid_ratio = std::stod(argv[++i]);
         } else if (arg == "--stat_log_file" && i + 1 < argc) {
              stat_log_file = argv[++i];
+        } else if (arg == "--no_fill" || arg == "-no_fill" || arg == "-no_filll") {
+            no_fill = true;
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -156,12 +202,22 @@ int main(int argc, char* argv[]) {
     printf("cache_trace_output = %s\n", cache_trace_output.c_str());
     printf("cold_trace_output = %s\n", cold_trace_output.c_str());
     printf("cold_capacity = %lu\n", cold_capacity);
+    printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
     std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file));
+
+    if (!no_fill) {
+        std::cout << "[prefill] start: trace=" << trace_file
+                  << ", limit=" << cache_write_size_limit
+                  << ", block_size=" << block_size << std::endl;
+        // Prefill using trace until limit; uses same parser to avoid dup parsing logic differences.
+        trace_prefill(*cache, trace_file, *parser, cache_write_size_limit, block_size);
+    }
+
     // 통계 변수 초기화
     long long total_read = 0, total_write = 0;
     long long total_read_size = 0, total_write_size = 0;
@@ -178,7 +234,6 @@ int main(int argc, char* argv[]) {
     std::string line;
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
-    const long long cache_write_size_limit = 40000000000000ULL;
     
     while (std::getline(infile, line) && line_count < line_count_limit) {
         line_count++;
