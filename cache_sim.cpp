@@ -14,6 +14,11 @@
 #include <iostream>
 #include <cstring>
 #include <memory>
+#include <climits>
+
+static constexpr uint64_t CACHE_WRITE_SIZE_LIMIT = 40000000000000ULL; // also used for prefill log interval
+static constexpr uint64_t PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
+#define PREFILL_RATE (0.8)
 
 void signal_handler(int signum) {
     std::cerr << "Received signal " << signum << ", stack trace:\n";
@@ -65,18 +70,21 @@ void calc_hit_ratio(long long read_hit_size, long long total_read_size,
     write_hit_ratio = (total_write_size > 0) ? (static_cast<double>(write_hit_size) / total_write_size) * 100 : 0;
 }
 
-// Fill only addresses observed in the trace up to a byte limit; aligns to block/sector.
+// Fill only unique address ranges observed in the trace up to a byte limit; aligns to block/sector.
 static void trace_prefill(ICache& cache,
                           const std::string& trace_file,
                           ITraceParser& parser,
                           uint64_t byte_limit,
-                          int block_size) {
+                          int block_size, uint64_t cold_capacity) {
     const uint64_t align_unit = std::max<uint64_t>(block_size, SECTOR_SIZE);
     const uint64_t aligned_limit = (byte_limit / align_unit) * align_unit;
-    if (aligned_limit == 0) {
+    uint64_t target_bytes = static_cast<uint64_t>(cold_capacity * PREFILL_RATE);
+    target_bytes = (target_bytes / align_unit) * align_unit;
+    if (aligned_limit == 0 || target_bytes == 0) {
         std::cout << "[prefill] skip: byte_limit too small\n";
         return;
     }
+    target_bytes = std::min<uint64_t>(aligned_limit, target_bytes);
 
     std::ifstream infile(trace_file);
     if (!infile) {
@@ -84,27 +92,89 @@ static void trace_prefill(ICache& cache,
         return;
     }
 
-    uint64_t written = 0;
-    uint64_t next_log = 1ULL << 40; // 1 TB
+    std::map<uint64_t, uint64_t> ranges; // start -> end (exclusive), aligned
+    uint64_t unique_bytes = 0;
     std::string line;
-    while (std::getline(infile, line) && written < aligned_limit) {
+    uint64_t next_scan_log = PREFILL_LOG_INTERVAL;
+    uint64_t accumulated_bytes = 0;
+
+    auto add_range = [&](uint64_t start, uint64_t end) {
+        if (start >= end) return;
+        uint64_t new_start = start;
+        uint64_t new_end   = end;
+        uint64_t removed   = 0;
+
+        auto it = ranges.lower_bound(start);
+        if (it != ranges.begin()) {
+            auto prev = std::prev(it);
+            if (prev->second >= start) {
+                new_start = prev->first;
+                new_end   = std::max(new_end, prev->second);
+                removed  += prev->second - prev->first; // entire erased interval was already counted
+                it = ranges.erase(prev);
+            }
+        }
+        while (it != ranges.end() && it->first <= new_end) {
+            new_end   = std::max(new_end, it->second);
+            removed  += it->second - it->first; // entire erased interval was already counted
+            it        = ranges.erase(it);
+        }
+
+        ranges[new_start] = new_end;
+        uint64_t added = new_end - new_start;
+        if (added >= removed) {
+            unique_bytes += (added - removed);
+        }
+        while (unique_bytes >= next_scan_log) {
+            std::cout << "[prefill][scan] covered " << (next_scan_log >> 30) << " GB of unique address space, accumulate = " << (accumulated_bytes >> 30) << " GB" << std::endl;
+            next_scan_log += PREFILL_LOG_INTERVAL;
+        }
+    };
+    
+    while (std::getline(infile, line) && unique_bytes < target_bytes) {
         ParsedRow parsed = parser.parseTrace(line);
         if (parsed.dev_id.empty()) continue;
         uint64_t aligned_size = (static_cast<uint64_t>(parsed.lba_size) / align_unit) * align_unit;
         if (aligned_size == 0) continue;
         uint64_t aligned_offset = (static_cast<uint64_t>(parsed.lba_offset) / align_unit) * align_unit;
 
-        uint64_t to_write = std::min<uint64_t>(aligned_size, aligned_limit - written);
-        issue_op_to_cache(cache, static_cast<long long>(aligned_offset), static_cast<int>(to_write), OP_TYPE::WRITE);
-        written += to_write;
-
-        while (written >= next_log) {
-            std::cout << "[prefill] written " << (next_log >> 40) << "T" << std::endl;
-            next_log += (1ULL << 40);
+        uint64_t end = aligned_offset + aligned_size;
+        add_range(aligned_offset, end);
+        accumulated_bytes += aligned_size;
+        if (accumulated_bytes >= aligned_limit) {
+            break;
         }
     }
 
-    std::cout << "[prefill] done, total " << written << " bytes (limit " << aligned_limit << ", align " << align_unit << ")" << std::endl;
+    uint64_t written = 0;
+    uint64_t next_log = PREFILL_LOG_INTERVAL;
+    const uint64_t fill_chunk = std::max<uint64_t>(block_size, align_unit);
+
+    for (const auto& kv : ranges) {
+        uint64_t start = kv.first;
+        uint64_t end   = kv.second;
+        if (written >= target_bytes) break;
+        uint64_t len   = end - start;
+        uint64_t remaining = target_bytes - written;
+        len = std::min<uint64_t>(len, remaining);
+
+        uint64_t offset = start;
+        uint64_t left   = len;
+        while (left > 0) {
+            uint64_t chunk = std::min<uint64_t>(fill_chunk, left);
+            issue_op_to_cache(cache, static_cast<long long>(offset), static_cast<int>(chunk), OP_TYPE::WRITE);
+            offset  += chunk;
+            left    -= chunk;
+            written += chunk;
+
+            if (written >= next_log) {
+                std::cout << "[prefill][write] written " << (next_log >> 30) << " GB" << std::endl;
+                next_log += PREFILL_LOG_INTERVAL;
+            }
+        }
+    }
+
+    std::cout << "[prefill] done, total " << written << " bytes (target " << target_bytes << ", align " << align_unit << ")" << std::endl;
 }
 
 // =======================
@@ -155,9 +225,8 @@ int main(int argc, char* argv[]) {
     std::string stat_log_file = "";
     double valid_ratio = 0.0;
     bool cache_trace = false;
-    bool no_fill = false;
+    bool no_fill = true;
     uint64_t cold_capacity = 0;
-    const long long cache_write_size_limit = 40000000000000ULL;
 
     // 추가 인자 파싱
     for (int i = 3; i < argc; i++) {
@@ -212,10 +281,10 @@ int main(int argc, char* argv[]) {
 
     if (!no_fill) {
         std::cout << "[prefill] start: trace=" << trace_file
-                  << ", limit=" << cache_write_size_limit
+                  << ", limit=" << cold_capacity
                   << ", block_size=" << block_size << std::endl;
         // Prefill using trace until limit; uses same parser to avoid dup parsing logic differences.
-        trace_prefill(*cache, trace_file, *parser, cache_write_size_limit, block_size);
+        trace_prefill(*cache, trace_file, *parser, CACHE_WRITE_SIZE_LIMIT, block_size, cold_capacity);
     }
 
     // 통계 변수 초기화
@@ -241,7 +310,7 @@ int main(int argc, char* argv[]) {
             print_stats(true, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
         }
         cache->print_stats();
-        if (cache_write_size > cache_write_size_limit) {
+        if (static_cast<uint64_t>(cache_write_size) > CACHE_WRITE_SIZE_LIMIT) {
             break;
         }
         // 사용자 구현 parse_trace 함수 호출

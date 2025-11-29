@@ -7,7 +7,6 @@
 #include <iostream>
 #include <string>
 #include <cstring>
-#include <stdexcept>
 
 // ---------------- Block helpers ----------------
 Block::Block(u64 id_) : Segment(0), id(id_), valid(PAGES_PER_BLOCK,false) {}
@@ -112,6 +111,7 @@ void PageMappingFTL::Write(u64 lbaOffset, u64 byteSize, int streamId) {
         InvalidatePpn(old);
 
         u64 blkId = GetOrAllocateActiveBlock(streamId);
+        if (blkId == NOT_ALLOCATED) return;
         if (blocks_[blkId].full()) {
             assert(false);
         }
@@ -177,12 +177,12 @@ u64 PageMappingFTL::GetOrAllocateGCActiveBlock(int streamId) {
 u64 PageMappingFTL::AllocateNewActiveBlock(int streamId) {
     while (freePool_.size() < GC_TRIGGER_THRESHOLD) {
         std::size_t before = freePool_.size();
-        bool progressed = RunGC();
-        if (!progressed || freePool_.size() <= before) {
-            throw std::runtime_error("GC could not reclaim space (free pool stalled)");
-        }
+        RunGC();
     }
-    if (freePool_.empty()) throw std::runtime_error("Out of space even after GC");
+    if (freePool_.empty()) {
+        printf("Out of space even after GC (active)\n");
+        return NOT_ALLOCATED;
+    }
     u64 blkId = freePool_.back();
     freePool_.pop_back();
     Block& b = blocks_[blkId];
@@ -196,7 +196,10 @@ u64 PageMappingFTL::AllocateNewActiveBlock(int streamId) {
 
 u64 PageMappingFTL::AllocateNewGCActiveBlock(int streamId) {
     if (freePool_.empty()) assert(false);
-    if (freePool_.empty()) throw std::runtime_error("Out of space even after GC");
+    if (freePool_.empty()) {
+        printf("Out of space even after GC (gc-active)\n");
+        return NOT_ALLOCATED;
+    }
     u64 blkId = freePool_.back();
     freePool_.pop_back();
     Block& b = blocks_[blkId];

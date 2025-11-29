@@ -89,7 +89,9 @@ if __name__ == "__main__":
     parser.add_argument("--cache_policy", type=str, default='all', help="Cache policy: all (default) or write-only")
     parser.add_argument("--trace_format", type=str, choices=['csv', 'blktrace'], default='csv', help="Trace format: csv (default) or blktrace")
     parser.add_argument("--valid_rate", type=str, default='', help="Valid rate threshold for LOG_GREEDY_COST_BENEFIT_11 policy (two decimal number with comma)")
-    parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes") # alibaba trace
+    #parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes") # alibaba trace
+    parser.add_argument("--device_size", type=int, default=2174461292544, help="Device size in bytes") # alibaba trace 40TB written
+    #[prefill] done, total 2174461292544 bytes (target 3288206467072, align 4096)
     #parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes") # lsmtree
     args = parser.parse_args()
     estimated_device_size = args.device_size

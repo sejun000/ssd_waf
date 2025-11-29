@@ -4,6 +4,7 @@
 #include "log_fifo_cache.h"
 #include "no_cache.h"
 #include "log_cache.h"
+#include "midas_cache.h"
 #include "fairywren_cache.h"
 #include "evict_policy_fifo.h"
 #include "evict_policy_fifo_zero.h"
@@ -409,6 +410,18 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, nullptr, 0.93, std::make_unique<KthCbEvictPolicy>(score_age, ranking), 1.0), cache_type);
+    }
+    else if (cache_type == "MIDAS_CACHE") {
+        MidasInitArgs midas_args;
+        midas_args.workload = "midas_cache_adapter";
+        midas_args.vs_policy = "greedy";
+        midas_args.dev_gb = static_cast<int>(capacity * cache_block_size / (1000 * 1000 * 1000));
+        if (midas_args.dev_gb <= 0) midas_args.dev_gb = 1;
+        midas_args.seg_mb = 32; // default 32MB
+        return attach_prefix(new MidasCache(cold_capacity, capacity, cache_block_size, _cache_trace,
+                                            trace_file, cold_trace_file, waf_log_file,
+                                            nullptr, nullptr, 0.93, stat_log_file, 5, midas_args),
+                             cache_type);
     }
     else {
         assert(false);

@@ -34,12 +34,12 @@ FairyWrenCache::FairyWrenCache(uint64_t           cold_capacity,
     : ICache(cold_capacity, waf_log_file, stat_log_file),
       cache_block_size_(cache_block_size),
       cfg_(cfg),
-      evicted_ages_histogram_(std::make_unique<Histogram>("fw_evicted_ages", interval, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      evicted_ages_histogram_(std::make_unique<Histogram>("fw_evicted_ages", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
       evicted_blocks_histogram_(std::make_unique<Histogram>("fw_evicted_blocks", 1, HISTOGRAM_BUCKETS, fp_stats)),
       migrated_blocks_histogram_(std::make_unique<Histogram>("fw_migrated_blocks", 1, HISTOGRAM_BUCKETS, fp_stats)),
-      evicted_ages_with_segment_histogram_(std::make_unique<Histogram>("fw_evicted_segment_age", interval, HISTOGRAM_BUCKETS * 2, fp_stats)),
-      migrated_ages_with_segment_histogram_(std::make_unique<Histogram>("fw_migrated_segment_age", interval, HISTOGRAM_BUCKETS * 2, fp_stats)),
-      migrated_ages_histogram_(std::make_unique<Histogram>("fw_migrated_ages", interval, HISTOGRAM_BUCKETS * 2, fp_stats)) {
+      evicted_ages_with_segment_histogram_(std::make_unique<Histogram>("fw_evicted_segment_age", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      migrated_ages_with_segment_histogram_(std::make_unique<Histogram>("fw_migrated_segment_age", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      migrated_ages_histogram_(std::make_unique<Histogram>("fw_migrated_ages", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)) {
     (void)cache_trace;
     (void)trace_file;
     (void)cold_trace_file;
