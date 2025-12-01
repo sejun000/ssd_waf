@@ -110,9 +110,19 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     if (capacity <= 0) {
         capacity = 1;
     }
+    // Generate stat_log_file with cache_type prefix if not provided
+    if (stat_log_file.empty()) {
+        auto now = std::chrono::system_clock::now();
+        std::time_t tt = std::chrono::system_clock::to_time_t(now);
+        std::tm tm {};
+        localtime_r(&tt, &tm);
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y%m%d_%H%M%S");
+        stat_log_file = cache_type + ".stat.log." + oss.str();
+    }
     set_stream_interval(static_cast<uint64_t>(capacity));
     if (cache_type == "LRU") {
-        return attach_prefix(new LRUCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file), cache_type);
+        return attach_prefix(new LRUCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file), cache_type);
     }
     else if (cache_type == "FIFO") {
         return attach_prefix(new FIFOCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file), cache_type);

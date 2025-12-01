@@ -18,8 +18,8 @@ long EffectiveCapacity(long base) {
 }
 }
 
-LRUCache::LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file)
-    : ICache(cold_capacity, waf_log_file),
+LRUCache::LRUCache(uint64_t cold_capacity, long capacity, int _cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, const std::string &stat_log_file)
+    : ICache(cold_capacity, waf_log_file, stat_log_file),
       capacity_(EffectiveCapacity(capacity)),
       cache_filled(false),
       cache_trace_fp(nullptr),
@@ -47,9 +47,6 @@ LRUCache::~LRUCache() {
     }
     if (cold_trace_fp) {
         fclose(cold_trace_fp);
-    }
-    if (cache_ftl_log_fp) {
-        fclose(cache_ftl_log_fp);
     }
 }
 
@@ -181,15 +178,8 @@ void LRUCache::maybe_log_cache_ftl_stats() {
     if (cache_ftl_log_interval_bytes == 0) {
         return;
     }
-    if (!cache_ftl_log_fp) {
-        const std::string& prefix = stats_prefix();
-        std::string cache_ftl_log_name = "stat.log." + (prefix.empty() ? std::string("LRU") : prefix) + "." + get_timestamp();
-        cache_ftl_log_fp = fopen(cache_ftl_log_name.c_str(), "w");
-        if (cache_ftl_log_fp == nullptr) {
-            printf("whyyyyyy\n");
-            std::cerr << "Cannot open file: " << cache_ftl_log_name << std::endl;
-            return;
-        }
+    if (!fp_stats) {
+        return;
     }
     const uint64_t host_bytes = cache_ftl.GetHostWritePages() * static_cast<uint64_t>(NAND_PAGE_SIZE);
     if (host_bytes < next_cache_ftl_log_bytes) {
@@ -202,7 +192,7 @@ void LRUCache::maybe_log_cache_ftl_stats() {
         / static_cast<unsigned long long>(cache_block_size);
     const std::string& prefix = stats_prefix();
     const char* prefix_cstr = prefix.empty() ? "LRU" : prefix.c_str();
-    fprintf(cache_ftl_log_fp,
+    fprintf(fp_stats,
             "%s invalidate_blocks: %lld compacted_blocks: %llu global_valid_blocks: %llu write_size_to_cache: %lld evicted_blocks: %lld write_hit_size: %lld total_cache_size: %llu reinsert_blocks: %d read_blocks_in_partial_write %d waf_host_bytes: %llu waf_nand_bytes: %llu\n",
             prefix_cstr,
             evicted_blocks,
@@ -216,6 +206,6 @@ void LRUCache::maybe_log_cache_ftl_stats() {
             0,
             static_cast<unsigned long long>(host_bytes),
             static_cast<unsigned long long>(nand_bytes));
-    fflush(cache_ftl_log_fp);
+    fflush(fp_stats);
     next_cache_ftl_log_bytes += cache_ftl_log_interval_bytes;
 }
