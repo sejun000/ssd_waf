@@ -23,6 +23,8 @@
 #undef WRITE
 #undef REMOVE
 
+extern uint64_t interval;
+
 namespace midas {
 extern SSD_SPEC *ssd_spec;
 extern SSD *ssd;
@@ -135,7 +137,10 @@ MidasCache::MidasCache(uint64_t              cold_capacity,
       midas_args_(midas_init_args),
       target_valid_blk_rate(input_target_valid_blk_rate),
       valid_blk_rate_hard_limit(0.93),
-      cache_trace_(cache_trace)
+      cache_trace_(cache_trace),
+      evicted_ages_histogram_(std::make_unique<Histogram>("midas_evicted_ages", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      evicted_blocks_histogram_(std::make_unique<Histogram>("midas_evicted_blocks", 1, HISTOGRAM_BUCKETS, fp_stats)),
+      evicted_ages_with_segment_histogram_(std::make_unique<Histogram>("midas_evicted_segment_age", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats))
 {
     (void)trace_file;
     (void)cold_trace;
@@ -363,5 +368,29 @@ int MidasCache::purge_segment_valids(int victim_seg) {
         }
         midas::valid_pages_global.store(midas_stats->vp, std::memory_order_relaxed);
     }
+    uint64_t age = segment_age_pages(victim_seg);
+    record_eviction_histograms(removed, age);
     return removed;
+}
+
+uint64_t MidasCache::segment_age_pages(int segment_idx) const {
+    if (!midas_stats || !midas::ssd || !midas::ssd->seg_stamp || !midas::ssd_spec) return 0;
+    if (segment_idx < 0 || segment_idx >= midas::ssd_spec->SEGNUM) return 0;
+    double stamp = midas::ssd->seg_stamp[segment_idx];
+    if (stamp < 0) return 0;
+    double age = midas_stats->cur_wp - stamp;
+    return (age > 0) ? static_cast<uint64_t>(age) : 0;
+}
+
+void MidasCache::record_eviction_histograms(int removed_pages, uint64_t segment_age_pages) {
+    if (removed_pages < 0) removed_pages = 0;
+    if (evicted_blocks_histogram_) {
+        evicted_blocks_histogram_->inc(static_cast<uint64_t>(removed_pages));
+    }
+    if (evicted_ages_histogram_) {
+        evicted_ages_histogram_->inc(segment_age_pages);
+    }
+    if (evicted_ages_with_segment_histogram_) {
+        evicted_ages_with_segment_histogram_->inc(segment_age_pages);
+    }
 }
