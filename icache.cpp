@@ -64,6 +64,16 @@ double score_warm_first(Segment *seg) {
     return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
 }
 
+double score_warm_first_2(Segment *seg) {
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
+        assert(g_threshold > 0 && g_timestamp > 0);
+    }
+    double u = seg->valid_cnt / segments;
+    return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+}
+
+
 double score_warm_first_hot_last(Segment *seg) {
     if (g_threshold <= 0 || g_timestamp <= 0) {
         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
@@ -118,7 +128,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         localtime_r(&tt, &tm);
         std::ostringstream oss;
         oss << std::put_time(&tm, "%Y%m%d_%H%M%S");
-        stat_log_file = cache_type + ".stat.log." + oss.str();
+        stat_log_file = "stat.log." + cache_type + "." + oss.str();
     }
     set_stream_interval(static_cast<uint64_t>(capacity));
     if (cache_type == "LRU") {
@@ -128,7 +138,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         return attach_prefix(new FIFOCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file), cache_type);
     }
     else if (cache_type == "LOG_FIFO") {
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>()), cache_type);
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>(), nullptr, nullptr, 0.0, nullptr, 0.0, false, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_FIFO_ZERO") {
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, std::make_unique<FifoZeroEvictPolicy>()), cache_type);
@@ -209,9 +219,9 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             cold_trace_file, waf_log_file, std::make_unique<MultiQueueEvictPolicy>(), nullptr, nullptr), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_FIFO") {
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<SelectiveFifoEvictPolicy>(),
-            nullptr, nullptr, 0.93, std::make_unique<GreedyEvictPolicy>(), 1.2), cache_type);
+            nullptr, nullptr, 0.93, std::make_unique<GreedyEvictPolicy>(), 1.2, false, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_HOT_FIRST_SELECTIVE_FIFO_0_6_SEPBIT") {
         IStream *input_stream_policy = createIstreamPolicy("hotcold");
@@ -271,15 +281,15 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_8") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
-            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
-            nullptr, input_stream_policy, 0.93, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false), cache_type);
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.93, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_8_2") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
-            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
-            nullptr, input_stream_policy, 0.93, std::make_unique<CbEvictPolicy>(score_cold_first), 0, false), cache_type);
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.93, std::make_unique<CbEvictPolicy>(score_cold_first), 0, false, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_8_3") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
@@ -295,9 +305,9 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
-            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
-            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true), cache_type);
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_11") { // for getting optimized value from dynamic algorithm
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
@@ -342,11 +352,10 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             &cfg, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true), cache_type);
     }
     else if (cache_type == "LOG_SEPBIT_FIFO") {
-        
         IStream *input_stream_policy = createIstreamPolicy("sepbit");
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>(), nullptr, input_stream_policy,
-            0.8, std::make_unique<CbEvictPolicy>(score_sepbit_age), 0), cache_type);
+            0.93, std::make_unique<CbEvictPolicy>(score_sepbit_age), 0, false, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_FIFO_2") {
         g_numerator = 10;
