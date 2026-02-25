@@ -28,10 +28,10 @@ def estimate_device_size(file_path, trace_format):
     
     return max_value  # 블록 크기를 4KB로 가정하고 크기 근사
 
-def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate=''):
+def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate='', scale=1):
     """캐시 크기를 1%, 5%, 10%, 15%, 20%, 25%, 30%로 변경하며 실행"""
-    #cache_ratios = [0.18]
-    cache_ratios = [0.25]
+    cache_ratios = [0.125]
+    #cache_ratios = [0.25]
     if (valid_rate == ''):
         valid_ratio_ranges = [0.8]
     else:
@@ -42,7 +42,8 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
     # ---- 병렬화: valid_ratio 단위로 20개 동시 실행 ----
     def _run_for_valid_ratio(valid_ratio):
         for ratio in cache_ratios:
-            cache_size = int(device_size * ratio)
+            align_unit = 13079937024
+            cache_size = ((int(device_size * ratio) + align_unit - 1) // align_unit) * align_unit
             input_cache_policy = cache_policy
             if (ratio == 0):
                 input_cache_policy = "NO_CACHE"
@@ -50,8 +51,7 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
             print (f"./cache_sim {trace_file} {cache_size} --rw_policy {rw_policy} --trace_format {trace_format} --cache_policy {input_cache_policy} --cache_trace /mnt/nvme2n2/{cache_policy}_{ratio}.trace --cold_trace /mnt/nvme2n2/{cache_policy}_{ratio}.cold.trace --cold_capacity {int(device_size * 1.07)} --waf_log_file {cache_policy}_{ratio}.waf.log")
             ts = datetime.now().strftime('%y%m%d_%H%M%S')
             waf_log_file = f"{cache_policy}_{ratio}_{ts}.waf.log"
-            if (valid_rate != ''):
-                subprocess.run([
+            base_args = [
                     "./cache_sim", trace_file, str(cache_size),
                     "--rw_policy", rw_policy,
                     "--trace_format", trace_format,
@@ -60,20 +60,13 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
                     "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace",
                     "--cold_capacity", str(int(device_size * 1.07)),
                     "--waf_log_file", waf_log_file,
-                    "--valid_ratio", str(valid_ratio),
-                    "--stat_log_file", "dp."+str(valid_ratio)
-                ])
-            else:
-                subprocess.run([
-                    "./cache_sim", trace_file, str(cache_size),
-                    "--rw_policy", rw_policy,
-                    "--trace_format", trace_format,
-                    "--cache_policy", input_cache_policy,
-                    "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace",
-                    "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace",
-                    "--cold_capacity", str(int(device_size * 1.07)),
-                    "--waf_log_file", waf_log_file
-                ])
+            ]
+            if scale != 1:
+                base_args += ["--scale", str(scale)]
+            if (valid_rate != ''):
+                base_args += ["--valid_ratio", str(valid_ratio),
+                              "--stat_log_file", "dp."+str(valid_ratio)]
+            subprocess.run(base_args)   
 
     with ThreadPoolExecutor(max_workers=20) as ex:
         futures = [ex.submit(_run_for_valid_ratio, vr) for vr in valid_ratio_ranges]
@@ -90,10 +83,12 @@ if __name__ == "__main__":
     parser.add_argument("--trace_format", type=str, choices=['csv', 'blktrace'], default='csv', help="Trace format: csv (default) or blktrace")
     parser.add_argument("--valid_rate", type=str, default='', help="Valid rate threshold for LOG_GREEDY_COST_BENEFIT_11 policy (two decimal number with comma)")
     #parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes") # alibaba trace
-    parser.add_argument("--device_size", type=int, default=2174461292544, help="Device size in bytes") # alibaba trace 40TB written
+    #parser.add_argument("--device_size", type=int, default=2174461292544, help="Device size in bytes") # alibaba trace 40TB written
+    parser.add_argument("--device_size", type=int, default=16000000000000, help="Device size in bytes") # alibaba trace 40TB written
+    parser.add_argument("--scale", type=int, default=1, help="LBA scale factor (e.g. 2 = lba*2, size*2)")
     #[prefill] done, total 2174461292544 bytes (target 3288206467072, align 4096)
     #parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes") # lsmtree
     args = parser.parse_args()
     estimated_device_size = args.device_size
     print(f"Estimated Device Size: {estimated_device_size} bytes")
-    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate)
+    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate, args.scale)

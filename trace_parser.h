@@ -23,7 +23,13 @@ public:
     ParsedRow parseTrace(const std::string &line) override;
 };
 
-// Factory 함수: 파서 타입("csv" 또는 "blktrace")에 따라 적절한 파서 객체를 생성
+// Tencent 형식 트레이스 파서: Timestamp,Offset(sectors),Size(sectors),IOType,VolumeID
+class TencentTraceParser : public ITraceParser {
+public:
+    ParsedRow parseTrace(const std::string &line) override;
+};
+
+// Factory 함수: 파서 타입("csv", "blktrace", "tencent")에 따라 적절한 파서 객체를 생성
 ITraceParser* createTraceParser(const std::string &type);
 
 #endif // TRACE_PARSER_H

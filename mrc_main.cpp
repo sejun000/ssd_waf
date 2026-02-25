@@ -136,7 +136,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Parsing and blockifying trace file...\n";
     printf("trace_type = %s\n", trace_type.c_str());
     std::unique_ptr<ITraceParser> parser(createTraceParser(trace_type));
-    uint64_t byte_limit = 20000000000000ULL; // 10TB (주의: 0 하나 줄임)
+    uint64_t byte_limit = 8000000000000ULL; // 8TB
     uint64_t written_bytes = 0ULL;
     uint64_t next_print_written_bytes = 100000000000ULL; // 100GB
     bool break_flag = false;

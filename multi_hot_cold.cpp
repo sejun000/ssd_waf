@@ -1,4 +1,5 @@
 #include "multi_hot_cold.h"
+#include <cfloat>
 
 MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool check_created_timestamp_only, bool classify_for_host_append, bool classfy_for_gc_append){
     mMaxGcStreams = max_gc_streams;
@@ -6,65 +7,56 @@ MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool c
     mCheckCreatedTimestampOnly = check_created_timestamp_only;
     mClassifyForHostAppend = classify_for_host_append;
     mClassifyForGcAppend = classfy_for_gc_append;
+    mAvgLifespan = DBL_MAX;
+    mLba2Fifo = new FIFO();
+    mMetadata = new Metadata();
 }
 
 extern uint64_t g_threshold;
 
 int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
     uint64_t time_diff = global_timestamp - created_timestamp;
+    if (!isGcAppend) {
+        uint64_t lifespan = mLba2Fifo->Query(blockAddr);
+        if (lifespan != UINT64_MAX && lifespan < mAvgLifespan) {
+            return 0;
+        }
+        else {
+            return 1;
+        }
+    }
     if (mCheckCreatedTimestampOnly) {
         time_diff = created_timestamp;
     }
-    int gc_stream_id = time_diff / mTimestampGranularity;
-    if (!isGcAppend) {
-        if (mClassifyForHostAppend) {
-            if (!mClassifyForGcAppend) {
-                if (created_timestamp == UINT64_MAX) {
-                    return 1;
-                }
-                if ((global_timestamp - created_timestamp) < g_threshold * 0.3) {
-                    return 0;
-                }
-                return 1;
-            }
-        }
-        else {
-            return 0;
-        }
-    }
-    else {
-        if (!mClassifyForGcAppend) {
-            return Segment::GC_STREAM_START;
-        }
-    }
-    if (gc_stream_id >= mMaxGcStreams) {
+    int stream_id = time_diff / mTimestampGranularity;
+    if (stream_id >= mMaxGcStreams) {
         if (mCheckCreatedTimestampOnly)
         {
-            gc_stream_id = gc_stream_id % mMaxGcStreams;
+            stream_id = stream_id % mMaxGcStreams;
         }
         else 
         {
-            gc_stream_id = mMaxGcStreams - 1; // Limit to max GC streams
+            stream_id = mMaxGcStreams - 1; // Limit to max GC streams
         }
     }
     // Implement classification logic here
     // For now, we return 0 as a placeholder
-    auto it = oldest_timestamp_map.find(gc_stream_id);
+    auto it = oldest_timestamp_map.find(stream_id);
     if (it == oldest_timestamp_map.end()) {
         // If found, use the stored timestamp
-        oldest_timestamp_map[gc_stream_id] = created_timestamp;
+        oldest_timestamp_map[stream_id] = created_timestamp;
     }
-    else if (oldest_timestamp_map[gc_stream_id] ) {
+    else if (oldest_timestamp_map[stream_id] ) {
         // If not found, update the timestamp
         if (created_timestamp < it->second) {
-            oldest_timestamp_map[gc_stream_id] = created_timestamp;
+            oldest_timestamp_map[stream_id] = created_timestamp;
         }
     }
     else {
         // If not found, initialize it
-        oldest_timestamp_map[gc_stream_id] = created_timestamp;
+        oldest_timestamp_map[stream_id] = created_timestamp;
     }
-    return gc_stream_id + Segment::GC_STREAM_START;
+    return stream_id + Segment::GC_STREAM_START;
 }
 
 int MultiHotCold::GetVictimStreamId(uint64_t global_timestamp, uint64_t threshold) {
@@ -81,4 +73,28 @@ int MultiHotCold::GetVictimStreamId(uint64_t global_timestamp, uint64_t threshol
         }
     }
     return -1;
+}
+
+void MultiHotCold::Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) {
+  /*  uint64_t valid_blocks = reinterpret_cast<uint64_t>(arg);
+    global_timestamp += 1;
+    mLba2Fifo->Update(blockAddr, mAvgLifespan, valid_blocks);
+    mMetadata->Update(blockAddr, global_timestamp);*/
+}
+
+void MultiHotCold::CollectSegment(Segment *segment, uint64_t global_timestamp) {
+  static uint64_t totLifespan = 0;
+  static int nCollects = 0;
+  if (segment->get_class_num() == 0) {
+    //printf("CollectSegment: %lu, class_num: %d\n mAvgLifespan %f\n", segment->get_create_time(), segment->get_class_num(), mAvgLifespan);
+    totLifespan += global_timestamp - segment->get_create_time();
+    nCollects += 1;
+  }
+  if (nCollects == 16) {
+    mAvgLifespan = 1.0 * totLifespan / nCollects;
+    nCollects = 0;
+    totLifespan = 0;
+    //std::cout << "AvgLifespan: " << mAvgLifespan << std::endl;
+  }
+// mClassNumOfLastCollectedSegment = segment->get_class_num();
 }

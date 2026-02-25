@@ -1,5 +1,6 @@
 #pragma once
 #include <list>
+#include <vector>
 #include <cstdint>
 
 class Segment;
@@ -33,6 +34,9 @@ public:
     }
 
     virtual void remove(Segment* seg)    = 0;
+
+    /* 상위 count개 segment를 score 순으로 peek (heap에서 제거 안 함) */
+    virtual std::vector<Segment*> peek_top_segments(int count) { return {}; }
 
     /* valid_cnt 가 변했을 때 호출 */
     virtual void update(Segment* seg)    = 0;

@@ -1,0 +1,6 @@
+dp*
+#stat.log.*
+object.log.*
+LOG_*
+*.o
+

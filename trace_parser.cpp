@@ -49,6 +49,9 @@ ParsedRow BlktraceParser::parseTrace(const std::string &line) {
         return ParsedRow();
     }
     result.dev_id = tokens[0];  // 디바이스 ID
+    // blktrace: only process Q (queue) events to avoid duplicates (Q→G→I→D→C)
+    if (tokens[5] != "Q")
+        return ParsedRow();
     result.op_type = tokens[6];
     try {
         long long lba_off = std::stoll(tokens[7]);
@@ -62,11 +65,37 @@ ParsedRow BlktraceParser::parseTrace(const std::string &line) {
     return result;
 }
 
+// Tencent 파서 구현: Timestamp,Offset(sectors),Size(sectors),IOType,VolumeID
+ParsedRow TencentTraceParser::parseTrace(const std::string &line) {
+    ParsedRow result;
+    std::vector<std::string> tokens = splitString(line, ',');
+    if (tokens.size() < 5) {
+        return ParsedRow();
+    }
+    try {
+        result.timestamp = std::stod(tokens[0]);
+        long long offset_sectors = std::stoll(tokens[1]);
+        long long size_sectors = std::stoll(tokens[2]);
+        int io_type = std::stoi(tokens[3]);
+        result.dev_id = tokens[4];
+        // IOType: 1=Write, 0=Read
+        result.op_type = (io_type == 1) ? "W" : "R";
+        result.lba_offset = offset_sectors * 512;
+        result.lba_size = size_sectors * 512;
+    } catch (...) {
+        return ParsedRow();
+    }
+    return result;
+}
+
 // Factory 함수: 타입에 따라 적절한 파서 객체 생성
 ITraceParser* createTraceParser(const std::string &type) {
     if (type == "blktrace") {
         printf("BlktraceParser\n");
         return new BlktraceParser();
+    } else if (type == "tencent") {
+        printf("TencentTraceParser\n");
+        return new TencentTraceParser();
     } else {
         return new CsvTraceParser();
     }

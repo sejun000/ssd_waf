@@ -34,6 +34,7 @@ class CbEvictPolicy final : public EvictPolicy {
 public:
     /* EvictPolicy 인터페이스 구현 */
     Segment* choose_segment() override;
+    std::vector<Segment*> peek_top_segments(int count) override;
     CbEvictPolicy(double (*func)(Segment* ) = nullptr);
     void add   (Segment* seg) override;
     void remove(Segment* seg) override;

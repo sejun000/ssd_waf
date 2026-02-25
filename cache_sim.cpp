@@ -16,7 +16,7 @@
 #include <memory>
 #include <climits>
 
-static constexpr uint64_t CACHE_WRITE_SIZE_LIMIT = 40000000000000ULL; // also used for prefill log interval
+static constexpr uint64_t CACHE_WRITE_SIZE_LIMIT = 8ULL * 1024 * 1024 * 1024 * 1024; // 4 TB
 static constexpr uint64_t PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
 #define PREFILL_RATE (0.8)
 
@@ -227,6 +227,7 @@ int main(int argc, char* argv[]) {
     bool cache_trace = false;
     bool no_fill = true;
     uint64_t cold_capacity = 0;
+    int lba_scale = 1;
 
     // 추가 인자 파싱
     for (int i = 3; i < argc; i++) {
@@ -255,6 +256,8 @@ int main(int argc, char* argv[]) {
              stat_log_file = argv[++i];
         } else if (arg == "--no_fill" || arg == "-no_fill" || arg == "-no_filll") {
             no_fill = true;
+        } else if (arg == "--scale" && i + 1 < argc) {
+            lba_scale = std::stoi(argv[++i]);
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -271,6 +274,7 @@ int main(int argc, char* argv[]) {
     printf("cache_trace_output = %s\n", cache_trace_output.c_str());
     printf("cold_trace_output = %s\n", cold_trace_output.c_str());
     printf("cold_capacity = %lu\n", cold_capacity);
+    printf("lba_scale = %d\n", lba_scale);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
@@ -319,6 +323,8 @@ int main(int argc, char* argv[]) {
         if (parsed.dev_id.empty()) {
             continue;
         }
+        parsed.lba_offset *= lba_scale;
+        parsed.lba_size   *= lba_scale;
         long long write_bytes_to_cache;
         long long evicted_blocks;
         if (parsed.op_type == "R" || parsed.op_type == "RS") {

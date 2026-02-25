@@ -30,6 +30,16 @@ void CbEvictPolicy::update(Segment* s)
     heap_.update(it->second, { score(s), s });
 }
 
+std::vector<Segment*> CbEvictPolicy::peek_top_segments(int count) {
+    std::vector<Segment*> result;
+    result.reserve(count);
+    for (auto it = heap_.ordered_begin();
+         it != heap_.ordered_end() && (int)result.size() < count; ++it) {
+        result.push_back(it->seg);
+    }
+    return result;
+}
+
 Segment* CbEvictPolicy::choose_segment()
 {
     /* top‑k (K_VALIDATE) 노드 재평가로 순위 확정 */
