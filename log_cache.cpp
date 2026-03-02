@@ -99,6 +99,8 @@ LogCache::~LogCache()
     print_survival_results();
     print_lifetime_results();
     print_rewrite_results();
+    print_utilization_distribution();
+    print_segment_age_scatter();
     if (trace_fp_)      std::fclose(trace_fp_);
     if (cold_trace_fp_) std::fclose(cold_trace_fp_);
 }
@@ -499,6 +501,8 @@ void LogCache::check_and_evict_if_needed(int max_victims)
 
         //printf("compact %d\n", compact);
         assert (victim != nullptr);
+        gc_victim_count++;
+        gc_victim_valid_ratio_sum += (double)victim->valid_cnt / victim->blocks.size();
         if (victim->valid_cnt == 0) {
             printf("[GC] event=RESET_EMPTY valid_cnt=0 free_pool=%zu global_valid=%lu ts=%lu\n",
                    free_pool.size(), global_valid_blocks, log_cache_timestamp);
@@ -941,14 +945,119 @@ void LogCache::print_rewrite_results()
            rewrite_hist_.size(), rewrite_last_ts_.size());
 }
 
+void LogCache::print_utilization_distribution()
+{
+    // 2% bins: [0,2), [2,4), ... [98,100]
+    static constexpr int NUM_BINS = 50;
+    static constexpr double BIN_WIDTH = 2.0; // percent
+    uint64_t bins[NUM_BINS] = {};
+    uint64_t total_sealed = 0;
+
+    for (auto& seg_ptr : all_segments) {
+        LogCacheSegment* seg = seg_ptr.get();
+        // skip active segments (not yet sealed) and free pool
+        if (seg->write_ptr == 0) continue;
+
+        double util_pct = 100.0 * seg->valid_cnt / seg->blocks.size();
+        int bin = static_cast<int>(util_pct / BIN_WIDTH);
+        if (bin >= NUM_BINS) bin = NUM_BINS - 1;
+        bins[bin]++;
+        total_sealed++;
+    }
+
+    if (total_sealed == 0) {
+        printf("[UtilDist] no sealed segments to report\n");
+        return;
+    }
+
+    // generate timestamped filename
+    char ts[64];
+    {
+        time_t now = time(nullptr);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
+    }
+    char fname[256];
+    snprintf(fname, sizeof(fname), "utilization_distribution.%s.csv", ts);
+
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+
+    fprintf(f, "util_low,util_high,count,fraction\n");
+    for (int i = 0; i < NUM_BINS; i++) {
+        double lo = i * BIN_WIDTH;
+        double hi = lo + BIN_WIDTH;
+        double frac = static_cast<double>(bins[i]) / total_sealed;
+        fprintf(f, "%.0f,%.0f,%lu,%.6f\n", lo, hi, bins[i], frac);
+    }
+    fclose(f);
+    printf("[UtilDist] distribution written to %s (%lu segments)\n", fname, total_sealed);
+}
+
+void LogCache::print_segment_age_scatter()
+{
+    char ts[64];
+    {
+        time_t now = time(nullptr);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
+    }
+    char fname[256];
+    snprintf(fname, sizeof(fname), "segment_age_scatter.%s.csv", ts);
+
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+
+    fprintf(f, "seg_age,utilization,valid_count,block_age_mean,block_age_stddev\n");
+    uint64_t count = 0;
+
+    for (auto& seg_ptr : all_segments) {
+        LogCacheSegment* seg = seg_ptr.get();
+        if (seg->write_ptr == 0) continue;
+
+        uint64_t seg_age = log_cache_timestamp - seg->create_timestamp;
+        double util = static_cast<double>(seg->valid_cnt) / seg->blocks.size();
+
+        // compute mean and stddev of valid block ages
+        double sum = 0.0;
+        double sum_sq = 0.0;
+        uint64_t n = 0;
+        for (size_t i = 0; i < seg->write_ptr; i++) {
+            if (!seg->blocks[i].valid) continue;
+            double age = static_cast<double>(log_cache_timestamp - seg->blocks[i].create_timestamp);
+            sum += age;
+            sum_sq += age * age;
+            n++;
+        }
+
+        double mean = 0.0, stddev = 0.0;
+        if (n > 0) {
+            mean = sum / n;
+            if (n > 1) {
+                double var = (sum_sq - sum * sum / n) / (n - 1);
+                stddev = (var > 0.0) ? std::sqrt(var) : 0.0;
+            }
+        }
+
+        fprintf(f, "%lu,%.6f,%lu,%.1f,%.1f\n", seg_age, util, n, mean, stddev);
+        count++;
+    }
+
+    fclose(f);
+    printf("[AgeScatter] written to %s (%lu segments)\n", fname, count);
+}
+
 void LogCache::print_stats() {
     static uint64_t written_window_bytes = cfg_.print_stats_interval;
     static uint64_t next_written_bytes = cfg_.segment_bytes;
     if ((uint64_t)write_size_to_cache >= next_written_bytes) {
         const std::string& prefix = stats_prefix();
         const char* prefix_cstr = prefix.empty() ? "LOG_CACHE" : prefix.c_str();
-        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu\n",
-                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks);
+        double avg_victim_valid_ratio = (gc_victim_count > 0) ? gc_victim_valid_ratio_sum / gc_victim_count : 0.0;
+        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu gc_victim_avg_valid_ratio: %.6f gc_victim_count: %lu\n",
+                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks, avg_victim_valid_ratio, gc_victim_count);
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }

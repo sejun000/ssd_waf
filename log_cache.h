@@ -125,6 +125,8 @@ private:
     uint64_t read_blocks_in_partial_write = 0;
 
     uint64_t evicted_segment_age = 0;
+    uint64_t gc_victim_count = 0;
+    double gc_victim_valid_ratio_sum = 0.0;
 
     double target_valid_blk_rate = 0.0; // ratio of write to QLC
     double valid_blk_rate_hard_limit = 0.0;
@@ -195,4 +197,10 @@ private:
 
     void record_rewrite(long key);
     void print_rewrite_results();
+
+    /* ── Segment utilization distribution (LFS-style) ──── */
+    void print_utilization_distribution();
+
+    /* ── Per-segment age scatter data ─────────────────── */
+    void print_segment_age_scatter();
 };

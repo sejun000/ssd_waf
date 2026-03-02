@@ -1,0 +1,34 @@
+# DP Optimizer Context (2026-03-02)
+
+## Current Model (dp_optimizer.cpp)
+- QLC_FACTOR = 8.64
+- MA_WINDOW = 24 (240GB simple moving average)
+- k-1, k, k+1 transition constraint (±1 ratio step per 10GB)
+- Increase penalty: diff * blocks * 1.0 (compaction cost)
+- Decrease penalty: (-diff) * blocks * QLC_FACTOR (eviction cost)
+- F_t = smoothed_compaction + QLC_FACTOR * smoothed_eviction + HOST_BLOCKS_PER_STEP
+- HOST_BLOCKS_PER_STEP = 10GB / 4096
+- warmup_tb = 6, step_skip = 1
+
+## Latest Results (MA_WINDOW=24, warmup_tb=6)
+
+### cb_11_dwpd2
+- Steps: 676, Best ratio: 0.66
+- Host: 6.60 TB, Compaction: 1.42 TB, Eviction: 1.06 TB (x8.64=9.14 TB)
+- Total: 17.16 TB
+
+### greedy_11_dwpd2
+- Steps: 820, Best ratio: 0.44
+- Host: 8.01 TB, Compaction: 4.26 TB, Eviction: 1.42 TB (x8.64=12.31 TB)
+- Total: 24.58 TB
+
+## Known Issue
+- Eviction이 비현실적으로 낮음 (cherry-picking 문제 의심)
+- DP가 매 step마다 eviction이 낮은 ratio를 골라서 전체 eviction sum이 비현실적
+- Smoothing(SMA)은 같은 ratio 내 변동만 줄이고, ratio 간 선택은 못 막음
+- 고정 ratio 일 때의 실제 eviction과 비교 필요
+
+## History (MA_WINDOW variations)
+- MA=10 (100GB): cb=16.21TB, greedy=24.06TB
+- MA=12 (120GB): cb=16.43TB, greedy=24.22TB
+- MA=24 (240GB): cb=17.16TB, greedy=24.58TB

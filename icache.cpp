@@ -377,6 +377,12 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_80") {
+        IStream *input_stream_policy = nullptr;
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_greedy_first), 0, false), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD_80") {
