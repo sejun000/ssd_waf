@@ -1,15 +1,23 @@
 #include "multi_hot_cold.h"
 #include <cfloat>
+#include <cstring>
 
-MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool check_created_timestamp_only, bool classify_for_host_append, bool classfy_for_gc_append){
+int g_stream_cycles[IStream::MAX_STREAMS] = {0};
+uint64_t g_cycle_length = 0;
+
+MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool check_created_timestamp_only, bool classify_for_host_append, bool classfy_for_gc_append, int num_host_streams){
     mMaxGcStreams = max_gc_streams;
     mTimestampGranularity = timestamp_granularity;
     mCheckCreatedTimestampOnly = check_created_timestamp_only;
     mClassifyForHostAppend = classify_for_host_append;
     mClassifyForGcAppend = classfy_for_gc_append;
+    mNumHostStreams = num_host_streams;
     mAvgLifespan = DBL_MAX;
     mLba2Fifo = new FIFO();
     mMetadata = new Metadata();
+    std::memset(mStreamCycles, -1, sizeof(mStreamCycles));
+    std::memset(g_stream_cycles, 0, sizeof(g_stream_cycles));
+    g_cycle_length = (uint64_t)mTimestampGranularity * mMaxGcStreams;
 }
 
 extern uint64_t g_threshold;
@@ -17,61 +25,57 @@ extern uint64_t g_threshold;
 int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
     uint64_t time_diff = global_timestamp - created_timestamp;
     if (!isGcAppend) {
-        uint64_t lifespan = mLba2Fifo->Query(blockAddr);
-        if (lifespan != UINT64_MAX && lifespan < mAvgLifespan) {
+        uint64_t lifespan = time_diff;
+        if (lifespan != 0 && lifespan < mAvgLifespan) {
             return 0;
         }
         else {
             return 1;
         }
+       return 0;
     }
     if (mCheckCreatedTimestampOnly) {
         time_diff = created_timestamp;
     }
-    int stream_id = time_diff / mTimestampGranularity;
-    if (stream_id >= mMaxGcStreams) {
-        if (mCheckCreatedTimestampOnly)
-        {
-            stream_id = stream_id % mMaxGcStreams;
+    int raw_id = time_diff / mTimestampGranularity;
+    int stream_id;
+    if (mCheckCreatedTimestampOnly) {
+        int cycle = raw_id / mMaxGcStreams;
+        stream_id = raw_id % mMaxGcStreams;
+
+        // Detect per-stream cycle wrap
+        if (mStreamCycles[stream_id] >= 0 && cycle < mStreamCycles[stream_id]) {
+            printf("#### Detected cycle wrap for stream %d: %d -> %d, timestamp: %d\n", stream_id, mStreamCycles[stream_id], cycle, global_timestamp);
         }
-        else 
-        {
+        if (mStreamCycles[stream_id] >= 0 && cycle > mStreamCycles[stream_id]) {
+            // This stream is about to be reused in a new cycle → queue for dummy fill
+            mPendingVictimStreams.push_back(stream_id);
+            mStreamCycles[stream_id] = cycle;
+            g_stream_cycles[stream_id] = cycle;
+        }
+        if (mStreamCycles[stream_id] < 0) {
+            mStreamCycles[stream_id] = cycle;
+            g_stream_cycles[stream_id] = cycle;
+        }
+    } else {
+        stream_id = raw_id;
+        if (stream_id >= mMaxGcStreams) {
             stream_id = mMaxGcStreams - 1; // Limit to max GC streams
         }
-    }
-    // Implement classification logic here
-    // For now, we return 0 as a placeholder
-    auto it = oldest_timestamp_map.find(stream_id);
-    if (it == oldest_timestamp_map.end()) {
-        // If found, use the stored timestamp
-        oldest_timestamp_map[stream_id] = created_timestamp;
-    }
-    else if (oldest_timestamp_map[stream_id] ) {
-        // If not found, update the timestamp
-        if (created_timestamp < it->second) {
-            oldest_timestamp_map[stream_id] = created_timestamp;
-        }
-    }
-    else {
-        // If not found, initialize it
-        oldest_timestamp_map[stream_id] = created_timestamp;
     }
     return stream_id + Segment::GC_STREAM_START;
 }
 
 int MultiHotCold::GetVictimStreamId(uint64_t global_timestamp, uint64_t threshold) {
     if (!mCheckCreatedTimestampOnly) return -1;
-    for (int index = 0; index < mMaxGcStreams; index++) {
-        auto it = oldest_timestamp_map.find(index);
-        if (it == oldest_timestamp_map.end()) {
-            continue;
-        }
-        if (global_timestamp - oldest_timestamp_map[index] >= threshold) {
-            int retId = index + Segment::GC_STREAM_START;
-            oldest_timestamp_map.erase(index);
-            return retId;
-        }
+
+    // Return pending cycle-wrap victims first
+    if (!mPendingVictimStreams.empty()) {
+        int id = mPendingVictimStreams.back();
+        mPendingVictimStreams.pop_back();
+        return id + Segment::GC_STREAM_START;
     }
+
     return -1;
 }
 

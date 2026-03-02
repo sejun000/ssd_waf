@@ -95,7 +95,7 @@ private:
     std::unique_ptr<EvictPolicy> evictor;
 
     LogCacheSegment* alloc_segment(bool shrink = true);
-    void             check_and_evict_if_needed();
+    void             check_and_evict_if_needed(int max_victims = 0);
     void             evict_segment(LogCacheSegment* s);
     Segment*         evict_and_compaction(LogCacheSegment* s, uint64_t threshold, int gc_stream_id = 0);
 

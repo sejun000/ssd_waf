@@ -68,7 +68,7 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
                               "--stat_log_file", "dp."+str(valid_ratio)]
             subprocess.run(base_args)   
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futures = [ex.submit(_run_for_valid_ratio, vr) for vr in valid_ratio_ranges]
         for _ in as_completed(futures):
             pass
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     parser.add_argument("--valid_rate", type=str, default='', help="Valid rate threshold for LOG_GREEDY_COST_BENEFIT_11 policy (two decimal number with comma)")
     #parser.add_argument("--device_size", type=int, default=3841362697216, help="Device size in bytes") # alibaba trace
     #parser.add_argument("--device_size", type=int, default=2174461292544, help="Device size in bytes") # alibaba trace 40TB written
-    parser.add_argument("--device_size", type=int, default=16000000000000, help="Device size in bytes") # alibaba trace 40TB written
+    parser.add_argument("--device_size", type=int, default=15000000000000, help="Device size in bytes") # alibaba trace 40TB written
     parser.add_argument("--scale", type=int, default=1, help="LBA scale factor (e.g. 2 = lba*2, size*2)")
     #[prefill] done, total 2174461292544 bytes (target 3288206467072, align 4096)
     #parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes") # lsmtree

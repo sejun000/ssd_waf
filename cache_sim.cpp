@@ -16,7 +16,7 @@
 #include <memory>
 #include <climits>
 
-static constexpr uint64_t CACHE_WRITE_SIZE_LIMIT = 8ULL * 1024 * 1024 * 1024 * 1024; // 4 TB
+static constexpr uint64_t CACHE_WRITE_SIZE_LIMIT = 14ULL * 1024 * 1024 * 1024 * 1024; // 4 TB
 static constexpr uint64_t PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
 #define PREFILL_RATE (0.8)
 

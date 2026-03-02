@@ -33,56 +33,153 @@ double score_age_evict(Segment *seg) {
 }
 double g_segment_blocks = 262144.0 * 6;  // default 1GB/4KB, set by cache init
 double score_age(Segment *seg) {
-    if (seg->valid_cnt > g_segment_blocks - 2) {
+    /*if (seg->valid_cnt > g_segment_blocks - 2) {
         return -UINT64_MAX;
-    }
+    }*/
     return seg->create_timestamp;
 }
 
 uint64_t g_threshold = 0;
 uint64_t g_timestamp = 0;
 
-double score_hot_first(Segment *seg) {
-    assert(g_threshold > 0 && g_timestamp > 0);
-    double u = seg->valid_cnt / g_segment_blocks;
-    return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / (u);
+// Score functions for CbEvictPolicy (same as icache.cpp)
+/*static double score_age_evict(Segment *seg) {
+    return -static_cast<double>(seg->create_timestamp);
+}*/
+
+static double score_greedy_first(Segment *seg) {
+    return -static_cast<double>(seg->valid_cnt);
 }
 
+// Global variables for score_warm_first (set by LogCache during GC)
+extern uint64_t g_threshold;
+extern uint64_t g_timestamp;
 
-double score_cold_first(Segment *seg) {
-    assert(g_threshold > 0 && g_timestamp > 0);
-    double u = seg->valid_cnt / g_segment_blocks;
-    return (g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+extern uint64_t g_cycle_length;
+extern int g_stream_cycles[IStream::MAX_STREAMS];
+
+// Check if segment is from an old cycle for its stream → protect from compaction
+// Uses seg->create_timestamp (= oldest block's timestamp after compaction) instead of seg->cycle
+static inline bool is_old_cycle_segment(Segment *seg) {
+    if (g_cycle_length == 0 || interval == 0) return false;
+    int seg_cycle = static_cast<int>(seg->create_timestamp / g_cycle_length);
+    int idx = seg->class_num - Segment::GC_STREAM_START;
+    if (idx < 0 || idx >= IStream::MAX_STREAMS) {
+        // Host segment: estimate which GC stream its blocks would map to
+        idx = static_cast<int>((seg->create_timestamp % g_cycle_length) / interval);
+    }
+    if (idx >= 0 && idx < IStream::MAX_STREAMS) {
+        if (seg_cycle < g_stream_cycles[idx]) {
+            return true;
+        }
+    }
+    return false;
 }
 
-double score_warm_first(Segment *seg) {
+static double score_warm_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+    //printf("segment_size : %f\n",segment_size);
+   // if (u > 0.8) return 0.0;  // Too full to compact efficiently
     if (g_threshold <= 0 || g_timestamp <= 0) {
-        //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
-        assert(g_threshold > 0 && g_timestamp > 0);
+        return -static_cast<double>(seg->create_timestamp);
     }
-    double u = seg->valid_cnt / g_segment_blocks;
-    //printf("why %.4f\n", std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u));
-    return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+    if (u < 0.0001) u = 0.0001;
+    if (std::min(g_threshold - (g_timestamp - seg->create_timestamp),
+                    g_timestamp - seg->create_timestamp) * (1 - u) / u < 0) {
+        //print related variable
+        printf("g_threshold: %lu, g_timestamp: %lu, seg->create_timestamp: %lu, u: %f\n",
+               g_threshold, g_timestamp, seg->create_timestamp, u);
+        assert(false);
+    }
+    return std::min(g_threshold - (g_timestamp - seg->create_timestamp),
+                    g_timestamp - seg->create_timestamp) * (1 - u) / u;
 }
 
-double score_warm_first_hot_last(Segment *seg) {
+// Score function: prefer HOT segments (recently created) for compaction
+static double score_hot_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+   // if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
-        //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
-        assert(g_threshold > 0 && g_timestamp > 0);
+        return -static_cast<double>(seg->create_timestamp);
     }
-    double u = seg->valid_cnt / g_segment_blocks;
-    if (seg->hot) {
-        return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
-    }
-    return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+    if (u < 0.0001) u = 0.0001;
+    // Hot-first: higher score for segments with smaller age (recently created)
+    return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / u;
 }
 
-double score_sepbit_age(Segment *seg) {
+// Score function: prefer COLD segments (old) for compaction
+static double score_cold_first(Segment *seg) {
+    if (is_old_cycle_segment(seg)) return 0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+  //  if (u > 0.8) return 0.0;
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    if (u < 0.0001) u = 0.0001;
+    // Cold-first: higher score for segments with larger age (older)
+    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
+}
+
+// Score function for SEPBIT: sqrt of age for balanced selection
+static double score_sepbit_age(Segment *seg) {
+    //if (is_old_cycle_segment(seg)) return 0.0;
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+//    if (u > 0.8) return 0.0;
+    if (g_threshold <= 0 || g_timestamp <= 0) {
+        return -static_cast<double>(seg->create_timestamp);
+    }
+    if (u < 0.0001) u = 0.0001;
+    return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
+}
+
+
+// double score_hot_first(Segment *seg) {
+//     assert(g_threshold > 0 && g_timestamp > 0);
+//     double u = seg->valid_cnt / g_segment_blocks;
+//     return (g_threshold - (g_timestamp - seg->create_timestamp)) * (1 - u) / (u);
+// }
+
+
+// double score_cold_first(Segment *seg) {
+//     assert(g_threshold > 0 && g_timestamp > 0);
+//     double u = seg->valid_cnt / g_segment_blocks;
+//     return (g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+// }
+
+// double score_warm_first(Segment *seg) {
+//     if (g_threshold <= 0 || g_timestamp <= 0) {
+//         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
+//         assert(g_threshold > 0 && g_timestamp > 0);
+//     }
+//     double u = seg->valid_cnt / g_segment_blocks;
+//     //printf("why %.4f\n", std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u));
+//     return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+// }
+
+// double score_warm_first_hot_last(Segment *seg) {
+//     if (g_threshold <= 0 || g_timestamp <= 0) {
+//         //printf("g_threshold %d g_timestamp %d\n", g_threshold, g_timestamp);
+//         assert(g_threshold > 0 && g_timestamp > 0);
+//     }
+//     double u = seg->valid_cnt / g_segment_blocks;
+//     if (seg->hot) {
+//         return (g_timestamp - seg->create_timestamp) * (1 - u) / u;
+//     }
+//     return std::min(g_threshold - (g_timestamp - seg->create_timestamp), g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+// }
+
+// double score_sepbit_age(Segment *seg) {
     
-    assert(g_threshold > 0 && g_timestamp > 0);
-    double u = seg->valid_cnt / g_segment_blocks;
-    return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / (u);
-}
+//     assert(g_threshold > 0 && g_timestamp > 0);
+//     double u = seg->valid_cnt / g_segment_blocks;
+//     return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / (u);
+// }
 
 
 int g_numerator = 30;
@@ -121,7 +218,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         oss << std::put_time(&tm, "%Y%m%d_%H%M%S");
         stat_log_file = cache_type + ".stat.log." + oss.str();
     }
-    set_stream_interval(static_cast<uint64_t>(capacity), g_segment_blocks);
+    set_stream_interval(static_cast<uint64_t>(capacity), 262144ULL * 6);
     if (cache_type == "LRU") {
         return attach_prefix(new LRUCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file), cache_type);
     }
@@ -276,6 +373,36 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, input_stream_policy, 0.90, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false), cache_type);
     }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_80") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_greedy_first), 0, false), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD_80") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_cold_first), 0, false), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_70") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.70, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_80") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_greedy_first), 0, true), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_60") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.60, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true), cache_type);
+    }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_8_2") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
@@ -305,6 +432,12 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
             nullptr, input_stream_policy, valid_rate_threshold, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false, stat_log_file), cache_type);
+    }
+    else if (cache_type == "LOG_GREEDY_11") { // for getting optimized value from dynamic algorithm
+        IStream *input_stream_policy = nullptr;
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, valid_rate_threshold, std::make_unique<CbEvictPolicy>(score_greedy_first), 0, false, stat_log_file), cache_type);
     }
     else if (cache_type == "LOG_FIFO_2") {
         Config cfg  ={
@@ -346,8 +479,8 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         
         IStream *input_stream_policy = createIstreamPolicy("sepbit");
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, 
-            cold_trace_file, waf_log_file, std::make_unique<FifoEvictPolicy>(), nullptr, input_stream_policy,
-            0.8, std::make_unique<CbEvictPolicy>(score_sepbit_age), 0), cache_type);
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict), 
+            nullptr, input_stream_policy, 0.80, std::make_unique<CbEvictPolicy>(score_sepbit_age), 0, false), cache_type);
     }
     else if (cache_type == "LOG_GREEDY_FIFO_2") {
         g_numerator = 10;
