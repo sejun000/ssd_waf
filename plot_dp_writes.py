@@ -48,29 +48,33 @@ BLK_TO_TB = 4096 / (1024**4)
 compacted_tb = [d[1] * BLK_TO_TB for d in data]
 evicted_tb = [d[2] * BLK_TO_TB for d in data]
 
-fig, ax1 = plt.subplots(figsize=(12, 6))
+plt.rcParams.update({'font.size': 28})
 
-ax1.scatter(dp_nums, compacted_tb, color='tab:blue', label='Host-level GC writes', zorder=3)
+fig, ax1 = plt.subplots(figsize=(14, 7))
+
+ax1.plot(dp_nums, compacted_tb, color='tab:blue', label='Host-level GC writes', zorder=3, marker='o', markersize=10, linewidth=2)
 ax1.set_xlabel('Buffer Utilization')
-ax1.set_ylabel('Host-level GC writes (TB)', color='tab:blue')
-ax1.tick_params(axis='y', labelcolor='tab:blue')
+ax1.set_ylabel('Host-level GC writes (TB)', color='black')
+ax1.tick_params(axis='y', labelcolor='black')
 ax1.set_ylim(bottom=0)
 
 ax2 = ax1.twinx()
-ax2.scatter(dp_nums, evicted_tb, color='tab:red', label='Flush writes', zorder=3)
-ax2.set_ylabel('Flush writes (TB)', color='tab:red')
-ax2.tick_params(axis='y', labelcolor='tab:red')
+ax2.plot(dp_nums, evicted_tb, color='tab:red', label='Flush writes', zorder=3, marker='s', markersize=10, linewidth=2)
+ax2.set_ylabel('Flush writes (TB)', color='black')
+ax2.tick_params(axis='y', labelcolor='black')
 ax2.set_ylim(bottom=0)
 
 lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
-ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+ax1.legend(lines1 + lines2, labels1 + labels2,
+           loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=2,
+           frameon=False, fontsize=28)
 
-ax1.grid(True, alpha=0.3)
-plt.title(f'TLC / QLC Writes vs Valid Ratio  [warmup={WARMUP_TB}TB]')
+ax1.grid(True, alpha=0.3, color='black', linestyle='--')
+ax1.set_axisbelow(True)
 plt.tight_layout()
-plt.savefig('/home/sejun000/ssd_waf/dp_writes_plot.png', dpi=150)
-print("Saved to dp_writes_plot.png")
+plt.savefig('/home/sejun000/ssd_waf/A_dp_writes_plot.pdf', dpi=150)
+print("Saved to A_dp_writes_plot.pdf")
 
 for d in data:
     print(f"dp={d[0]:.2f}  compacted(TLC)={d[1]:>15,}  evicted(QLC)={d[2]:>15,}")
