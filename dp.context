@@ -1,8 +1,8 @@
 # DP Optimizer Context (2026-03-02)
 
 ## Current Model (dp_optimizer.cpp)
-- QLC_FACTOR = 8.64
-- MA_WINDOW = 24 (240GB simple moving average)
+- QLC_FACTOR = 8.64 (configurable via --qlc_factor)
+- MA_WINDOW = 20 (200GB simple moving average)
 - k-1, k, k+1 transition constraint (±1 ratio step per 10GB)
 - Increase penalty: diff * blocks * 1.0 (compaction cost)
 - Decrease penalty: (-diff) * blocks * QLC_FACTOR (eviction cost)
@@ -28,7 +28,26 @@
 - Smoothing(SMA)은 같은 ratio 내 변동만 줄이고, ratio 간 선택은 못 막음
 - 고정 ratio 일 때의 실제 eviction과 비교 필요
 
+## Latest Results (MA_WINDOW=20, warmup_tb=6, 4 traces × 2 QLC factors)
+
+| Trace    | QLC=2.88 | QLC=8.64 |
+|----------|----------|----------|
+| Alibaba1 | 18.85 TB | 33.57 TB |
+| Alibaba2 | 14.41 TB | 23.74 TB |
+| Alibaba3 | 17.10 TB | 33.16 TB |
+| SSDTrace | 17.69 TB | 33.31 TB |
+
 ## History (MA_WINDOW variations)
 - MA=10 (100GB): cb=16.21TB, greedy=24.06TB
 - MA=12 (120GB): cb=16.43TB, greedy=24.22TB
 - MA=24 (240GB): cb=17.16TB, greedy=24.58TB
+- MA=60 (600GB): see below
+- MA=20 (200GB): see table above
+
+### MA=60 results (4 traces × 2 QLC)
+| Trace    | QLC=2.88 | QLC=8.64 |
+|----------|----------|----------|
+| Alibaba1 | 19.31 TB | 34.51 TB |
+| Alibaba2 | 14.98 TB | 24.83 TB |
+| Alibaba3 | 17.50 TB | 34.17 TB |
+| SSDTrace | 18.17 TB | 34.17 TB |

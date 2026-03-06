@@ -1,5 +1,6 @@
 #include <atomic>
 #include <mutex>
+#include <vector>
  
  namespace midas {
 
@@ -22,6 +23,7 @@ struct SSD {
 	double *TOTAL_GNUM; // # of blocks in each group
 	double *seg_stamp; // time per block (not used yet)
 	struct OOB *oob; // oob per page
+	uint64_t *page_stamp; // write timestamp per page
 	double *err_VPG;
 	double *err_EPG;
 	long **lifespan;
@@ -46,7 +48,7 @@ struct SSD_SPEC {
 	int BLKNUM; // # of blocks in SSD
 	int BLKSIZE; // block size (PPB*PGSIZE)
 	int PGNUM; // BLKNUM*PPB
-	int SEGSIZE; // segment size (BPS*BLKSIZE)
+	long long SEGSIZE; // segment size (BPS*BLKSIZE)
 	int SEGNUM; // # of segments in SSD
 	int fifo_mode; // victim selection of last group
 	int LBANUM; // # of LBAs in SSD (LOGSIZE/PGSIZE)
@@ -106,5 +108,6 @@ int policy_to_int(char *policy);
 extern std::atomic<unsigned long long> compacted_blocks_global;
 extern std::atomic<unsigned long long> valid_pages_global;
 extern std::mutex model_mutex;
+extern std::vector<int> gc_compacted_lbas;  // LBAs compacted during GC (consumed by MidasCache)
 
 } // namespace midas

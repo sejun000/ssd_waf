@@ -14,6 +14,7 @@
 #include <memory>
 #include <map>
 #include <string>
+#include <random>
 
 /**
  * Multi‑stream append‑only Log Cache (세그먼트 단위)
@@ -48,7 +49,10 @@ public:
              std::unique_ptr<EvictPolicy> compactor = nullptr,
              double max_age_ratio_by_gc = 0.0,
              bool input_ghost_cache = false,
-             std::string stat_log_file = ""
+             std::string stat_log_file = "",
+             double valid_rate_period_gb = 0.0,
+             double valid_rate_min = 0.0,
+             double valid_rate_max = 0.0
             );
 
     ~LogCache();
@@ -139,6 +143,8 @@ private:
     std::unique_ptr<Histogram> evicted_ages_with_segment_histogram;
     std::unique_ptr<Histogram> compacted_ages_with_segment_histogram;
     std::unique_ptr<Histogram> evicted_cache_blocks_per_evict;
+    std::unordered_map<long, uint64_t> compacted_at_;
+    std::unique_ptr<Histogram> compacted_lifetime_histogram_;
     static const int HISTOGRAM_BUCKETS = 20;
     static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
     static constexpr double TCO_EVICTION_WEIGHT = 2.8;
@@ -157,30 +163,6 @@ private:
     static constexpr double UTIL_STEP = 0.02;
     std::deque<double> tco_history;
     bool tco_policy_higher = true;
-
-    /* ── Survival analysis: age → time-to-death ───────────── */
-    bool survival_snapshot_taken_ = false;
-    uint64_t survival_snapshot_ts_ = 0;
-
-    struct SurvivalEntry {
-        uint64_t age_at_snapshot;
-    };
-    std::unordered_map<long, SurvivalEntry> survival_tracker_;
-
-    static const int SURVIVAL_BUCKETS = 100;
-    uint64_t survival_bucket_width_ = 1;
-
-    struct SurvivalResult {
-        uint64_t sum_ttd_invalidate = 0;   // host overwrite
-        uint64_t count_invalidate = 0;
-        uint64_t sum_ttd_evict = 0;        // flush / eviction
-        uint64_t count_evict = 0;
-    };
-    std::vector<SurvivalResult> survival_results_;
-
-    void take_survival_snapshot();
-    void record_survival_death(long key, bool is_host_invalidate);
-    void print_survival_results();
 
     /* ── Lifetime histogram (entire trace) ────────────────── */
     bool lifetime_tracking_active_ = false;
@@ -203,4 +185,31 @@ private:
 
     /* ── Per-segment age scatter data ─────────────────── */
     void print_segment_age_scatter();
+
+    /* ── Invalidation time snapshot ──────────────────── */
+    static constexpr long long INV_SNAPSHOT_THRESHOLD = 10LL * 1024 * 1024 * 1024 * 1024; // 10TB
+    bool inv_snapshot_taken_ = false;
+    uint64_t inv_snapshot_ts_ = 0;
+    struct InvSnapSegInfo {
+        uint64_t seg_age;
+        double utilization;
+        uint64_t valid_count;
+        double age_mean;
+        double age_stddev;
+        int class_num;
+    };
+    std::vector<InvSnapSegInfo> inv_snap_segs_;
+    std::unordered_map<long, size_t> inv_snap_block_seg_idx_;
+    std::vector<std::vector<uint64_t>> inv_snap_inv_times_;
+    void take_inv_snapshot();
+    void record_inv_time(long key);
+    void print_inv_time_scatter();
+
+    /* ── Periodic valid rate sweep ─────────────────────── */
+    double valid_rate_period_gb_ = 0.0;
+    double valid_rate_min_ = 0.0;
+    double valid_rate_max_ = 0.0;
+    uint64_t valid_rate_period_blocks_ = 0;
+    uint64_t next_valid_rate_change_ts_ = 0;
+    std::mt19937 valid_rate_rng_{42};
 };

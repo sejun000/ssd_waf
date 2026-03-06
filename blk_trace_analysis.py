@@ -68,7 +68,7 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
                               "--stat_log_file", "dp."+str(valid_ratio)]
             subprocess.run(base_args)   
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:
         futures = [ex.submit(_run_for_valid_ratio, vr) for vr in valid_ratio_ranges]
         for _ in as_completed(futures):
             pass

@@ -140,7 +140,8 @@ MidasCache::MidasCache(uint64_t              cold_capacity,
       cache_trace_(cache_trace),
       evicted_ages_histogram_(std::make_unique<Histogram>("midas_evicted_ages", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
       evicted_blocks_histogram_(std::make_unique<Histogram>("midas_evicted_blocks", 1, HISTOGRAM_BUCKETS, fp_stats)),
-      evicted_ages_with_segment_histogram_(std::make_unique<Histogram>("midas_evicted_segment_age", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats))
+      evicted_ages_with_segment_histogram_(std::make_unique<Histogram>("midas_evicted_segment_age", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
+      compacted_lifetime_histogram_(std::make_unique<Histogram>("compacted_lifetime", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats))
 {
     (void)trace_file;
     (void)cold_trace;
@@ -159,6 +160,9 @@ MidasCache::MidasCache(uint64_t              cold_capacity,
 }
 
 MidasCache::~MidasCache() {
+    print_utilization_distribution();
+    print_segment_age_scatter();
+    print_inv_time_scatter();
     destroy_midas();
 }
 
@@ -187,17 +191,32 @@ void MidasCache::batch_insert(int stream_id, const std::map<long,int>& newBlocks
     for (auto [key, lba_sz] : newBlocks) {
         maybe_run_gc_policy();
 
+        // record inv_time and compacted_lifetime for overwritten block
+        if (remap_.mapping.count(key)) {
+            record_inv_time(key);
+            auto cit = compacted_at_.find(key);
+            if (cit != compacted_at_.end()) {
+                compacted_lifetime_histogram_->inc(midas_stats->cur_wp - cit->second);
+                compacted_at_.erase(cit);
+            }
+        }
+
         int mapped = remap_.get_or_assign(key);
         if (mapped < 0) {
-            printf("failed\n");  
+            printf("failed\n");
             continue;
         }
         write_size_to_cache += lba_sz;
 
         // delegate the real write to MiDAS engine (4K per call)
         midas::write(static_cast<int>(mapped), midas_ssd, midas_stats, midas_group.data(), false);
+        midas::stat_update(midas_stats, 1, 0); // increment cur_wp for page_stamp tracking
         // sync valid blocks from MiDAS atomic
         global_valid_blocks = midas::valid_pages_global.load(std::memory_order_relaxed);
+
+        if (!inv_snapshot_taken_ && write_size_to_cache >= INV_SNAPSHOT_THRESHOLD) {
+            take_inv_snapshot();
+        }
     }
 }
 
@@ -331,6 +350,7 @@ void MidasCache::maybe_run_gc_policy() {
         else {
             //printf("GC\n");
             midas::GC(midas_ssd, midas_stats, midas_group.data());
+            consume_gc_compacted_lbas();
         }
         t++;
         if (t % ILOOP == 0 && t > 1) {
@@ -348,6 +368,18 @@ int MidasCache::purge_segment_valids(int victim_seg) {
         if (idx < 0) continue;
         if (midas_ssd->itable[idx] == false && midas_ssd->oob[idx].lba != -1) { // valid page
             int lba = midas_ssd->oob[idx].lba;
+            // record inv_time and compacted_lifetime for GC-evicted block
+            {
+                auto rit = remap_.rev_mapping.find(lba);
+                if (rit != remap_.rev_mapping.end()) {
+                    record_inv_time(rit->second);
+                    auto cit = compacted_at_.find(rit->second);
+                    if (cit != compacted_at_.end()) {
+                        compacted_lifetime_histogram_->inc(midas_stats->cur_wp - cit->second);
+                        compacted_at_.erase(cit);
+                    }
+                }
+            }
             uint64_t start_index = static_cast<uint64_t>(lba) / static_cast<uint64_t>(cfg_.evicted_blk_size);
             start_index *= static_cast<uint64_t>(cfg_.evicted_blk_size);
             _evict_one_block(start_index * cache_block_size,
@@ -382,6 +414,121 @@ uint64_t MidasCache::segment_age_pages(int segment_idx) const {
     return (age > 0) ? static_cast<uint64_t>(age) : 0;
 }
 
+void MidasCache::print_utilization_distribution() {
+    if (!midas_initialized || !midas_ssd || !midas::ssd_spec) return;
+
+    static constexpr int NUM_BINS = 50;
+    static constexpr double BIN_WIDTH = 2.0;
+    uint64_t bins[NUM_BINS] = {};
+    uint64_t total_sealed = 0;
+    int PPS = midas::ssd_spec->PPS;
+
+    for (int seg = 0; seg < midas::ssd_spec->SEGNUM; seg++) {
+        if (!midas_ssd->fill_info[seg]) continue; // not sealed
+        int valid = PPS - midas_ssd->irtable[seg];
+        double util_pct = 100.0 * valid / PPS;
+        int bin = static_cast<int>(util_pct / BIN_WIDTH);
+        if (bin >= NUM_BINS) bin = NUM_BINS - 1;
+        bins[bin]++;
+        total_sealed++;
+    }
+
+    if (total_sealed == 0) {
+        printf("[MiDAS UtilDist] no sealed segments\n");
+        return;
+    }
+
+    char fname[256];
+    {
+        const std::string& sts = start_ts();
+        const std::string& pfx = stats_prefix();
+        if (sts.empty()) {
+            char ts_buf[64];
+            time_t now = time(nullptr); struct tm tm; localtime_r(&now, &tm);
+            strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm);
+            snprintf(fname, sizeof(fname), "utilization_distribution.%s.csv", ts_buf);
+        } else if (pfx.empty()) {
+            snprintf(fname, sizeof(fname), "utilization_distribution.%s.csv", sts.c_str());
+        } else {
+            snprintf(fname, sizeof(fname), "%s.utilization_distribution.%s.csv", pfx.c_str(), sts.c_str());
+        }
+    }
+
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+    fprintf(f, "util_low,util_high,count,fraction\n");
+    for (int i = 0; i < NUM_BINS; i++) {
+        double lo = i * BIN_WIDTH;
+        double hi = lo + BIN_WIDTH;
+        double frac = static_cast<double>(bins[i]) / total_sealed;
+        fprintf(f, "%.0f,%.0f,%lu,%.6f\n", lo, hi, (unsigned long)bins[i], frac);
+    }
+    fclose(f);
+    printf("[MiDAS UtilDist] written to %s (%lu segments)\n", fname, (unsigned long)total_sealed);
+}
+
+void MidasCache::print_segment_age_scatter() {
+    if (!midas_initialized || !midas_ssd || !midas::ssd_spec || !midas_stats) return;
+
+    const std::string& ts = start_ts();
+    const std::string& prefix = stats_prefix();
+    char fname[256];
+    if (ts.empty()) {
+        char ts_buf[64];
+        time_t now = time(nullptr); struct tm tm; localtime_r(&now, &tm);
+        strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm);
+        snprintf(fname, sizeof(fname), "segment_age_scatter.%s.csv", ts_buf);
+    } else if (prefix.empty()) {
+        snprintf(fname, sizeof(fname), "segment_age_scatter.%s.csv", ts.c_str());
+    } else {
+        snprintf(fname, sizeof(fname), "%s.segment_age_scatter.%s.csv", prefix.c_str(), ts.c_str());
+    }
+
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+    fprintf(f, "seg_age,utilization,valid_count,block_age_mean,block_age_stddev\n");
+
+    int PPS = midas::ssd_spec->PPS;
+    uint64_t cur_wp = midas_stats->cur_wp;
+    uint64_t count = 0;
+
+    for (int seg = 0; seg < midas::ssd_spec->SEGNUM; seg++) {
+        if (!midas_ssd->fill_info[seg]) continue;
+
+        int base = seg * PPS;
+        int valid = 0;
+        double sum = 0.0, sum_sq = 0.0;
+
+        for (int i = 0; i < PPS; i++) {
+            if (midas_ssd->itable[base + i] == false && midas_ssd->oob[base + i].lba != -1) {
+                valid++;
+                double age = static_cast<double>(cur_wp - midas_ssd->page_stamp[base + i]);
+                sum += age;
+                sum_sq += age * age;
+            }
+        }
+
+        double util = static_cast<double>(valid) / PPS;
+        uint64_t seg_age = (midas_ssd->seg_stamp[seg] >= 0)
+            ? static_cast<uint64_t>(cur_wp - midas_ssd->seg_stamp[seg]) : 0;
+
+        double mean = 0.0, stddev = 0.0;
+        if (valid > 0) {
+            mean = sum / valid;
+            if (valid > 1) {
+                double var = (sum_sq - sum * sum / valid) / (valid - 1);
+                stddev = (var > 0.0) ? std::sqrt(var) : 0.0;
+            }
+        }
+
+        fprintf(f, "%lu,%.6f,%d,%.1f,%.1f\n", (unsigned long)seg_age, util, valid, mean, stddev);
+        count++;
+    }
+
+    fclose(f);
+    printf("[MiDAS AgeScatter] written to %s (%lu segments)\n", fname, (unsigned long)count);
+}
+
 void MidasCache::record_eviction_histograms(int removed_pages, uint64_t segment_age_pages) {
     if (removed_pages < 0) removed_pages = 0;
     if (evicted_blocks_histogram_) {
@@ -393,4 +540,154 @@ void MidasCache::record_eviction_histograms(int removed_pages, uint64_t segment_
     if (evicted_ages_with_segment_histogram_) {
         evicted_ages_with_segment_histogram_->inc(segment_age_pages);
     }
+}
+
+void MidasCache::consume_gc_compacted_lbas()
+{
+    if (midas::gc_compacted_lbas.empty()) return;
+    uint64_t wp = midas_stats->cur_wp;
+    for (int lba : midas::gc_compacted_lbas) {
+        auto rit = remap_.rev_mapping.find(lba);
+        if (rit != remap_.rev_mapping.end()) {
+            long key = rit->second;
+            // if previously compacted, record lifetime of that copy
+            auto cit = compacted_at_.find(key);
+            if (cit != compacted_at_.end()) {
+                compacted_lifetime_histogram_->inc(wp - cit->second);
+            }
+            compacted_at_[key] = wp;
+        }
+    }
+    midas::gc_compacted_lbas.clear();
+}
+
+void MidasCache::take_inv_snapshot()
+{
+    if (!midas_initialized || !midas_ssd || !midas::ssd_spec || !midas_stats) return;
+
+    inv_snapshot_taken_ = true;
+    inv_snapshot_wp_ = midas_stats->cur_wp;
+
+    int PPS = midas::ssd_spec->PPS;
+    uint64_t cur_wp = midas_stats->cur_wp;
+    size_t seg_idx = 0;
+
+    for (int seg = 0; seg < midas::ssd_spec->SEGNUM; seg++) {
+        if (!midas_ssd->fill_info[seg]) continue;
+
+        int base = seg * PPS;
+        int valid = 0;
+        double sum = 0.0, sum_sq = 0.0;
+
+        for (int i = 0; i < PPS; i++) {
+            if (midas_ssd->itable[base + i] == false && midas_ssd->oob[base + i].lba != -1) {
+                valid++;
+                double age = static_cast<double>(cur_wp - midas_ssd->page_stamp[base + i]);
+                sum += age;
+                sum_sq += age * age;
+            }
+        }
+        if (valid == 0) continue;
+
+        double util = static_cast<double>(valid) / PPS;
+        uint64_t seg_age = (midas_ssd->seg_stamp[seg] >= 0)
+            ? static_cast<uint64_t>(cur_wp - midas_ssd->seg_stamp[seg]) : 0;
+
+        double mean = sum / valid;
+        double stddev = 0.0;
+        if (valid > 1) {
+            double var = (sum_sq - sum * sum / valid) / (valid - 1);
+            stddev = (var > 0.0) ? std::sqrt(var) : 0.0;
+        }
+
+        int gid = midas_ssd->gnum_info[seg];
+        inv_snap_segs_.push_back({seg_age, util, static_cast<uint64_t>(valid), mean, stddev, gid});
+        inv_snap_inv_times_.push_back({});
+
+        // map each valid block's key -> seg_idx
+        for (int i = 0; i < PPS; i++) {
+            if (midas_ssd->itable[base + i] == false && midas_ssd->oob[base + i].lba != -1) {
+                int lba = midas_ssd->oob[base + i].lba;
+                auto rit = remap_.rev_mapping.find(lba);
+                if (rit != remap_.rev_mapping.end()) {
+                    inv_snap_block_seg_idx_[rit->second] = seg_idx;
+                }
+            }
+        }
+        seg_idx++;
+    }
+
+    printf("[MiDAS InvSnapshot] taken at wp=%lu, write=%.1f TB, %zu segments, %zu blocks tracked\n",
+           inv_snapshot_wp_, (double)write_size_to_cache / (1024.0*1024*1024*1024),
+           inv_snap_segs_.size(), inv_snap_block_seg_idx_.size());
+}
+
+void MidasCache::record_inv_time(long key)
+{
+    if (!inv_snapshot_taken_) return;
+    auto it = inv_snap_block_seg_idx_.find(key);
+    if (it != inv_snap_block_seg_idx_.end()) {
+        uint64_t inv_time = midas_stats->cur_wp - inv_snapshot_wp_;
+        inv_snap_inv_times_[it->second].push_back(inv_time);
+        inv_snap_block_seg_idx_.erase(it);
+    }
+}
+
+void MidasCache::print_inv_time_scatter()
+{
+    if (!inv_snapshot_taken_ || inv_snap_segs_.empty()) return;
+
+    char fname[256];
+    const std::string& ts = start_ts();
+    const std::string& prefix = stats_prefix();
+    if (ts.empty()) {
+        char ts_buf[64];
+        time_t now = time(nullptr); struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm);
+        snprintf(fname, sizeof(fname), "inv_time_scatter.%s.csv", ts_buf);
+    } else if (prefix.empty()) {
+        snprintf(fname, sizeof(fname), "inv_time_scatter.%s.csv", ts.c_str());
+    } else {
+        snprintf(fname, sizeof(fname), "%s.inv_time_scatter.%s.csv", prefix.c_str(), ts.c_str());
+    }
+
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+
+    fprintf(f, "seg_age,utilization,valid_count,age_mean,age_stddev,"
+               "inv_time_mean,inv_time_stddev,inv_count,survived_count,class_num\n");
+
+    uint64_t total_survived = 0;
+    for (size_t i = 0; i < inv_snap_segs_.size(); i++) {
+        auto& info = inv_snap_segs_[i];
+        auto& times = inv_snap_inv_times_[i];
+
+        uint64_t survived = info.valid_count - times.size();
+        total_survived += survived;
+
+        double inv_mean = 0.0, inv_stddev = 0.0;
+        uint64_t n = times.size();
+        if (n > 0) {
+            double sum = 0.0, sum_sq = 0.0;
+            for (auto t : times) {
+                sum += (double)t;
+                sum_sq += (double)t * t;
+            }
+            inv_mean = sum / n;
+            if (n > 1) {
+                double var = (sum_sq - sum * sum / n) / (n - 1);
+                inv_stddev = (var > 0.0) ? std::sqrt(var) : 0.0;
+            }
+        }
+
+        fprintf(f, "%lu,%.6f,%lu,%.1f,%.1f,%.1f,%.1f,%lu,%lu,%d\n",
+                (unsigned long)info.seg_age, info.utilization, (unsigned long)info.valid_count,
+                info.age_mean, info.age_stddev,
+                inv_mean, inv_stddev, (unsigned long)n, (unsigned long)survived, info.group_id);
+    }
+
+    fclose(f);
+    printf("[MiDAS InvTimeScatter] written to %s (%zu segments, %lu blocks survived)\n",
+           fname, inv_snap_segs_.size(), (unsigned long)total_survived);
 }

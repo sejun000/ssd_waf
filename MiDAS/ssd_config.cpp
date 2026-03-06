@@ -75,7 +75,7 @@ void ssd_init(struct SSD* ssd, class GROUP* group[], int gnum, int vs_policy, in
 	ssd_spec->FREENUM = 4; //GC trigger point
 	ssd_spec->NAIVE_N = 4; 
 	ssd_spec->BLKSIZE = ssd_spec->PGSIZE*ssd_spec->PPB;
-	ssd_spec->SEGSIZE = ssd_spec->BLKSIZE*ssd_spec->BPS;
+	ssd_spec->SEGSIZE = (long long)ssd_spec->BLKSIZE*ssd_spec->BPS;
 	ssd_spec->SEGNUM = (int)(ssd_spec->DEVSIZE/ssd_spec->SEGSIZE);
 	ssd_spec->BLKNUM = ssd_spec->SEGNUM*ssd_spec->BPS;
 	ssd_spec->PGNUM = ssd_spec->BLKNUM*ssd_spec->PPB;
@@ -90,6 +90,7 @@ void ssd_init(struct SSD* ssd, class GROUP* group[], int gnum, int vs_policy, in
 	ssd->gnum_info = (unsigned char*)malloc(sizeof(unsigned char)*ssd_spec->SEGNUM);
 	ssd->fill_info = (bool*)malloc(sizeof(bool)*ssd_spec->SEGNUM);
 	ssd->seg_stamp = (double*)malloc(sizeof(double)*ssd_spec->SEGNUM);
+	ssd->page_stamp = (uint64_t*)calloc(ssd_spec->PGNUM, sizeof(uint64_t));
 	ssd->VPG = (double*)malloc(sizeof(double)*ssd_spec->MAXGNUM);
 	ssd->EPG = (double*)malloc(sizeof(double)*ssd_spec->MAXGNUM);
 	ssd->DEBUG_VPG = (double*)malloc(sizeof(double)*ssd_spec->MAXGNUM);

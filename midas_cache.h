@@ -23,7 +23,7 @@ class GROUP;
  */
 struct MidasConfig
 {
-    std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
+    std::size_t segment_bytes  = 6ull * 1024 * 1024 * 1024; ///< default 6 GB
     double      free_ratio_low = 0.01;                ///< 1 %
     int         evicted_blk_size = 1;                 // 4k eviction
     uint64_t    print_stats_interval = 10 * 1024ull * 1024 * 1024; // 10 GB
@@ -101,6 +101,27 @@ private:
     int              purge_segment_valids(int victim_seg);
     uint64_t         segment_age_pages(int segment_idx) const;
     void             record_eviction_histograms(int removed_pages, uint64_t segment_age_pages);
+    void             print_utilization_distribution();
+    void             print_segment_age_scatter();
+
+    /* ── Invalidation time snapshot (same as LogCache) ── */
+    static constexpr long long INV_SNAPSHOT_THRESHOLD = 10LL * 1024 * 1024 * 1024 * 1024; // 10TB
+    bool inv_snapshot_taken_ = false;
+    uint64_t inv_snapshot_wp_ = 0;     // cur_wp at snapshot time
+    struct InvSnapSegInfo {
+        uint64_t seg_age;
+        double   utilization;
+        uint64_t valid_count;
+        double   age_mean;
+        double   age_stddev;
+        int      group_id;
+    };
+    std::vector<InvSnapSegInfo>                inv_snap_segs_;
+    std::unordered_map<long, size_t>           inv_snap_block_seg_idx_;  // key -> seg index in inv_snap_segs_
+    std::vector<std::vector<uint64_t>>         inv_snap_inv_times_;
+    void             take_inv_snapshot();
+    void             record_inv_time(long key);
+    void             print_inv_time_scatter();
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -146,4 +167,9 @@ private:
     std::unique_ptr<Histogram> evicted_ages_histogram_;
     std::unique_ptr<Histogram> evicted_blocks_histogram_;
     std::unique_ptr<Histogram> evicted_ages_with_segment_histogram_;
+
+    /* ── Compacted block lifetime tracking (same as LogCache) ── */
+    std::unordered_map<long, uint64_t> compacted_at_;  // key -> cur_wp at compact time
+    std::unique_ptr<Histogram> compacted_lifetime_histogram_;
+    void consume_gc_compacted_lbas();
 };

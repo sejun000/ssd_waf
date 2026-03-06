@@ -1,27 +1,11 @@
 // Dynamic Programming optimizer for valid ratio selection from dp.* logs
 //
-// Assumptions and rules based on user description:
-// - Input files: current directory entries named like "dp.*" where * is the valid ratio number (double), e.g., dp.0.80
-// - Each file contains lines, we only parse lines starting with "invalidate_blocks:" followed by key:value pairs.
-// - Keys of interest: compacted_blocks, evicted_blocks, total_cache_size
-// - These counters are cumulative; we compute deltas per time step t to get u_t (compaction blocks) and v_t (eviction blocks).
-// - Base objective per time step: F_t = u_t + QLC_FACTOR * v_t
-// - Between t->t+1, if we change valid ratio c->c':
-//   - If decrease (c' < c): penalty = QLC_FACTOR * (c - c') * total_cache_size/4096
-//   - If increase (c' > c): penalty = 1.0  * (c' - c) * total_cache_size/4096
-//   - If unchanged: no penalty
-// - total_cache_size in logs is bytes but needs to be divided by 4096 to convert to blocks (as per user note).
-// - We assume no initial penalty at t=0.
-// - If files have different lengths, we truncate to the minimum available length across all files.
-//
-// Output:
-// - Prints summary with T (steps), K (ratios), minimal total cost.
-// - Then prints per-time-step: t, chosen ratio, base F_t, transition penalty from previous ratio, and cumulative cost.
+// NEW: Uses actual utilization (global_valid_blocks / total_cache_blocks) binned
+// at 1% granularity instead of filename-based target ratios.
+// If multiple dp files map to the same (bin, step), uses the higher dp filename number.
 //
 // Build: g++ -O2 -std=c++17 -o dp_optimizer dp_optimizer.cpp
-// Usage: ./dp_optimizer [--dir DIR] [--tmax N]
-//   --dir: directory to scan for dp.* files (default: current directory)
-//   --tmax: cap number of time steps used (optional)
+// Usage: ./dp_optimizer [--dir DIR] [--tmax N] [--warmup_tb TB] [--step_skip N] [--decision_interval N]
 
 #include <bits/stdc++.h>
 #include <filesystem>
@@ -29,17 +13,16 @@
 using namespace std;
 namespace fs = std::filesystem;
 
-static constexpr double QLC_FACTOR = 8.64;
+static double QLC_FACTOR = 8.64;
 
+// Series represents a utilization bin (e.g., 0.66)
 struct Series {
-    string filename;
-    double c = 0.0;                          // valid ratio represented by file name
-    vector<long long> u_cum;                 // compacted_blocks cumulative
-    vector<long long> v_cum;                 // evicted_blocks cumulative
-    vector<long long> tc_bytes;              // total_cache_size bytes
-    vector<double> u_delta;                  // per-step deltas
-    vector<double> v_delta;                  // per-step deltas
-    vector<double> F;                        // u + QLC_FACTOR * v per-step
+    string label;
+    double c = 0.0;                          // bin ratio (e.g., 0.66)
+    vector<long long> tc_bytes;              // total_cache_size bytes per step
+    vector<double> u_delta;                  // per-step raw compaction delta
+    vector<double> v_delta;                  // per-step raw eviction delta
+    vector<double> F;                        // smoothed cost per step
 };
 
 static bool starts_with(const string& s, const string& p) {
@@ -47,16 +30,14 @@ static bool starts_with(const string& s, const string& p) {
 }
 
 static optional<double> parse_c_from_filename(const string& name) {
-    // Expect pattern: dp.<number>
     const string prefix = "dp.";
     if (!starts_with(name, prefix)) return nullopt;
     string tail = name.substr(prefix.size());
-    // Ensure tail is a valid number (allow digits, dot, minus)
     if (tail.empty()) return nullopt;
     try {
         size_t idx = 0;
         double v = stod(tail, &idx);
-        if (idx != tail.size()) return nullopt; // extra junk
+        if (idx != tail.size()) return nullopt;
         return v;
     } catch (...) {
         return nullopt;
@@ -67,37 +48,28 @@ static bool parse_line_values(const string& line,
                               long long& compacted,
                               long long& evicted,
                               long long& total_cache_size,
-                              long long& write_size_to_cache) {
-    // Line format example:
-    // invalidate_blocks: 342 compacted_blocks: 0 global_valid_blocks: 24436 write_size_to_cache: 100693504 evicted_blocks: 0 write_hit_size: 0 total_cache_size: 2832159886802944 reinsert_blocks: 0
-    // We'll scan tokens and read the values we need. Missing keys default to 0.
-    compacted = 0; evicted = 0; total_cache_size = 0; write_size_to_cache = 0;
-    // Find "invalidate_blocks:" anywhere in the line (may have prefix like "LOG_GREEDY_11")
+                              long long& write_size_to_cache,
+                              long long& global_valid_blocks) {
+    compacted = 0; evicted = 0; total_cache_size = 0; write_size_to_cache = 0; global_valid_blocks = 0;
     auto pos = line.find("invalidate_blocks:");
     if (pos == string::npos) return false;
     istringstream iss(line.substr(pos));
     string tok;
-    if (!(iss >> tok)) return false; // "invalidate_blocks:"
-    // skip the number after invalidate_blocks:
+    if (!(iss >> tok)) return false;
     string num; if (!(iss >> num)) return false;
-    // Read remaining key: value pairs
     while (iss >> tok) {
-        string key = tok; // should have trailing ':'
+        string key = tok;
         if (!key.empty() && key.back() == ':') {
             key.pop_back();
             string valstr;
             if (!(iss >> valstr)) break;
-            // convert to long long if numeric
             long long val = 0;
-            try {
-                val = stoll(valstr);
-            } catch (...) {
-                continue;
-            }
+            try { val = stoll(valstr); } catch (...) { continue; }
             if (key == "compacted_blocks") compacted = val;
             else if (key == "evicted_blocks") evicted = val;
             else if (key == "total_cache_size") total_cache_size = val;
             else if (key == "write_size_to_cache") write_size_to_cache = val;
+            else if (key == "global_valid_blocks") global_valid_blocks = val;
         }
     }
     return true;
@@ -125,6 +97,8 @@ int main(int argc, char** argv) {
             step_skip = atoi(argv[++i]);
         } else if (a == "--decision_interval" && i + 1 < argc) {
             decision_interval = atoi(argv[++i]);
+        } else if (a == "--qlc_factor" && i + 1 < argc) {
+            QLC_FACTOR = atof(argv[++i]);
         } else {
             cerr << "Unknown or incomplete argument: " << a << "\n";
             cerr << "Usage: " << argv[0] << " [--dir DIR] [--tmax N] [--warmup_tb TB] [--step_skip N] [--decision_interval N]\n";
@@ -133,144 +107,203 @@ int main(int argc, char** argv) {
     }
     long long warmup_bytes = static_cast<long long>(warmup_tb * 1024LL * 1024 * 1024 * 1024);
 
-    vector<Series> series;
-    // Scan directory for dp.* files
+    // ---- Phase 1: Read all dp files, compute per-file deltas ----
+    struct FileData {
+        double dp_num;
+        string filename;
+        vector<double> F;
+        vector<double> u_delta;
+        vector<double> v_delta;
+        vector<long long> tc_bytes;
+        vector<long long> gvb;
+    };
+
+    static constexpr int MA_WINDOW = 20;
+    static constexpr double HOST_BLOCKS_PER_STEP = 10.0 * 1024 * 1024 * 1024 / 4096;
+
+    auto moving_avg = [](const vector<double>& raw, int win) -> vector<double> {
+        size_t n = raw.size();
+        vector<double> out(n);
+        double sum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            sum += raw[i];
+            if (i >= (size_t)win) sum -= raw[i - win];
+            size_t cnt = min(i + 1, (size_t)win);
+            out[i] = sum / cnt;
+        }
+        return out;
+    };
+
+    vector<FileData> files;
     for (auto& de : fs::directory_iterator(dir)) {
         if (!de.is_regular_file()) continue;
         string name = de.path().filename().string();
         auto copt = parse_c_from_filename(name);
         if (!copt) continue;
-        Series s;
-        s.filename = de.path().string();
-        s.c = *copt;
-        ifstream ifs(s.filename);
-        if (!ifs) {
-            cerr << "Warning: cannot open " << s.filename << "\n";
-            continue;
-        }
+
+        FileData fd;
+        fd.dp_num = *copt;
+        fd.filename = de.path().string();
+
+        ifstream ifs(fd.filename);
+        if (!ifs) { cerr << "Warning: cannot open " << fd.filename << "\n"; continue; }
+
+        vector<long long> comp, evict, tc, gvb_vec;
         string line;
-        vector<long long> comp, evict, tc;
-        comp.reserve(100000);
-        evict.reserve(100000);
-        tc.reserve(100000);
         int line_skip_cnt = 0;
         while (getline(ifs, line)) {
             if (line.find("invalidate_blocks:") == string::npos) continue;
-            long long cval=0, eval=0, tcval=0, wval=0;
-            if (parse_line_values(line, cval, eval, tcval, wval)) {
+            long long cval=0, eval=0, tcval=0, wval=0, gval=0;
+            if (parse_line_values(line, cval, eval, tcval, wval, gval)) {
                 if (warmup_bytes > 0 && wval < warmup_bytes) continue;
                 if (step_skip > 1 && (line_skip_cnt++ % step_skip) != 0) continue;
                 comp.push_back(cval);
                 evict.push_back(eval);
                 tc.push_back(tcval);
+                gvb_vec.push_back(gval);
             }
         }
-        if (comp.empty()) {
-            cerr << "Warning: no valid lines in " << s.filename << "\n";
-            continue;
-        }
-        s.u_cum = move(comp);
-        s.v_cum = move(evict);
-        s.tc_bytes = move(tc);
-        // compute raw deltas, then apply moving average
-        size_t T = s.u_cum.size();
-        s.u_delta.resize(T);
-        s.v_delta.resize(T);
-        s.F.resize(T);
-        static constexpr double HOST_BLOCKS_PER_STEP = 10.0 * 1024 * 1024 * 1024 / 4096;
-        static constexpr int MA_WINDOW = 120;
+        if (comp.empty()) { cerr << "Warning: no valid lines in " << fd.filename << "\n"; continue; }
+
+        size_t fT = comp.size();
+        fd.tc_bytes = move(tc);
+        fd.gvb = move(gvb_vec);
 
         // raw deltas
-        vector<double> raw_u(T), raw_v(T);
-        long long up = s.u_cum[0], vp = s.v_cum[0];
-        for (size_t t = 0; t < T; ++t) {
-            raw_u[t] = (t == 0) ? 0.0 : max(0.0, (double)(s.u_cum[t] - up));
-            raw_v[t] = (t == 0) ? 0.0 : max(0.0, (double)(s.v_cum[t] - vp));
-            up = s.u_cum[t]; vp = s.v_cum[t];
+        vector<double> raw_u(fT), raw_v(fT);
+        long long up = comp[0], vp = evict[0];
+        for (size_t t = 0; t < fT; ++t) {
+            raw_u[t] = (t == 0) ? 0.0 : max(0.0, (double)(comp[t] - up));
+            raw_v[t] = (t == 0) ? 0.0 : max(0.0, (double)(evict[t] - vp));
+            up = comp[t]; vp = evict[t];
         }
 
-        // moving average
-        auto moving_avg = [](const vector<double>& raw, int win) -> vector<double> {
-            size_t n = raw.size();
-            vector<double> out(n);
-            double sum = 0.0;
-            for (size_t i = 0; i < n; ++i) {
-                sum += raw[i];
-                if (i >= (size_t)win) sum -= raw[i - win];
-                size_t cnt = min(i + 1, (size_t)win);
-                out[i] = sum / cnt;
-            }
-            return out;
-        };
-
+        // moving average for smoothed F
         vector<double> smooth_u = moving_avg(raw_u, MA_WINDOW);
         vector<double> smooth_v = moving_avg(raw_v, MA_WINDOW);
 
-        for (size_t t = 0; t < T; ++t) {
-            s.u_delta[t] = smooth_u[t];
-            s.v_delta[t] = smooth_v[t];
-            s.F[t] = smooth_u[t] + QLC_FACTOR * smooth_v[t] + HOST_BLOCKS_PER_STEP;
+        fd.u_delta.resize(fT);
+        fd.v_delta.resize(fT);
+        fd.F.resize(fT);
+        for (size_t t = 0; t < fT; ++t) {
+            fd.u_delta[t] = raw_u[t];
+            fd.v_delta[t] = raw_v[t];
+            fd.F[t] = smooth_u[t] + QLC_FACTOR * smooth_v[t] + HOST_BLOCKS_PER_STEP;
         }
-        series.push_back(move(s));
+        cerr << "  Loaded " << fd.filename << " (dp_num=" << fd.dp_num << ", steps=" << fT << ")\n";
+        files.push_back(move(fd));
     }
 
-    if (series.empty()) {
+    if (files.empty()) {
         cerr << "No dp.* files found in " << dir << "\n";
         return 1;
     }
 
-    // Sort series by c for readability
-    sort(series.begin(), series.end(), [](const Series& a, const Series& b){
-        if (a.c == b.c) return a.filename < b.filename;
-        return a.c < b.c;
-    });
-
-    // Determine T = min length across all series
-    size_t T = series.front().F.size();
-    for (auto& s : series) T = min(T, s.F.size());
+    // ---- Phase 2: Build bin grid by actual utilization (1% bins) ----
+    size_t T = 0;
+    for (auto& fd : files) T = max(T, fd.F.size());
     if (tmax != LLONG_MAX) T = min(T, static_cast<size_t>(tmax));
 
-    // Build a reference total_cache_blocks per t. Prefer first series.
+    struct CellData {
+        double F, u_delta, v_delta;
+        long long tc_bytes;
+        double source_dp;
+    };
+    // grid[bin_pct][t] — bin_pct is integer (e.g., 66 means 0.66)
+    map<int, map<size_t, CellData>> grid;
+
+    for (auto& fd : files) {
+        size_t len = min(T, fd.F.size());
+        for (size_t t = 0; t < len; ++t) {
+            double total_blks = (fd.tc_bytes[t] > 0)
+                ? static_cast<double>(fd.tc_bytes[t]) / 4096.0 : 0.0;
+            if (total_blks <= 0) continue;
+            double actual_util = static_cast<double>(fd.gvb[t]) / total_blks;
+            int bin_pct = (int)round(actual_util * 100.0);
+            if (bin_pct < 0 || bin_pct > 100) continue;
+
+            auto& cell_map = grid[bin_pct];
+            auto it = cell_map.find(t);
+            if (it == cell_map.end() || fd.dp_num > it->second.source_dp) {
+                cell_map[t] = {fd.F[t], fd.u_delta[t], fd.v_delta[t], fd.tc_bytes[t], fd.dp_num};
+            }
+        }
+    }
+
+    // ---- Phase 3: Convert bins to sorted Series ----
+    vector<int> bin_pcts;
+    for (auto& [bp, _] : grid) bin_pcts.push_back(bp);
+    // map is ordered, so bin_pcts is already sorted ascending
+
+    vector<Series> series;
+    for (int bp : bin_pcts) {
+        Series s;
+        s.c = bp / 100.0;
+        s.label = "bin_" + to_string(bp);
+        s.F.resize(T, 0.0);
+        s.u_delta.resize(T, 0.0);
+        s.v_delta.resize(T, 0.0);
+        s.tc_bytes.resize(T, 0);
+
+        for (auto& [t, cell] : grid[bp]) {
+            if (t < T) {
+                s.F[t] = cell.F;
+                s.u_delta[t] = cell.u_delta;
+                s.v_delta[t] = cell.v_delta;
+                s.tc_bytes[t] = cell.tc_bytes;
+            }
+        }
+        series.push_back(move(s));
+    }
+
+    cerr << "Bins: " << series.size() << ", T=" << T << "\n";
+    for (size_t k = 0; k < series.size(); ++k) {
+        size_t filled = grid[bin_pcts[k]].size();
+        cerr << "  " << series[k].c << ": " << filled << "/" << T << " steps filled\n";
+    }
+
+    // ---- Phase 4: Build cost matrix and tcache_blocks ----
+    const size_t K = series.size();
+    const double INF = 1e300;
+
+    // tcache_blocks for transition penalty
     vector<double> tcache_blocks(T, 0.0);
     for (size_t t = 0; t < T; ++t) {
         long long bytes = 0;
-        // If any series has tc_bytes[t] > 0, use it
         for (auto& s : series) {
             if (t < s.tc_bytes.size() && s.tc_bytes[t] > 0) { bytes = s.tc_bytes[t]; break; }
         }
-        // As per instruction: divide by 4096 twice (total_cache_size is wrong by 4096x)
         tcache_blocks[t] = static_cast<double>(bytes) / 4096.0 / 4096.0;
     }
 
-    const size_t K = series.size();
-    // Prepare cost matrix cost[k][t] = F_t for choosing c_k at t
-    vector<vector<double>> cost(K, vector<double>(T, 0.0));
+    // cost[k][t] = F if data exists for this (bin, step), else INF
+    vector<vector<double>> cost(K, vector<double>(T, INF));
     for (size_t k = 0; k < K; ++k) {
-        for (size_t t = 0; t < T; ++t) {
-            cost[k][t] = series[k].F[t];
+        for (auto& [t, cell] : grid[bin_pcts[k]]) {
+            if (t < T) cost[k][t] = series[k].F[t];
         }
     }
 
+    // Report reachability
+    for (size_t k = 0; k < K; ++k) {
+        size_t reachable = 0;
+        for (size_t t = 0; t < T; ++t) if (cost[k][t] < INF * 0.5) reachable++;
+        if (reachable < T)
+            cerr << "  c=" << series[k].c << ": " << reachable << "/" << T << " steps reachable\n";
+    }
+
+    // ---- DP ----
     auto trans_penalty = [&](double c_prev, double c_next, size_t t)->double{
         double diff = c_next - c_prev;
         double blocks = tcache_blocks[t]; // already bytes/4096
-        if (diff > 0) {
-            // increase valid ratio => need more valid blocks via TLC writes (weight 1.0)
-            return diff * blocks;
-        } else if (diff < 0) {
-            // decrease valid ratio => eviction cost weight QLC_FACTOR
-            return (-diff) * blocks * QLC_FACTOR;
-        } else {
-            return 0.0;
-        }
+        (void)diff; (void)blocks;
+        return 0.0;
     };
 
-    // DP arrays
-    const double INF = 1e300;
     vector<vector<double>> DP(T, vector<double>(K, INF));
     vector<vector<int>> parent(T, vector<int>(K, -1));
 
-    // Initialize t=0 (no transition penalty at start)
+    // Initialize t=0
     for (size_t k = 0; k < K; ++k) DP[0][k] = cost[k][0];
 
     // Transitions
@@ -279,13 +312,17 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < K; ++k) {
             double best = INF; int arg = -1;
             if (can_switch) {
-                // allow k-1, k, k+1
-                for (int j = max(0, (int)k - 1); j <= min((int)K - 1, (int)k + 1); ++j) {
+                // allow ±1 normally, ±2 only to skip over INF intermediate
+                for (int j = max(0, (int)k - 2); j <= min((int)K - 1, (int)k + 2); ++j) {
+                    int dist = abs(j - (int)k);
+                    if (dist == 2) {
+                        int mid = (j + (int)k) / 2;
+                        if (cost[mid][t-1] < INF * 0.5) continue;
+                    }
                     double cand = DP[t-1][j] + trans_penalty(series[j].c, series[k].c, t) + cost[k][t];
                     if (cand < best) { best = cand; arg = j; }
                 }
             } else {
-                // must stay at same ratio
                 best = DP[t-1][k] + cost[k][t];
                 arg = (int)k;
             }
@@ -302,7 +339,7 @@ int main(int argc, char** argv) {
     }
     cout << "Best final state: k=" << bestk << ", c=" << series[bestk].c << ", cost=" << best << "\n";
 
-    // Backtrack path of chosen indices
+    // Backtrack
     vector<int> choice(T, -1);
     int cur = bestk;
     for (int t = static_cast<int>(last); t >= 0; --t) {
@@ -312,7 +349,7 @@ int main(int argc, char** argv) {
 
     // Print results
     cout.setf(std::ios::fixed); cout << setprecision(6);
-    static constexpr double BLK_TO_TB = 4096.0 / (1024.0*1024*1024*1024);
+    static constexpr double BLK_TO_TB = 4096.0 / 1e12; // TB (10^12)
     double total_cost_tb = best * BLK_TO_TB;
     cout << "Steps(T): " << T << ", Ratios(K): " << K << ", MinTotalCost(blocks): " << best
          << ", TotalCost(TB): " << total_cost_tb << "\n";
@@ -325,7 +362,6 @@ int main(int argc, char** argv) {
     double total_compaction = 0.0;
     double total_eviction = 0.0;
     double total_host = 0.0;
-    static constexpr double HOST_BLOCKS_PER_STEP = 10.0 * 1024 * 1024 * 1024 / 4096;
     for (size_t t = 0; t < T; ++t) {
         int k = choice[t];
         double pen = 0.0;
@@ -340,9 +376,9 @@ int main(int argc, char** argv) {
         if (t > 0) {
             double diff = series[k].c - series[choice[t-1]].c;
             if (diff > 0) {
-                total_compaction += pen; // increase → compaction overhead
+                total_compaction += pen;
             } else if (diff < 0) {
-                total_eviction += pen / QLC_FACTOR; // decrease → evict blocks (pen already has QLC_FACTOR)
+                total_eviction += pen / QLC_FACTOR;
             }
         }
 

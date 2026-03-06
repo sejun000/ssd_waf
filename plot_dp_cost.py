@@ -3,10 +3,10 @@ import re
 import matplotlib.pyplot as plt
 
 # ── Configurable: skip first N TB of write_size_to_cache as warmup ──
-WARMUP_TB = 4  # diff baseline: values at write_size_to_cache >= WARMUP_TB
+WARMUP_TB = 6  # diff baseline: values at write_size_to_cache >= WARMUP_TB
 WARMUP_BYTES = WARMUP_TB * (1024**4)
 
-BLK_TO_TB = 4096 / (1024**4)
+BLK_TO_TB = 4096 / 1e12
 
 def parse_dp_files(directory, min_dp=0.55):
     dp_files = glob.glob(f"{directory}/dp.*")

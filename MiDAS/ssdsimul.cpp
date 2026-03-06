@@ -41,6 +41,7 @@ struct SSD *ssd;
 struct STATS *stats;
 std::atomic<unsigned long long> compacted_blocks_global{0};
 std::atomic<unsigned long long> valid_pages_global{0};
+std::vector<int> gc_compacted_lbas;
 
 char *workload;
 char *c_workload;
@@ -181,6 +182,7 @@ void initialize_segment(struct SSD *ssd, int victim_idx, int victim_seg, int vic
 	for (int i = 0; i < ssd_spec->PPS; i++) { //erase segment
 		ssd->itable[victim_idx+i] = 0; //invalid T/F clear
 		ssd->oob[victim_idx+i].lba = -1; //oob clear
+		ssd->page_stamp[victim_idx+i] = 0; //page timestamp clear
 	}
 	ssd->irtable[victim_seg] = 0; //invalid page counter clear
 	ssd->gnum_info[victim_seg] = ssd_spec->MAXGNUM - 1; //group number clear, not used
@@ -243,12 +245,14 @@ int do_gc(struct SSD *ssd, struct STATS *stats, class GROUP *group[], int gc_gro
 		if(ssd->itable[victim_idx+i] == false && ssd->oob[victim_idx+i].lba != -1){ //if the page in the victim segment is valid,
 			local_copy += 1;
 			copy_lba = ssd->oob[victim_idx+i].lba; //get lba of valid page
+			gc_compacted_lbas.push_back(copy_lba);
 			if (victim_gnum == 0 || victim_gnum == 1) {
 				hf_generate (ssd, copy_lba, victim_seg, group, hf_gen, 0);
 			}
 			new_ppa = now_active*ssd_spec->PPS + ssd->active[target_group][1]; //assign new ppa for valid page
 			ssd->mtable[copy_lba] = new_ppa; //update mapping entry for valid page
-			ssd->oob[new_ppa].lba = copy_lba; //record lba in the oob space 
+			ssd->oob[new_ppa].lba = copy_lba; //record lba in the oob space
+			ssd->page_stamp[new_ppa] = ssd->page_stamp[victim_idx+i]; //preserve original write timestamp
 			//setting segment age when the first page is written
 			ssd->active[target_group][1] += 1; //update appending point of target group
 		}
@@ -366,6 +370,7 @@ int write(int lba, struct SSD *ssd, struct STATS *stats, class GROUP *group[], b
 	ssd->mtable[lba] = new_ppa; //update mapping table of lba
 	ssd->oob[new_ppa].lba = lba; //record lba and group number in oob space of this page
 	ssd->oob[new_ppa].gnum = user_group;
+	ssd->page_stamp[new_ppa] = stats->cur_wp; //record write timestamp
 	ssd->active[user_group][1] ++; //increase appending point of active block
 
 	//handling modeling functions

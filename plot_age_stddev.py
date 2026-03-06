@@ -28,7 +28,7 @@ rewritten_stat_files = {
 
 colors = {'Greedy': '#FFB07C', 'SepBIT': '#87CEAB', 'MiDAS': '#C4A8D8', 'REFlash-CB': 'tab:blue', 'REFlash': 'tab:red'}
 rewritten_colors = {'Greedy': '#FFB07C', 'REFlash-CB': 'tab:blue', 'REFlash': 'tab:red'}
-BLK_TO_TB = 4096.0 / (1024**4)
+BLK_TO_TB = 4096.0 / (1000**4)
 
 gc_writes_blks = {
     'Greedy': 2386322142,
@@ -64,7 +64,7 @@ plt.rcParams.update({'font.size': 20})
 labels_order = ['Greedy', 'SepBIT', 'MiDAS', 'REFlash-CB', 'REFlash']
 rewritten_order = list(rewritten_stat_files.keys())
 
-fig, (ax_inv, ax_hist, ax_bar) = plt.subplots(1, 3, figsize=(21, 6),
+fig, (ax_inv, ax_hist, ax_bar) = plt.subplots(1, 3, figsize=(21, 5),
                                                gridspec_kw={'width_ratios': [2, 2, 1.5]})
 
 # --- Left: Remaining Lifetime Stddev CDF ---
@@ -101,7 +101,7 @@ for label in rewritten_order:
     ax_hist.plot(x_tb, fracs, color=rewritten_colors[label], linewidth=2.5, label=label)
 
 ax_hist.set_xlim(0, max_bucket * tb_per_bucket)
-ax_hist.set_xlabel('Compacted Block Lifetime (TB)')
+ax_hist.set_xlabel('GC-Rewritten Block Lifetime (TB)')
 ax_hist.set_ylabel('Fraction')
 ax_hist.legend(fontsize=16)
 ax_hist.grid(True, alpha=0.3)
@@ -123,9 +123,9 @@ ax_bar.grid(True, axis='y', alpha=0.3)
 plt.tight_layout()
 
 for ax, subtitle in [(ax_inv, '(a) Remaining lifetime stddev per segment'),
-                      (ax_hist, '(b) GC-Rewritten lifetime'),
+                      (ax_hist, '(b) GC-rewritten block lifetime distribution'),
                       (ax_bar, '(c) GC writes')]:
-    ax.text(0.5, -0.22, subtitle, transform=ax.transAxes,
+    ax.text(0.5, -0.35, subtitle, transform=ax.transAxes,
             ha='center', va='top', fontsize=20)
 
 plt.savefig('A_age_stddev_cdf.pdf', dpi=150, bbox_inches='tight')

@@ -99,6 +99,7 @@ int do_gc_for_split(struct SSD *ssd, struct STATS *stats, class GROUP *group[], 
         if(ssd->itable[victim_idx+i] == false && ssd->oob[victim_idx+i].lba != -1){ //if the page in the victim segment is valid,
             local_copy += 1;
             copy_lba = ssd->oob[victim_idx+i].lba; //get lba of valid page
+            gc_compacted_lbas.push_back(copy_lba);
             if (victim_gnum == 0 || victim_gnum == 1) {
                 hf_generate (ssd, copy_lba, victim_seg, group, hf_gen, 0);
             }
@@ -116,6 +117,7 @@ int do_gc_for_split(struct SSD *ssd, struct STATS *stats, class GROUP *group[], 
     update_gc_results(ssd, stats, local_copy, victim_gnum, victim_seg);
     //update GC information
     stat_update(stats, local_copy, 1);
+    compacted_blocks_global.fetch_add(static_cast<unsigned long long>(local_copy), std::memory_order_relaxed);
 
     //initialize segment information
     initialize_segment(ssd, victim_idx, victim_seg, victim_gnum);
@@ -291,6 +293,7 @@ int mida_off(struct SSD *ssd, struct STATS *stats, class GROUP *group[]){
 //Active Segment Merge (by Group merge)
 int active_merge(struct SSD *ssd, struct STATS *stats, class GROUP *group[], int target_g, int victim_g){
     int copy_lba, new_ppa;
+    int local_copy = 0;
     int fill_idx = -1;
     int old_active = ssd->active[victim_g][0];
     if (old_active == -1) {
@@ -317,14 +320,16 @@ int active_merge(struct SSD *ssd, struct STATS *stats, class GROUP *group[], int
         }
 
         if(ssd->itable[victim_idx+i] == false){ //if the page in the victim segment is valid,
-            //stats->tmp_copy += 1; //increase copy counter
+            local_copy += 1;
             copy_lba = ssd->oob[victim_idx+i].lba; //get lba of valid page
+            gc_compacted_lbas.push_back(copy_lba);
             new_ppa = now_active*ssd_spec->PPS + ssd->active[target_g][1]; //assign new ppa for valid page
             ssd->mtable[copy_lba] = new_ppa; //update mapping entry for valid page
             ssd->oob[new_ppa].lba = copy_lba; //record lba in the oob space
             ssd->active[target_g][1] += 1; //update appending point of target group
         }
     }
+    compacted_blocks_global.fetch_add(static_cast<unsigned long long>(local_copy), std::memory_order_relaxed);
     for (int i = 0; i < ssd_spec->PPS; i++) { //erase segment
         ssd->itable[victim_idx+i] = 0; //invalid T/F clear
         ssd->oob[victim_idx+i].lba = -1; //oob clear

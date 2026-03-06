@@ -3,10 +3,10 @@ import re
 import matplotlib.pyplot as plt
 
 # ── Configurable: skip first N TB of write_size_to_cache as warmup ──
-WARMUP_TB = 4  # diff baseline: values at write_size_to_cache >= WARMUP_TB
+WARMUP_TB = 6  # diff baseline: values at write_size_to_cache >= WARMUP_TB
 WARMUP_BYTES = WARMUP_TB * (1024**4)
 
-dp_files = glob.glob("/home/sejun000/ssd_waf/greedy_11_dwpd2/dp.*")
+dp_files = glob.glob("/home/sejun000/ssd_waf/greedy_11_dwpd1/dp.*")
 
 data = []
 for f in dp_files:
@@ -44,7 +44,7 @@ for f in dp_files:
 
 data.sort(key=lambda x: x[0])
 dp_nums = [d[0] for d in data]
-BLK_TO_TB = 4096 / (1024**4)
+BLK_TO_TB = 4096 / (1000**4)
 compacted_tb = [d[1] * BLK_TO_TB for d in data]
 evicted_tb = [d[2] * BLK_TO_TB for d in data]
 

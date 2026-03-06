@@ -29,7 +29,10 @@ LogCache::LogCache(uint64_t              cold_capacity,
              std::unique_ptr<EvictPolicy> cp,
              double input_additional_free_blks_ratio_by_gc,
              bool input_ghost_cache,
-             std::string stat_log_file
+             std::string stat_log_file,
+             double valid_rate_period_gb,
+             double valid_rate_min,
+             double valid_rate_max
              )
     : ICache(cold_capacity, waf_log_file, stat_log_file),
       cache_block_size(blk_sz),
@@ -46,6 +49,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
       evicted_ages_with_segment_histogram(std::make_unique<Histogram>("evicted_ages_with_segment", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
       compacted_ages_with_segment_histogram(std::make_unique<Histogram>("compacted_ages_with_segment", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
       evicted_cache_blocks_per_evict(std::make_unique<Histogram>("evicted_cache_blocks_per_evict", 1, 100, fp_stats)),
+      compacted_lifetime_histogram_(std::make_unique<Histogram>("compacted_lifetime", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
       is_ghost_cache(input_ghost_cache),
       compaction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
@@ -73,6 +77,15 @@ LogCache::LogCache(uint64_t              cold_capacity,
     stream_policy = input_stream_policy;
     global_valid_blocks = 0;
 
+    /* ── Periodic valid rate sweep init ─────────────────── */
+    valid_rate_period_gb_ = valid_rate_period_gb;
+    valid_rate_min_ = valid_rate_min;
+    valid_rate_max_ = valid_rate_max;
+    if (valid_rate_period_gb_ > 0.0) {
+        valid_rate_period_blocks_ = static_cast<uint64_t>(valid_rate_period_gb_ * 1e9 / blk_sz);
+        next_valid_rate_change_ts_ = valid_rate_period_blocks_;
+    }
+
     // score_warm_first / score_cold_first 가 heap add 시점에
     // g_threshold=0 fallback(-create_timestamp) 으로 음수 cached score 를 갖지 않도록 초기화
     g_threshold = cache_block_count * 2;
@@ -96,11 +109,11 @@ LogCache::LogCache(uint64_t              cold_capacity,
 
 LogCache::~LogCache()
 {
-    print_survival_results();
     print_lifetime_results();
     print_rewrite_results();
     print_utilization_distribution();
     print_segment_age_scatter();
+    print_inv_time_scatter();
     if (trace_fp_)      std::fclose(trace_fp_);
     if (cold_trace_fp_) std::fclose(cold_trace_fp_);
 }
@@ -121,12 +134,19 @@ void LogCache::invalidate(long key, int lba_sz) {
         if (loc.seg->blocks[loc.idx].valid)
         {
             print_objects("invalidate", log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp);
-            record_survival_death(key, /*is_host_invalidate=*/true);
             record_lifetime(log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp, true);
+            {
+                auto cit = compacted_at_.find(key);
+                if (cit != compacted_at_.end()) {
+                    compacted_lifetime_histogram_->inc(log_cache_timestamp - cit->second);
+                    compacted_at_.erase(cit);
+                }
+            }
             invalidate_blocks += 1;
             loc.seg->blocks[loc.idx].valid = false;
             --loc.seg->valid_cnt;
             global_valid_blocks -= 1;
+            record_inv_time(key);
             if (loc.seg->full()){
                 evict_policy_update(loc.seg);
             }
@@ -180,16 +200,28 @@ void LogCache::periodic() {
         }
         if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
             if (compaction_ratio.has_value() &&
-                eviction_ratio.has_value() && 
+                eviction_ratio.has_value() &&
                 eviction_ratio_in_ghost_cache.has_value()){
                 if (2.88 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
-                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.1);  
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.1);
                 }
                 else {
                     target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - 0.1);
                 }
             }
         }
+    }
+
+    /* ── Periodic valid rate sweep ─────────────────────── */
+    if (valid_rate_period_blocks_ > 0 &&
+        log_cache_timestamp >= next_valid_rate_change_ts_) {
+        std::uniform_real_distribution<double> dist(valid_rate_min_, valid_rate_max_);
+        double old_rate = target_valid_blk_rate;
+        target_valid_blk_rate = dist(valid_rate_rng_);
+        next_valid_rate_change_ts_ += valid_rate_period_blocks_;
+        printf("periodic_valid_rate: ts=%lu old=%.4f new=%.4f next_change=%lu\n",
+               log_cache_timestamp, old_rate, target_valid_blk_rate,
+               next_valid_rate_change_ts_);
     }
 }
 /*
@@ -318,6 +350,9 @@ void LogCache::batch_insert(int stream_id,
             stream_policy->Append(key, log_cache_timestamp, reinterpret_cast<void*>(seg->valid_cnt));
         }
         write_size_to_cache += lba_sz;
+        if (!inv_snapshot_taken_ && write_size_to_cache >= INV_SNAPSHOT_THRESHOLD) {
+            take_inv_snapshot();
+        }
 
         /* proactive GC: 1 segment per batch, like async impl */
         if (log_cache_timestamp % (segment_size_blocks / 2) == 0 && free_pool.size() <= 10) {
@@ -458,13 +493,6 @@ void LogCache::check_and_evict_if_needed(int max_victims)
         printf("[Lifetime] tracking activated at timestamp %lu\n", log_cache_timestamp);
     }
 
-    /* take survival snapshot at 2 TB written to cache */
-    static constexpr uint64_t SNAPSHOT_BYTES = 2ULL * 1024 * 1024 * 1024 * 1024;
-    if (!survival_snapshot_taken_ &&
-        static_cast<uint64_t>(write_size_to_cache) >= SNAPSHOT_BYTES) {
-        take_survival_snapshot();
-    }
-
     LogCacheSegment* last_target_seg = nullptr;
     //bool first_compact = true;
     std::list<Segment *> segment_list;
@@ -474,7 +502,7 @@ void LogCache::check_and_evict_if_needed(int max_victims)
     g_threshold = threshold + cfg_.segment_bytes / cache_block_size;
    // printf("%d\n", low_water);
     int processed = 0;
-    while (free_pool.size() <= 2 ||
+    while (free_pool.size() <= 3 ||
            (max_victims > 0 && processed < max_victims && free_pool.size() <= 10))
     {
         /* eviction 후보 수집 */
@@ -652,6 +680,13 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
             print_objects("evict", log_cache_timestamp - blk.create_timestamp);
             evicted_blocks += cfg_.evicted_blk_size;
             evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
+            {
+                auto cit = compacted_at_.find(blk.key);
+                if (cit != compacted_at_.end()) {
+                    compacted_lifetime_histogram_->inc(log_cache_timestamp - cit->second);
+                    compacted_at_.erase(cit);
+                }
+            }
             evicted_timestamp[blk.key] = log_cache_timestamp;
             evicted_blocks_for_victim += 1;
             // map erase and blk valid false is done in this function
@@ -684,6 +719,13 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
         ++target_seg->valid_cnt;
         ++compacted_blocks;
         compacted_blocks_for_victim += 1;
+        {
+            auto cit = compacted_at_.find(blk.key);
+            if (cit != compacted_at_.end()) {
+                compacted_lifetime_histogram_->inc(log_cache_timestamp - cit->second);
+            }
+            compacted_at_[blk.key] = log_cache_timestamp;
+        }
 
         blk.valid = false;
     }
@@ -719,11 +761,18 @@ void LogCache::evict_segment(LogCacheSegment* s)
         }
         print_objects("evict", log_cache_timestamp - blk.create_timestamp);
         evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
+        {
+            auto cit = compacted_at_.find(blk.key);
+            if (cit != compacted_at_.end()) {
+                compacted_lifetime_histogram_->inc(log_cache_timestamp - cit->second);
+                compacted_at_.erase(cit);
+            }
+        }
         evicted_blocks += cfg_.evicted_blk_size;
         evicted_blocks_for_victim += 1;
         evicted_timestamp[blk.key] = log_cache_timestamp;
 
-        // map erase and blk valid false is done in this function    
+        // map erase and blk valid false is done in this function
         evict(blk);
         
     }
@@ -752,8 +801,8 @@ void LogCache::evict(LogCacheSegment::Block &blk) {
         auto it = mapping.find(index_64k);
 
         if (it != mapping.end()) {
-            record_survival_death(index_64k, /*is_host_invalidate=*/false);
             record_lifetime(log_cache_timestamp - it->second.seg->blocks[it->second.idx].create_timestamp, false);
+            record_inv_time(index_64k);
             auto &other_blk = it->second.seg->blocks[it->second.idx];
             other_blk.valid = false;
             mapping.erase(index_64k);
@@ -766,7 +815,7 @@ void LogCache::evict(LogCacheSegment::Block &blk) {
     }
     evicted_cache_blocks_per_evict->inc(evicted_blocks_per_evict);
     _evict_one_block(start_index_64k  * cache_block_size /* 64k aligend */, cache_block_size * EVICTED_BLOCK_SIZE /* 64k */, OP_TYPE::WRITE);
-    record_survival_death(blk.key, /*is_host_invalidate=*/false);
+    record_inv_time(blk.key);
     record_lifetime(log_cache_timestamp - blk.create_timestamp, false);
     mapping.erase(blk.key);
     blk.valid = false;
@@ -775,100 +824,6 @@ void LogCache::evict(LogCacheSegment::Block &blk) {
 
 void LogCache::print_objects(std::string prefix, uint64_t value) {
     //fprintf(fp_object, "%s: %lu\n", prefix.c_str(), value);
-}
-
-/* ── Survival analysis ─────────────────────────────────── */
-
-void LogCache::take_survival_snapshot()
-{
-    survival_snapshot_taken_ = true;
-    survival_snapshot_ts_    = log_cache_timestamp;
-
-    uint64_t max_age = 0;
-    for (auto& seg_ptr : all_segments) {
-        LogCacheSegment* seg = seg_ptr.get();
-        for (std::size_t i = 0; i < seg->write_ptr; ++i) {
-            auto& blk = seg->blocks[i];
-            if (!blk.valid) continue;
-            uint64_t age = log_cache_timestamp - blk.create_timestamp;
-            survival_tracker_[blk.key] = { age };
-            if (age > max_age) max_age = age;
-        }
-    }
-
-    survival_bucket_width_ = (max_age / SURVIVAL_BUCKETS) + 1;
-    survival_results_.resize(SURVIVAL_BUCKETS + 1);
-
-    printf("[Survival] snapshot taken: %zu blocks, max_age=%lu, bucket_width=%lu\n",
-           survival_tracker_.size(), max_age, survival_bucket_width_);
-}
-
-void LogCache::record_survival_death(long key, bool is_host_invalidate)
-{
-    if (!survival_snapshot_taken_) return;
-    auto it = survival_tracker_.find(key);
-    if (it == survival_tracker_.end()) return;
-
-    uint64_t ttd    = log_cache_timestamp - survival_snapshot_ts_;
-    uint64_t bucket = it->second.age_at_snapshot / survival_bucket_width_;
-    if (bucket >= survival_results_.size())
-        bucket = survival_results_.size() - 1;
-
-    auto& r = survival_results_[bucket];
-    if (is_host_invalidate) {
-        r.sum_ttd_invalidate += ttd;
-        r.count_invalidate++;
-    } else {
-        r.sum_ttd_evict += ttd;
-        r.count_evict++;
-    }
-    survival_tracker_.erase(it);
-}
-
-void LogCache::print_survival_results()
-{
-    if (!survival_snapshot_taken_) return;
-
-    FILE* f = fopen("survival_analysis.csv", "w");
-    if (!f) return;
-
-    fprintf(f, "age_bucket_start,age_bucket_end,"
-               "avg_ttd_invalidate,count_invalidate,"
-               "avg_ttd_evict,count_evict,"
-               "avg_ttd_all,count_all,still_alive\n");
-
-    /* count still-alive blocks per bucket */
-    std::vector<uint64_t> alive(survival_results_.size(), 0);
-    for (auto& [key, entry] : survival_tracker_) {
-        uint64_t b = entry.age_at_snapshot / survival_bucket_width_;
-        if (b >= alive.size()) b = alive.size() - 1;
-        alive[b]++;
-    }
-
-    for (std::size_t i = 0; i < survival_results_.size(); ++i) {
-        auto& r = survival_results_[i];
-        uint64_t start = i * survival_bucket_width_;
-        uint64_t end   = start + survival_bucket_width_;
-
-        double avg_inv = r.count_invalidate > 0
-            ? (double)r.sum_ttd_invalidate / r.count_invalidate : 0;
-        double avg_ev  = r.count_evict > 0
-            ? (double)r.sum_ttd_evict / r.count_evict : 0;
-
-        uint64_t total_count = r.count_invalidate + r.count_evict;
-        double   avg_all     = total_count > 0
-            ? (double)(r.sum_ttd_invalidate + r.sum_ttd_evict) / total_count : 0;
-
-        if (total_count == 0 && alive[i] == 0) continue;   /* skip empty */
-
-        fprintf(f, "%lu,%lu,%.2f,%lu,%.2f,%lu,%.2f,%lu,%lu\n",
-                start, end, avg_inv, r.count_invalidate,
-                avg_ev, r.count_evict,
-                avg_all, total_count, alive[i]);
-    }
-    fclose(f);
-    printf("[Survival] results written to survival_analysis.csv "
-           "(%zu blocks still alive)\n", survival_tracker_.size());
 }
 
 /* ── Lifetime histogram (entire trace) ─────────────────── */
@@ -970,16 +925,23 @@ void LogCache::print_utilization_distribution()
         return;
     }
 
-    // generate timestamped filename
-    char ts[64];
-    {
-        time_t now = time(nullptr);
-        struct tm tm;
-        localtime_r(&now, &tm);
-        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
-    }
+    // generate timestamped filename (use start timestamp + policy prefix)
     char fname[256];
-    snprintf(fname, sizeof(fname), "utilization_distribution.%s.csv", ts);
+    {
+        const std::string& sts = start_ts();
+        const std::string& pfx = stats_prefix();
+        if (sts.empty()) {
+            char ts_buf[64];
+            time_t now = time(nullptr); struct tm tm;
+            localtime_r(&now, &tm);
+            strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm);
+            snprintf(fname, sizeof(fname), "utilization_distribution.%s.csv", ts_buf);
+        } else if (pfx.empty()) {
+            snprintf(fname, sizeof(fname), "utilization_distribution.%s.csv", sts.c_str());
+        } else {
+            snprintf(fname, sizeof(fname), "%s.utilization_distribution.%s.csv", pfx.c_str(), sts.c_str());
+        }
+    }
 
     FILE* f = fopen(fname, "w");
     if (!f) return;
@@ -997,15 +959,21 @@ void LogCache::print_utilization_distribution()
 
 void LogCache::print_segment_age_scatter()
 {
-    char ts[64];
-    {
+    const std::string& ts = start_ts();
+    const std::string& prefix = stats_prefix();
+    char fname[256];
+    if (ts.empty()) {
         time_t now = time(nullptr);
         struct tm tm;
         localtime_r(&now, &tm);
-        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm);
+        char ts_buf[64];
+        strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm);
+        snprintf(fname, sizeof(fname), "segment_age_scatter.%s.csv", ts_buf);
+    } else if (prefix.empty()) {
+        snprintf(fname, sizeof(fname), "segment_age_scatter.%s.csv", ts.c_str());
+    } else {
+        snprintf(fname, sizeof(fname), "%s.segment_age_scatter.%s.csv", prefix.c_str(), ts.c_str());
     }
-    char fname[256];
-    snprintf(fname, sizeof(fname), "segment_age_scatter.%s.csv", ts);
 
     FILE* f = fopen(fname, "w");
     if (!f) return;
@@ -1061,4 +1029,121 @@ void LogCache::print_stats() {
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }
+}
+
+void LogCache::take_inv_snapshot()
+{
+    inv_snapshot_taken_ = true;
+    inv_snapshot_ts_ = log_cache_timestamp;
+
+    size_t seg_idx = 0;
+    for (auto& seg_ptr : all_segments) {
+        LogCacheSegment* seg = seg_ptr.get();
+        if (seg->write_ptr == 0) continue;
+        if (seg->valid_cnt == 0) continue;
+
+        uint64_t seg_age = log_cache_timestamp - seg->create_timestamp;
+        double util = (double)seg->valid_cnt / seg->blocks.size();
+
+        double sum = 0.0, sum_sq = 0.0;
+        uint64_t n = 0;
+        for (size_t i = 0; i < seg->write_ptr; i++) {
+            if (!seg->blocks[i].valid) continue;
+            double age = (double)(log_cache_timestamp - seg->blocks[i].create_timestamp);
+            sum += age;
+            sum_sq += age * age;
+            n++;
+        }
+        double mean = 0.0, stddev = 0.0;
+        if (n > 0) {
+            mean = sum / n;
+            if (n > 1) {
+                double var = (sum_sq - sum * sum / n) / (n - 1);
+                stddev = (var > 0.0) ? std::sqrt(var) : 0.0;
+            }
+        }
+
+        inv_snap_segs_.push_back({seg_age, util, n, mean, stddev, seg->get_class_num()});
+        inv_snap_inv_times_.push_back({});
+
+        for (size_t i = 0; i < seg->write_ptr; i++) {
+            if (!seg->blocks[i].valid) continue;
+            inv_snap_block_seg_idx_[seg->blocks[i].key] = seg_idx;
+        }
+        seg_idx++;
+    }
+
+    printf("[InvSnapshot] taken at ts=%lu, write=%.1f TB, %zu segments, %zu blocks tracked\n",
+           log_cache_timestamp, (double)write_size_to_cache / (1024.0*1024*1024*1024),
+           inv_snap_segs_.size(), inv_snap_block_seg_idx_.size());
+}
+
+void LogCache::record_inv_time(long key)
+{
+    if (!inv_snapshot_taken_) return;
+    auto it = inv_snap_block_seg_idx_.find(key);
+    if (it != inv_snap_block_seg_idx_.end()) {
+        uint64_t inv_time = log_cache_timestamp - inv_snapshot_ts_;
+        inv_snap_inv_times_[it->second].push_back(inv_time);
+        inv_snap_block_seg_idx_.erase(it);
+    }
+}
+
+void LogCache::print_inv_time_scatter()
+{
+    if (!inv_snapshot_taken_ || inv_snap_segs_.empty()) return;
+
+    char fname[256];
+    const std::string& ts = start_ts();
+    const std::string& prefix = stats_prefix();
+    if (ts.empty()) {
+        char ts_buf[64];
+        time_t now = time(nullptr); struct tm tm;
+        localtime_r(&now, &tm);
+        strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm);
+        snprintf(fname, sizeof(fname), "inv_time_scatter.%s.csv", ts_buf);
+    } else if (prefix.empty()) {
+        snprintf(fname, sizeof(fname), "inv_time_scatter.%s.csv", ts.c_str());
+    } else {
+        snprintf(fname, sizeof(fname), "%s.inv_time_scatter.%s.csv", prefix.c_str(), ts.c_str());
+    }
+
+    FILE* f = fopen(fname, "w");
+    if (!f) return;
+
+    fprintf(f, "seg_age,utilization,valid_count,age_mean,age_stddev,"
+               "inv_time_mean,inv_time_stddev,inv_count,survived_count,class_num\n");
+
+    uint64_t total_survived = 0;
+    for (size_t i = 0; i < inv_snap_segs_.size(); i++) {
+        auto& info = inv_snap_segs_[i];
+        auto& times = inv_snap_inv_times_[i];
+
+        uint64_t survived = info.valid_count - times.size();
+        total_survived += survived;
+
+        double inv_mean = 0.0, inv_stddev = 0.0;
+        uint64_t n = times.size();
+        if (n > 0) {
+            double sum = 0.0, sum_sq = 0.0;
+            for (auto t : times) {
+                sum += (double)t;
+                sum_sq += (double)t * t;
+            }
+            inv_mean = sum / n;
+            if (n > 1) {
+                double var = (sum_sq - sum * sum / n) / (n - 1);
+                inv_stddev = (var > 0.0) ? std::sqrt(var) : 0.0;
+            }
+        }
+
+        fprintf(f, "%lu,%.6f,%lu,%.1f,%.1f,%.1f,%.1f,%lu,%lu,%d\n",
+                info.seg_age, info.utilization, info.valid_count,
+                info.age_mean, info.age_stddev,
+                inv_mean, inv_stddev, n, survived, info.class_num);
+    }
+
+    fclose(f);
+    printf("[InvTimeScatter] written to %s (%zu segments, %lu blocks survived)\n",
+           fname, inv_snap_segs_.size(), total_survived);
 }

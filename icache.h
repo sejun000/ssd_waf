@@ -58,6 +58,9 @@ public:
     std::tuple<long long, long long, long long> get_status();
     void set_stats_prefix(const std::string& prefix);
     const std::string& stats_prefix() const;
+    void set_start_ts(const std::string& ts) { start_ts_ = ts; }
+    const std::string& start_ts() const { return start_ts_; }
+    void rename_stat_log(const std::string& new_name);
     PageMappingFTL ftl;
     long long write_size_to_cache;
     long long evicted_blocks;
@@ -68,6 +71,7 @@ public:
     FILE *fp_object = nullptr;
 protected:
     std::string stats_prefix_;
+    std::string start_ts_;
 };
 
 ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "");
