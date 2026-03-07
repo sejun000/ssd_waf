@@ -3,55 +3,38 @@
 
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+
+plt.rcParams.update({'font.size': 24})
 
 df = pd.read_csv("periodic_vs_dp_cumulative.csv")
+ws_gb = df['ws_tb'] * 1000
 
-fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+fig, axes = plt.subplots(1, 2, figsize=(20, 7), sharey=False)
 
-# ── 1. GC (compacted) ──────────────────────────────────────
+# ── 1. Buffer-tier writes (GC + Host) ──────────────────────
 ax = axes[0]
-ax.plot(df['ws_tb'], df['p_gc_gb'],  linewidth=1.5, label='Periodic (actual)')
-ax.plot(df['ws_tb'], df['dp_gc_gb'], linewidth=1.5, label='DP predicted', linestyle='--')
-ax.fill_between(df['ws_tb'], df['dp_gc_gb'], df['p_gc_gb'], alpha=0.15, color='C0')
-ax.set_ylabel('Cumulative GC writes (GB)')
-ax.legend(loc='upper left')
-ax.set_title('Periodic vs DP-predicted cumulative writes')
-ax.grid(True, alpha=0.3)
-
-# ── 2. Flush (evicted) ─────────────────────────────────────
-ax = axes[1]
-ax.plot(df['ws_tb'], df['p_flush_gb'],  linewidth=1.5, label='Periodic (actual)')
-ax.plot(df['ws_tb'], df['dp_flush_gb'], linewidth=1.5, label='DP predicted', linestyle='--')
-ax.fill_between(df['ws_tb'], df['dp_flush_gb'], df['p_flush_gb'], alpha=0.15, color='C1')
-ax.set_ylabel('Cumulative Flush writes (GB)')
-ax.legend(loc='upper left')
-ax.grid(True, alpha=0.3)
-
-# ── 3. Total + diff% on twin axis ──────────────────────────
-ax = axes[2]
-p_tot = df['p_total_gb']
-d_tot = df['dp_total_gb']
-ax.plot(df['ws_tb'], p_tot, linewidth=1.5, label='Periodic (actual)')
-ax.plot(df['ws_tb'], d_tot, linewidth=1.5, label='DP predicted', linestyle='--')
-ax.fill_between(df['ws_tb'], d_tot, p_tot, alpha=0.15, color='C2')
-ax.set_ylabel('Cumulative Total writes (GB)')
+p_slc = df['p_gc_gb'] + ws_gb
+d_slc = df['dp_gc_gb'] + ws_gb
+ax.plot(df['ws_tb'], p_slc,  linewidth=2, label='Single experiment')
+ax.plot(df['ws_tb'], d_slc, linewidth=2, label='Predicted (fixed-BUtil sweep)', linestyle='--')
+ax.set_ylabel('Buffer-tier writes (GB)')
 ax.set_xlabel('Host writes to cache (TB)')
-ax.legend(loc='upper left')
 ax.grid(True, alpha=0.3)
 
-# diff % on twin y-axis
-ax2 = ax.twinx()
-mask = d_tot > 1  # avoid div-by-zero early on
-diff_pct = ((p_tot - d_tot) / d_tot * 100).where(mask)
-ax2.plot(df['ws_tb'], diff_pct, color='red', linewidth=1.0, alpha=0.6, label='diff %')
-ax2.set_ylabel('Periodic − DP (%)', color='red')
-ax2.tick_params(axis='y', labelcolor='red')
-ax2.set_ylim(-10, 30)
-ax2.axhline(0, color='red', linewidth=0.5, linestyle=':')
-ax2.legend(loc='upper right')
+# ── 2. Flush-tier writes (evicted) ─────────────────────────
+ax = axes[1]
+ax.plot(df['ws_tb'], df['p_flush_gb'],  linewidth=2, label='Single experiment')
+ax.plot(df['ws_tb'], df['dp_flush_gb'], linewidth=2, label='Predicted (fixed-BUtil sweep)', linestyle='--')
+ax.set_ylabel('Flush-tier writes (GB)')
+ax.set_xlabel('Host writes to cache (TB)')
+ax.grid(True, alpha=0.3)
 
-plt.tight_layout()
+# ── Shared legend at top center, no border ──────────────────
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc='upper center', ncol=2,
+           frameon=False, fontsize=24, bbox_to_anchor=(0.5, 1.02))
+
+plt.tight_layout(rect=[0, 0, 1, 0.93])
 plt.savefig('periodic_vs_dp_plot.pdf', bbox_inches='tight')
 plt.savefig('periodic_vs_dp_plot.png', dpi=150, bbox_inches='tight')
 print("Saved: periodic_vs_dp_plot.pdf, periodic_vs_dp_plot.png")

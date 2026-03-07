@@ -574,7 +574,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
             nullptr, input_stream_policy, 0.70, std::make_unique<CbEvictPolicy>(score_warm_first), 0, false, stat_log_file,
             600.0,   // period 600GB
-            0.20,    // min
+            0.60,    // min
             0.88),   // max
             cache_type, start_ts, !stat_log_file.empty());
     }

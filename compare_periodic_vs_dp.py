@@ -15,7 +15,7 @@ import numpy as np
 from collections import defaultdict
 
 # ── Config ──────────────────────────────────────────────────
-PERIODIC_LOG = "LOG_GREEDY_COST_BENEFIT_PERIODIC.stat.log.20260306_075203"
+PERIODIC_LOG = "LOG_GREEDY_COST_BENEFIT_PERIODIC.stat.log.20260306_091159"
 DP_DIR       = "cb_11_dwpd1"
 WINDOW_GB    = 240.0
 BLK_SZ       = 4096
@@ -74,32 +74,19 @@ def parse_stat_log_min(path):
             np.array(eb, dtype=np.float64))
 
 
-# ── Compute 240GB-window smoothed rate for a DP file ───────
-def compute_dp_rates(ws, cb, eb, window_bytes):
+# ── Compute 240GB-smoothed rate for a DP file ───────────────
+def compute_dp_rates(ws, cb, eb, window_bytes=None):
     """
-    For each index i, compute:
-      rate_gc  = (cb[i] - cb[j]) / (ws[i] - ws[j]) * BLK_SZ
-      rate_fl  = (eb[i] - eb[j]) / (ws[i] - ws[j]) * BLK_SZ
-    where j is the index closest to ws[i] - window_bytes.
-    Rate = blocks per block written.
+    240GB window = ~24 steps of 10GB.
+    Smoothed per-step delta = (cb[i] - cb[i-24]) / 24
     """
     n = len(ws)
     r_gc = np.full(n, np.nan)
     r_fl = np.full(n, np.nan)
-    j = 0
-    for i in range(n):
-        target = ws[i] - window_bytes
-        if target <= 0:
-            continue
-        while j < n - 1 and ws[j + 1] <= target:
-            j += 1
-        jj = j + 1 if (j + 1 < n and abs(ws[j+1] - target) < abs(ws[j] - target)) else j
-        dw = ws[i] - ws[jj]
-        if dw <= 0:
-            continue
-        dw_blks = dw / BLK_SZ
-        r_gc[i] = (cb[i] - cb[jj]) / dw_blks  # blocks per block written
-        r_fl[i] = (eb[i] - eb[jj]) / dw_blks
+    STEPS = 20  # 200GB / 10GB (matches dp_optimizer MA_WINDOW)
+    for i in range(STEPS, n):
+        r_gc[i] = (cb[i] - cb[i - STEPS]) / STEPS
+        r_fl[i] = (eb[i] - eb[i - STEPS]) / STEPS
     return r_gc, r_fl
 
 
@@ -149,13 +136,6 @@ def main():
 
     miss_count = 0
     for i in range(1, n):
-        # Delta write in this step (in blocks)
-        delta_ws_blks = (p_ws[i] - p_ws[i-1]) / BLK_SZ
-        if delta_ws_blks <= 0:
-            dp_cum_gc[i] = dp_cum_gc[i-1]
-            dp_cum_fl[i] = dp_cum_fl[i-1]
-            continue
-
         # Current utilization from global_valid_blocks
         util = p_gv[i] / total_cache_blks
         r100 = int(round(util * 100))
@@ -163,18 +143,19 @@ def main():
 
         if r100 in dp_rates:
             d_ws, r_gc, r_fl = dp_rates[r100]
-            rate_gc = interp_rate(d_ws, r_gc, p_ws[i])
-            rate_fl = interp_rate(d_ws, r_fl, p_ws[i])
-            if np.isnan(rate_gc):
-                rate_gc = 0.0
-            if np.isnan(rate_fl):
-                rate_fl = 0.0
+            # r_gc/r_fl = smoothed blocks per 10GB step (already /24)
+            step_gc = interp_rate(d_ws, r_gc, p_ws[i])
+            step_fl = interp_rate(d_ws, r_fl, p_ws[i])
+            if np.isnan(step_gc):
+                step_gc = 0.0
+            if np.isnan(step_fl):
+                step_fl = 0.0
         else:
-            rate_gc, rate_fl = 0.0, 0.0
+            step_gc, step_fl = 0.0, 0.0
             miss_count += 1
 
-        dp_cum_gc[i] = dp_cum_gc[i-1] + rate_gc * delta_ws_blks
-        dp_cum_fl[i] = dp_cum_fl[i-1] + rate_fl * delta_ws_blks
+        dp_cum_gc[i] = dp_cum_gc[i-1] + step_gc
+        dp_cum_fl[i] = dp_cum_fl[i-1] + step_fl
 
     if miss_count > 0:
         print(f"  WARNING: {miss_count} steps had no matching DP file")

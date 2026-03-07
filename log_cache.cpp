@@ -82,7 +82,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
     valid_rate_min_ = valid_rate_min;
     valid_rate_max_ = valid_rate_max;
     if (valid_rate_period_gb_ > 0.0) {
-        valid_rate_period_blocks_ = static_cast<uint64_t>(valid_rate_period_gb_ * 1e9 / blk_sz);
+        valid_rate_period_blocks_ = segment_size_blocks * 8;
         next_valid_rate_change_ts_ = valid_rate_period_blocks_;
     }
 
@@ -215,9 +215,10 @@ void LogCache::periodic() {
     /* ── Periodic valid rate sweep ─────────────────────── */
     if (valid_rate_period_blocks_ > 0 &&
         log_cache_timestamp >= next_valid_rate_change_ts_) {
-        std::uniform_real_distribution<double> dist(valid_rate_min_, valid_rate_max_);
+        std::uniform_real_distribution<double> dist(-0.10, 0.10);
         double old_rate = target_valid_blk_rate;
-        target_valid_blk_rate = dist(valid_rate_rng_);
+        target_valid_blk_rate = std::clamp(target_valid_blk_rate + dist(valid_rate_rng_),
+                                           valid_rate_min_, valid_rate_max_);
         next_valid_rate_change_ts_ += valid_rate_period_blocks_;
         printf("periodic_valid_rate: ts=%lu old=%.4f new=%.4f next_change=%lu\n",
                log_cache_timestamp, old_rate, target_valid_blk_rate,

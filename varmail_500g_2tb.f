@@ -1,12 +1,12 @@
 set $dir=/mnt/nvme0
-set $nfiles=625000
+set $nfiles=975000
 set $meandirwidth=1000000
 set $filesize=cvar(type=cvar-gamma,parameters=mean:858993;gamma:1.5)
 set $nthreads=16
 set $iosize=1m
 set $meanappendsize=1m
 
-define fileset name=bigfileset,path=$dir,size=$filesize,entries=$nfiles,dirwidth=$meandirwidth,prealloc=80
+define fileset name=bigfileset,path=$dir,size=$filesize,entries=$nfiles,dirwidth=$meandirwidth,prealloc=50
 
 define process name=filereader,instances=1
 {
@@ -30,4 +30,4 @@ define process name=filereader,instances=1
 
 echo "Varmail 500GB Version 3.0 personality successfully loaded"
 
-run 2200
+run 6600

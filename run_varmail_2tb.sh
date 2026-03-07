@@ -13,12 +13,7 @@ if [ -z "$DEVICE" ]; then
 fi
 echo "Root device: $ROOT_DEV, Using device: $DEVICE"
 
-# Confirm with user
-read -p "Will use /dev/$DEVICE for blktrace+filebench. Continue? [y/N] " confirm
-if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    echo "Aborted."
-    exit 1
-fi
+echo "Using /dev/$DEVICE for blktrace+filebench"
 
 # Mount if not already mounted
 MOUNTPOINT=$(lsblk -no MOUNTPOINT /dev/$DEVICE | head -1)
