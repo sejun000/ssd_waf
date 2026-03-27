@@ -224,6 +224,7 @@ int main(int argc, char* argv[]) {
     std::string waf_log_file = "";
     std::string stat_log_file = "";
     double valid_ratio = 0.0;
+    double periodic_ratio = 2.88;
     bool cache_trace = false;
     bool no_fill = true;
     uint64_t cold_capacity = 0;
@@ -258,6 +259,8 @@ int main(int argc, char* argv[]) {
             no_fill = true;
         } else if (arg == "--scale" && i + 1 < argc) {
             lba_scale = std::stoi(argv[++i]);
+        } else if (arg == "--periodic_ratio" && i + 1 < argc) {
+            periodic_ratio = std::stod(argv[++i]);
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -275,13 +278,14 @@ int main(int argc, char* argv[]) {
     printf("cold_trace_output = %s\n", cold_trace_output.c_str());
     printf("cold_capacity = %lu\n", cold_capacity);
     printf("lba_scale = %d\n", lba_scale);
+    printf("periodic_ratio = %.2f\n", periodic_ratio);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file));
+    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio));
 
     if (!no_fill) {
         std::cout << "[prefill] start: trace=" << trace_file

@@ -32,7 +32,8 @@ LogCache::LogCache(uint64_t              cold_capacity,
              std::string stat_log_file,
              double valid_rate_period_gb,
              double valid_rate_min,
-             double valid_rate_max
+             double valid_rate_max,
+             double periodic_ratio
              )
     : ICache(cold_capacity, waf_log_file, stat_log_file),
       cache_block_size(blk_sz),
@@ -56,8 +57,11 @@ LogCache::LogCache(uint64_t              cold_capacity,
       eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ghost_util_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      ghost_cache(cache_block_count * 0.1)
+      ghost_cache(cache_block_count * 0.1),
+      net_free_seg_ratio_(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      gc_valid_pages_ratio_(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
 {
+    periodic_ratio_ = periodic_ratio;
     segment_size_blocks = cfg_.segment_bytes / blk_sz;
     g_segment_blocks = static_cast<double>(segment_size_blocks);
     total_segments = cache_block_count * blk_sz / cfg_.segment_bytes;
@@ -82,7 +86,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
     valid_rate_min_ = valid_rate_min;
     valid_rate_max_ = valid_rate_max;
     if (valid_rate_period_gb_ > 0.0) {
-        valid_rate_period_blocks_ = segment_size_blocks * 8;
+        valid_rate_period_blocks_ = segment_size_blocks * total_segments;
         next_valid_rate_change_ts_ = valid_rate_period_blocks_;
     }
 
@@ -191,6 +195,7 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 }
 
 void LogCache::periodic() {
+#if 1
     if (is_ghost_cache){
         if (log_cache_timestamp % (segment_size_blocks/4) == 0) {
             compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
@@ -202,7 +207,7 @@ void LogCache::periodic() {
             if (compaction_ratio.has_value() &&
                 eviction_ratio.has_value() &&
                 eviction_ratio_in_ghost_cache.has_value()){
-                if (2.88 * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
+                if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
                     target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + 0.1);
                 }
                 else {
@@ -211,19 +216,38 @@ void LogCache::periodic() {
             }
         }
     }
+#elif 0
+    /* ── A/B feedback: net free segs vs compaction cost ── */
+    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+        uint64_t A = gc_victim_count - gc_active_alloc_count_;
+        net_free_seg_ratio_.updateFromCumulative(log_cache_timestamp, A * segment_size_blocks);
+        if (net_free_seg_ratio_.has_value()) {
+            double a = net_free_seg_ratio_.value();
+            cumulative_B_ += evictor->get_mth_score_valid_pages(a);
+        }
+        gc_valid_pages_ratio_.updateFromCumulative(log_cache_timestamp, cumulative_B_);
+    }
 
-    /* ── Periodic valid rate sweep ─────────────────────── */
     if (valid_rate_period_blocks_ > 0 &&
         log_cache_timestamp >= next_valid_rate_change_ts_) {
-        std::uniform_real_distribution<double> dist(-0.10, 0.10);
-        double old_rate = target_valid_blk_rate;
-        target_valid_blk_rate = std::clamp(target_valid_blk_rate + dist(valid_rate_rng_),
-                                           valid_rate_min_, valid_rate_max_);
         next_valid_rate_change_ts_ += valid_rate_period_blocks_;
-        printf("periodic_valid_rate: ts=%lu old=%.4f new=%.4f next_change=%lu\n",
-               log_cache_timestamp, old_rate, target_valid_blk_rate,
-               next_valid_rate_change_ts_);
+        if (net_free_seg_ratio_.has_value() && gc_valid_pages_ratio_.has_value()) {
+            double a = net_free_seg_ratio_.value();
+            double b = gc_valid_pages_ratio_.value();
+            static constexpr double r = 2.88;
+            double old_rate = target_valid_blk_rate;
+            if (b * r > a) {
+                target_valid_blk_rate = std::min(valid_blk_rate_hard_limit,
+                    (double)global_valid_blocks / total_cache_block_count + 0.1);
+            } else {
+                target_valid_blk_rate = std::max(0.0,
+                    (double)global_valid_blocks / total_cache_block_count - 0.1);
+            }
+            printf("periodic_ab: ts=%lu a=%.6f b=%.6f b*r=%.6f old=%.4f new=%.4f\n",
+                   log_cache_timestamp, a, b, b * r, old_rate, target_valid_blk_rate);
+        }
     }
+#endif
 }
 /*
 void LogCache::periodic() {
@@ -442,6 +466,7 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
         seg->class_num = stream_id; // stream id로 class num 설정
         seg->create_timestamp = log_cache_timestamp; // 초기화
         (*active_table)[stream_id] = seg;
+        if (gc) ++gc_active_alloc_count_;
     }
     else
     {
@@ -472,6 +497,7 @@ LogCacheSegment* LogCache::get_segment_to_active_stream(bool gc, int stream_id, 
         seg->class_num = stream_id; // stream id로 class num 설정
         seg->create_timestamp = log_cache_timestamp; // 초기화
         (*active_table)[stream_id] = seg;
+        if (gc) ++gc_active_alloc_count_;
     }
     else
     {
@@ -650,6 +676,7 @@ void LogCache::reset_segment(LogCacheSegment* s)
 void LogCache::dummy_fill_segment(LogCacheSegment* s)
 {
     if (s) {
+        ++dummy_fill_segment_count;
         printf("[GC] event=DUMMY_FILL valid_cnt=%ld write_ptr=%zu/%zu free_pool=%zu global_valid=%lu class=%d\n",
                s->valid_cnt, s->write_ptr, s->blocks.size(), free_pool.size(), global_valid_blocks, s->get_class_num());
         for (std::size_t i = s->write_ptr; i < s->blocks.size(); ++i)
@@ -1025,8 +1052,8 @@ void LogCache::print_stats() {
         const std::string& prefix = stats_prefix();
         const char* prefix_cstr = prefix.empty() ? "LOG_CACHE" : prefix.c_str();
         double avg_victim_valid_ratio = (gc_victim_count > 0) ? gc_victim_valid_ratio_sum / gc_victim_count : 0.0;
-        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu gc_victim_avg_valid_ratio: %.6f gc_victim_count: %lu\n",
-                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks, avg_victim_valid_ratio, gc_victim_count);
+        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu gc_victim_avg_valid_ratio: %.6f gc_victim_count: %lu dummy_fill_segments: %lu\n",
+                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks, avg_victim_valid_ratio, gc_victim_count, dummy_fill_segment_count);
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }

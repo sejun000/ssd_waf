@@ -58,24 +58,21 @@ Segment* CbEvictPolicy::choose_segment()
     return seg;
 }
 
-uint64_t CbEvictPolicy::get_mth_score_valid_pages(int m) const
+uint64_t CbEvictPolicy::get_mth_score_valid_pages(double m) const
 {
-    if (m <= 0) {
-        return 0;
-    }
-    // ordered_iterator로 score 순서대로 순회하며 1~2m번째 평균 valid_cnt 계산
-    int search_limit = m * 2;
+    if (m <= 0.0 || heap_.empty()) return 0;
+
+    int full = static_cast<int>(m);        // floor(m)
+    double frac = m - full;                // fractional part
     uint64_t sum = 0;
-    int count = 0;
     auto it = heap_.ordered_begin();
-    for (int i = 0; i < search_limit && it != heap_.ordered_end(); ++i, ++it) {
+    for (int i = 0; i < full && it != heap_.ordered_end(); ++i, ++it) {
         sum += it->seg->valid_cnt;
-        ++count;
     }
-    if (count == 0) {
-        return 0;
+    if (frac > 0.0 && it != heap_.ordered_end()) {
+        sum += static_cast<uint64_t>(it->seg->valid_cnt * frac);
     }
-    return sum / count;
+    return sum;
 }
 
 uint64_t CbEvictPolicy::get_kth_segment_valid_cnt_for_free_segments(double m) const

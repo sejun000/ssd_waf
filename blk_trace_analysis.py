@@ -28,7 +28,7 @@ def estimate_device_size(file_path, trace_format):
     
     return max_value  # 블록 크기를 4KB로 가정하고 크기 근사
 
-def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate='', scale=1):
+def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate='', scale=1, periodic_ratio=None):
     """캐시 크기를 1%, 5%, 10%, 15%, 20%, 25%, 30%로 변경하며 실행"""
     cache_ratios = [0.125]
     #cache_ratios = [0.25]
@@ -50,25 +50,30 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
             print(f"\nRunning analysis with cache size: {cache_size} bytes ({ratio*100:.5f}% trace_format {trace_format})")
             print (f"./cache_sim {trace_file} {cache_size} --rw_policy {rw_policy} --trace_format {trace_format} --cache_policy {input_cache_policy} --cache_trace /mnt/nvme2n2/{cache_policy}_{ratio}.trace --cold_trace /mnt/nvme2n2/{cache_policy}_{ratio}.cold.trace --cold_capacity {int(device_size * 1.07)} --waf_log_file {cache_policy}_{ratio}.waf.log")
             ts = datetime.now().strftime('%y%m%d_%H%M%S')
-            waf_log_file = f"{cache_policy}_{ratio}_{ts}.waf.log"
+            pr_tag = f"_pr{periodic_ratio}" if periodic_ratio is not None else ""
+            waf_log_file = f"{cache_policy}_{ratio}_{ts}{pr_tag}.waf.log"
+            trace_suffix = f"{cache_policy}_{ratio}{pr_tag}"
             base_args = [
                     "./cache_sim", trace_file, str(cache_size),
                     "--rw_policy", rw_policy,
                     "--trace_format", trace_format,
                     "--cache_policy", input_cache_policy,
-                    "--cache_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".trace",
-                    "--cold_trace", "/mnt/nvme2n2/"+ cache_policy + "_" + str(ratio) + ".cold.trace",
+                    "--cache_trace", f"/mnt/nvme2n2/{trace_suffix}.trace",
+                    "--cold_trace", f"/mnt/nvme2n2/{trace_suffix}.cold.trace",
                     "--cold_capacity", str(int(device_size * 1.07)),
                     "--waf_log_file", waf_log_file,
             ]
+            if periodic_ratio is not None:
+                base_args += ["--periodic_ratio", str(periodic_ratio),
+                              "--stat_log_file", f"stat{pr_tag}"]
             if scale != 1:
                 base_args += ["--scale", str(scale)]
             if (valid_rate != ''):
                 base_args += ["--valid_ratio", str(valid_ratio),
                               "--stat_log_file", "dp."+str(valid_ratio)]
-            subprocess.run(base_args)   
+            subprocess.run(base_args)
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=7) as ex:
         futures = [ex.submit(_run_for_valid_ratio, vr) for vr in valid_ratio_ranges]
         for _ in as_completed(futures):
             pass
@@ -86,9 +91,10 @@ if __name__ == "__main__":
     #parser.add_argument("--device_size", type=int, default=2174461292544, help="Device size in bytes") # alibaba trace 40TB written
     parser.add_argument("--device_size", type=int, default=15000000000000, help="Device size in bytes") # alibaba trace 40TB written
     parser.add_argument("--scale", type=int, default=1, help="LBA scale factor (e.g. 2 = lba*2, size*2)")
+    parser.add_argument("--periodic_ratio", type=float, default=None, help="Periodic ratio for ghost cache eviction decision (default: 2.88)")
     #[prefill] done, total 2174461292544 bytes (target 3288206467072, align 4096)
     #parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes") # lsmtree
     args = parser.parse_args()
     estimated_device_size = args.device_size
     print(f"Estimated Device Size: {estimated_device_size} bytes")
-    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate, args.scale)
+    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate, args.scale, args.periodic_ratio)

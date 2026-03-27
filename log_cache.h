@@ -52,7 +52,8 @@ public:
              std::string stat_log_file = "",
              double valid_rate_period_gb = 0.0,
              double valid_rate_min = 0.0,
-             double valid_rate_max = 0.0
+             double valid_rate_max = 0.0,
+             double periodic_ratio = 2.88
             );
 
     ~LogCache();
@@ -131,6 +132,7 @@ private:
     uint64_t evicted_segment_age = 0;
     uint64_t gc_victim_count = 0;
     double gc_victim_valid_ratio_sum = 0.0;
+    uint64_t dummy_fill_segment_count = 0;
 
     double target_valid_blk_rate = 0.0; // ratio of write to QLC
     double valid_blk_rate_hard_limit = 0.0;
@@ -155,6 +157,7 @@ private:
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
     EwmaRatio compaction_ratio_in_ghost_cache;
+    double periodic_ratio_ = 2.88;
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
     uint64_t ghost_compacted_blocks = 0;
@@ -212,4 +215,10 @@ private:
     uint64_t valid_rate_period_blocks_ = 0;
     uint64_t next_valid_rate_change_ts_ = 0;
     std::mt19937 valid_rate_rng_{42};
+
+    /* ── A/B feedback: net free segs vs compaction cost ── */
+    uint64_t gc_active_alloc_count_ = 0;   // cumulative gc active segments allocated
+    uint64_t cumulative_B_ = 0;            // cumulative valid pages from get_mth_score_valid_pages
+    EwmaRatio net_free_seg_ratio_;         // EWMA of A (gc_victim_count - gc_active_alloc_count_)
+    EwmaRatio gc_valid_pages_ratio_;       // EWMA of B (cumulative valid pages)
 };

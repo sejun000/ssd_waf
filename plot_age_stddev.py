@@ -30,14 +30,29 @@ colors = {'Greedy': '#FFB07C', 'SepBIT': '#87CEAB', 'MiDAS': '#C4A8D8', 'REFlash
 rewritten_colors = {'Greedy': '#FFB07C', 'REFlash-CB': 'tab:blue', 'REFlash': 'tab:red'}
 BLK_TO_TB = 4096.0 / (1000**4)
 
-gc_writes_blks = {
-    'Greedy': 2386322142,
-    'SepBIT': 4401616050,
-    'REFlash': 1578750240,
-    'REFlash-CB': 2303204956,
-    'MiDAS': 2046290451,
-}
+WARMUP_BYTES = 6 * 1024**4  # 6 TiB
 
+def parse_gc_writes_after_warmup(stat_file):
+    """Parse compacted_blocks diff after 8 TiB warmup."""
+    first_after = None
+    last = None
+    with open(stat_file) as f:
+        for line in f:
+            if 'invalidate_blocks:' not in line:
+                continue
+            m_w = re.search(r'write_size_to_cache: (\d+)', line)
+            m_c = re.search(r'compacted_blocks: (\d+)', line)
+            if not (m_w and m_c):
+                continue
+            w, c = int(m_w.group(1)), int(m_c.group(1))
+            if w >= WARMUP_BYTES and first_after is None:
+                first_after = c
+            last = c
+    if first_after is not None and last is not None:
+        return last - first_after
+    return 0
+
+gc_writes_blks = {label: parse_gc_writes_after_warmup(f) for label, f in stat_files.items()}
 
 # Histogram granularity (blocks per bucket)
 GRANULARITY = 38535168
@@ -59,12 +74,12 @@ def parse_compacted_lifetime(stat_file):
                     buckets[int(m.group(1))] = int(m.group(2))
     return buckets
 
-plt.rcParams.update({'font.size': 20})
+plt.rcParams.update({'font.size': 22})
 
 labels_order = ['Greedy', 'SepBIT', 'MiDAS', 'REFlash-CB', 'REFlash']
 rewritten_order = list(rewritten_stat_files.keys())
 
-fig, (ax_inv, ax_hist, ax_bar) = plt.subplots(1, 3, figsize=(21, 5),
+fig, (ax_inv, ax_hist, ax_bar) = plt.subplots(1, 3, figsize=(21, 4.25),
                                                gridspec_kw={'width_ratios': [2, 2, 1.5]})
 
 # --- Left: Remaining Lifetime Stddev CDF ---
@@ -97,12 +112,13 @@ for label in rewritten_order:
     x_tb = [(i + 0.5) * tb_per_bucket for i in indices]
     counts = [buckets[i] for i in indices]
     total = sum(buckets.values())
-    fracs = [c / total for c in counts]
-    ax_hist.plot(x_tb, fracs, color=rewritten_colors[label], linewidth=2.5, label=label)
+    cdf = np.cumsum(counts) / total
+    ax_hist.plot(x_tb, cdf, color=rewritten_colors[label], linewidth=2.5, label=label)
 
 ax_hist.set_xlim(0, max_bucket * tb_per_bucket)
+ax_hist.set_ylim(0, 1.0)
 ax_hist.set_xlabel('GC-Rewritten Block Lifetime (TB)')
-ax_hist.set_ylabel('Fraction')
+ax_hist.set_ylabel('CDF')
 ax_hist.legend(fontsize=16)
 ax_hist.grid(True, alpha=0.3)
 
@@ -110,7 +126,7 @@ ax_hist.grid(True, alpha=0.3)
 bar_order = ['Greedy', 'SepBIT', 'MiDAS', 'REFlash-CB', 'REFlash']
 gc_tb_vals = [gc_writes_blks[l] * BLK_TO_TB for l in bar_order]
 bar_colors = [colors[l] for l in bar_order]
-bars = ax_bar.bar(bar_order, gc_tb_vals, color=bar_colors, width=0.6)
+bars = ax_bar.bar(bar_order, gc_tb_vals, color=bar_colors, width=0.6, edgecolor='black', linewidth=1.2)
 ax_bar.set_ylabel('GC Writes (TB)')
 for bar, val in zip(bars, gc_tb_vals):
     ax_bar.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,
@@ -125,8 +141,8 @@ plt.tight_layout()
 for ax, subtitle in [(ax_inv, '(a) Remaining lifetime stddev per segment'),
                       (ax_hist, '(b) GC-rewritten block lifetime distribution'),
                       (ax_bar, '(c) GC writes')]:
-    ax.text(0.5, -0.35, subtitle, transform=ax.transAxes,
-            ha='center', va='top', fontsize=20)
+    ax.text(0.5, -0.50, subtitle, transform=ax.transAxes,
+            ha='center', va='top', fontsize=22)
 
 plt.savefig('A_age_stddev_cdf.pdf', dpi=150, bbox_inches='tight')
 print("Saved A_age_stddev_cdf.pdf")

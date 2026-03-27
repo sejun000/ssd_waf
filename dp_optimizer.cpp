@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
         vector<long long> gvb;
     };
 
-    static constexpr int MA_WINDOW = 20;
+    static constexpr int MA_WINDOW = 24;
     static constexpr double HOST_BLOCKS_PER_STEP = 10.0 * 1024 * 1024 * 1024 / 4096;
 
     auto moving_avg = [](const vector<double>& raw, int win) -> vector<double> {
