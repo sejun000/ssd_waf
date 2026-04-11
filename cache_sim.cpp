@@ -42,6 +42,9 @@ void signal_handler(int signum) {
 }
 
 // LRU 정책: 주어진 lba 범위의 블록들을 캐시에 추가
+// Global remapper pointer, set by main() when --lba_remap is active.
+static LbaRemapper* g_remapper = nullptr;
+
 void issue_op_to_cache(ICache& cache, long long lba_offset, int lba_size, OP_TYPE op_type) {
     int block_size = cache.get_block_size();
     long start_block = static_cast<long>(lba_offset / block_size);
@@ -51,13 +54,17 @@ void issue_op_to_cache(ICache& cache, long long lba_offset, int lba_size, OP_TYP
     std::map<long, int> newBlocks;
     for (long block = start_block; block <= end_block; block++) {
         long long block_start = static_cast<long long>(block) * block_size;
-        long long block_end = block_start + block_size;    
+        long long block_end = block_start + block_size;
         long long left_offset = std::max(block_start, req_start);
         long long right_offset = std::min(block_end, req_end);
         if (right_offset <= left_offset) {
             continue;
         }
-        newBlocks[block] = right_offset - left_offset;
+        // Per-block remap: each 4K block independently mapped
+        long mapped_block = g_remapper
+            ? static_cast<long>(g_remapper->remap(static_cast<long long>(block) * block_size) / block_size)
+            : block;
+        newBlocks[mapped_block] = right_offset - left_offset;
     }
     cache.batch_insert(0, newBlocks, op_type);
 }
@@ -75,10 +82,11 @@ static void trace_prefill(ICache& cache,
                           const std::string& trace_file,
                           ITraceParser& parser,
                           uint64_t byte_limit,
-                          int block_size, uint64_t cold_capacity) {
+                          int block_size, uint64_t cache_size) {
     const uint64_t align_unit = std::max<uint64_t>(block_size, SECTOR_SIZE);
     const uint64_t aligned_limit = (byte_limit / align_unit) * align_unit;
-    uint64_t target_bytes = static_cast<uint64_t>(cold_capacity * PREFILL_RATE);
+    // Treat the cache device as the addressable storage; prefill exactly cache_size worth.
+    uint64_t target_bytes = cache_size;
     target_bytes = (target_bytes / align_unit) * align_unit;
     if (aligned_limit == 0 || target_bytes == 0) {
         std::cout << "[prefill] skip: byte_limit too small\n";
@@ -229,6 +237,7 @@ int main(int argc, char* argv[]) {
     bool no_fill = true;
     uint64_t cold_capacity = 0;
     int lba_scale = 1;
+    bool lba_remap = false;
 
     // 추가 인자 파싱
     for (int i = 3; i < argc; i++) {
@@ -257,10 +266,14 @@ int main(int argc, char* argv[]) {
              stat_log_file = argv[++i];
         } else if (arg == "--no_fill" || arg == "-no_fill" || arg == "-no_filll") {
             no_fill = true;
+        } else if (arg == "--fill") {
+            no_fill = false;
         } else if (arg == "--scale" && i + 1 < argc) {
             lba_scale = std::stoi(argv[++i]);
         } else if (arg == "--periodic_ratio" && i + 1 < argc) {
             periodic_ratio = std::stod(argv[++i]);
+        } else if (arg == "--lba_remap") {
+            lba_remap = true;
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -280,6 +293,7 @@ int main(int argc, char* argv[]) {
     printf("lba_scale = %d\n", lba_scale);
     printf("periodic_ratio = %.2f\n", periodic_ratio);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
+    printf("lba_remap = %s\n", lba_remap ? "enabled" : "disabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
@@ -287,12 +301,19 @@ int main(int argc, char* argv[]) {
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
     std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio));
 
+    std::unique_ptr<LbaRemapper> remapper;
+    if (lba_remap) {
+        remapper = std::make_unique<LbaRemapper>(static_cast<uint64_t>(max_cache_blocks), block_size);
+        g_remapper = remapper.get();
+        printf("[lba_remap] enabled, pool_blocks=%ld block_size=%d\n", max_cache_blocks, block_size);
+    }
+
     if (!no_fill) {
         std::cout << "[prefill] start: trace=" << trace_file
                   << ", limit=" << cold_capacity
                   << ", block_size=" << block_size << std::endl;
         // Prefill using trace until limit; uses same parser to avoid dup parsing logic differences.
-        trace_prefill(*cache, trace_file, *parser, CACHE_WRITE_SIZE_LIMIT, block_size, cold_capacity);
+        trace_prefill(*cache, trace_file, *parser, CACHE_WRITE_SIZE_LIMIT, block_size, cache_size);
     }
 
     // 통계 변수 초기화

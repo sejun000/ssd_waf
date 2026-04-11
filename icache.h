@@ -19,6 +19,54 @@ struct CacheEntry {
     size_t allocated_id;
 };
 
+/**
+ * Log-append style LBA remapper.
+ *
+ * Used by cache_sim when --lba_remap is given. Treats the cache device as a
+ * single storage of `pool_blocks` slots. The first time an upstream LBA is
+ * seen, it is mapped to the next free slot (monotonically incrementing,
+ * log-append). Subsequent appearances of the same LBA reuse the mapping. When
+ * the slot pool is exhausted, the original LBA is passed through unchanged.
+ *
+ * Operates on byte-addressed offsets so callers do not need to know the
+ * block size; intra-block byte offsets are preserved.
+ */
+class LbaRemapper {
+public:
+    LbaRemapper(uint64_t pool_blocks, int block_size)
+        : pool_blocks_(pool_blocks), block_size_(block_size) {}
+
+    long long remap(long long lba_offset) {
+        long long blk = lba_offset / block_size_;
+        long long off_in_blk = lba_offset - blk * block_size_;
+        auto it = map_.find(blk);
+        long long mapped;
+        if (it == map_.end()) {
+            if (next_alloc_ >= static_cast<long long>(pool_blocks_)) {
+                // pool exhausted: pass through untouched
+                ++passthrough_count_;
+                return lba_offset;
+            }
+            mapped = next_alloc_++;
+            map_[blk] = mapped;
+        } else {
+            mapped = it->second;
+        }
+        return mapped * static_cast<long long>(block_size_) + off_in_blk;
+    }
+
+    uint64_t mapped_count() const { return static_cast<uint64_t>(next_alloc_); }
+    uint64_t passthrough_count() const { return passthrough_count_; }
+    uint64_t pool_blocks() const { return pool_blocks_; }
+
+private:
+    std::unordered_map<long long, long long> map_;
+    long long next_alloc_ = 0;
+    uint64_t pool_blocks_;
+    int block_size_;
+    uint64_t passthrough_count_ = 0;
+};
+
 class ICache {
 public:
     // 생성자: capacity는 블록 단위 최대 개수
