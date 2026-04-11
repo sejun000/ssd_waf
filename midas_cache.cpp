@@ -338,20 +338,9 @@ void MidasCache::maybe_run_gc_policy() {
         static_cast<std::size_t>(std::ceil(static_cast<double>(total_segments) * cfg_.free_ratio_low)),
         static_cast<std::size_t>(midas::ssd_spec->FREENUM));
     while (midas::fbqueue.size() < low_water) {
-        double global_valid_rate = (total_cache_block_count == 0)
-        ? 0.0
-        : static_cast<double>(global_valid_blocks) / static_cast<double>(total_cache_block_count);
-        double effective_target = (target_valid_blk_rate > 0.0)
-        ? std::min(target_valid_blk_rate, valid_blk_rate_hard_limit)
-        : 0.0;
-        if (effective_target > 0.0 && global_valid_rate > effective_target) {
-            evict_one_segment();
-        }
-        else {
-            //printf("GC\n");
-            midas::GC(midas_ssd, midas_stats, midas_group.data());
-            consume_gc_compacted_lbas();
-        }
+        // evict 경로 제거: 항상 GC (compact only)
+        midas::GC(midas_ssd, midas_stats, midas_group.data());
+        consume_gc_compacted_lbas();
         t++;
         if (t % ILOOP == 0 && t > 1) {
             break;

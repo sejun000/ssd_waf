@@ -9,7 +9,7 @@ HotColdFineGrain::HotColdFineGrain() {
 
 }
 
-int HotColdFineGrain::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+int HotColdFineGrain::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp, bool is_read) {
   // We set global timerstamp as "time stamp diff"
   uint64_t max_lifespan = 30 * 1024ULL * 1024ULL; // 30 seconds in bytes
   if ( global_timestamp - created_timestamp > max_lifespan) {

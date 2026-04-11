@@ -22,7 +22,7 @@ MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool c
 
 extern uint64_t g_threshold;
 
-int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp, bool is_read) {
     uint64_t time_diff = global_timestamp - created_timestamp;
     if (!isGcAppend) {
         uint64_t lifespan = time_diff;

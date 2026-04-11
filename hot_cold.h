@@ -10,7 +10,7 @@ class Metadata;
 class HotCold: public IStream {
   public:
     HotCold();
-    int  Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) override;
+    int  Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp, bool is_read = false) override;
     void Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) override;
     void GcAppend(uint64_t blockAddr) override;
     void CollectSegment(Segment *segment, uint64_t global_timestamp) override;

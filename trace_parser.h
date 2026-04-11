@@ -29,7 +29,13 @@ public:
     ParsedRow parseTrace(const std::string &line) override;
 };
 
-// Factory 함수: 파서 타입("csv", "blktrace", "tencent")에 따라 적절한 파서 객체를 생성
+// blkparse custom format: timestamp,R/W,sector,nsectors (sector=512B units)
+class BlkparseCsvParser : public ITraceParser {
+public:
+    ParsedRow parseTrace(const std::string &line) override;
+};
+
+// Factory 함수: 파서 타입("csv", "blktrace", "tencent", "blkparse_csv")에 따라 적절한 파서 객체를 생성
 ITraceParser* createTraceParser(const std::string &type);
 
 #endif // TRACE_PARSER_H

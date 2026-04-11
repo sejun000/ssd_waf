@@ -24,7 +24,8 @@ MiDASHotCold::MiDASHotCold(uint32_t channels, uint32_t chips_per_channel)
 int MiDASHotCold::Classify(uint64_t blockAddr,
                            bool isGcAppend,
                            uint64_t /*global_timestamp*/,
-                           uint64_t /*created_timestamp*/) {
+                           uint64_t /*created_timestamp*/,
+                           bool /*is_read*/) {
     if (isGcAppend) {
         return gc_stream_id(blockAddr);
     }

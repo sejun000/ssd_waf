@@ -11,7 +11,7 @@ SepBIT::SepBIT() {
     mMetadata = new Metadata();
 }
 
-int SepBIT::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+int SepBIT::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp, bool is_read) {
   static uint64_t hot = 0, cold = 0;
   if (!isGcAppend) {
     uint64_t lifespan = mLba2Fifo->Query(blockAddr);

@@ -17,6 +17,7 @@ public:
             bool valid = false; ///< 유효성 플래그 (1비트)
         };
         uint64_t create_timestamp = UINT64_MAX; ///< 생성 시각
+        bool was_read = false; ///< 마지막 접근이 read였는지
     };
 
     explicit LogCacheSegment(std::size_t blocks_per_segment, uint64_t create_timestamp)

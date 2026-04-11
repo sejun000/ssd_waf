@@ -88,6 +88,27 @@ ParsedRow TencentTraceParser::parseTrace(const std::string &line) {
     return result;
 }
 
+// blkparse custom CSV: timestamp,R/W,sector,nsectors (sector=512B)
+ParsedRow BlkparseCsvParser::parseTrace(const std::string &line) {
+    ParsedRow result;
+    std::vector<std::string> tokens = splitString(line, ',');
+    if (tokens.size() < 4) {
+        return ParsedRow();
+    }
+    try {
+        result.timestamp = std::stod(tokens[0]);
+        result.op_type = tokens[1];
+        long long sector = std::stoll(tokens[2]);
+        int nsectors = std::stoi(tokens[3]);
+        result.lba_offset = sector * 512;
+        result.lba_size = nsectors * 512;
+        result.dev_id = "cache";
+    } catch (...) {
+        return ParsedRow();
+    }
+    return result;
+}
+
 // Factory 함수: 타입에 따라 적절한 파서 객체 생성
 ITraceParser* createTraceParser(const std::string &type) {
     if (type == "blktrace") {
@@ -96,6 +117,9 @@ ITraceParser* createTraceParser(const std::string &type) {
     } else if (type == "tencent") {
         printf("TencentTraceParser\n");
         return new TencentTraceParser();
+    } else if (type == "blkparse_csv") {
+        printf("BlkparseCsvParser\n");
+        return new BlkparseCsvParser();
     } else {
         return new CsvTraceParser();
     }

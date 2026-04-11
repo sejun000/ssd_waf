@@ -139,7 +139,7 @@ private:
     uint64_t read_blocks_in_partial_write = 0;
 
     static const int HISTOGRAM_BUCKETS = 20;
-    static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = 262144 * 4;
+    static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (16384 * 6) * 4;
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
 

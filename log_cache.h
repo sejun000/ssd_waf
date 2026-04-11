@@ -22,7 +22,7 @@
 struct Config
 {
     //std::size_t segment_bytes  = 32ull * 1024 * 1024; ///< default 32 MB
-    std::size_t segment_bytes  = 6ull * 1024 * 1024 * 1024; ///< default 6 GB
+    std::size_t segment_bytes  = 384ull * 1024 * 1024; ///< default 384 MB
 
     double      free_ratio_low = 0.04;                ///< 25% (~50 segments for 512 total)
     int         evicted_blk_size = 1;    // 4k eviction
@@ -53,7 +53,8 @@ public:
              double valid_rate_period_gb = 0.0,
              double valid_rate_min = 0.0,
              double valid_rate_max = 0.0,
-             double periodic_ratio = 2.88
+             double periodic_ratio = 2.88,
+             bool renew_on_read = false
             );
 
     ~LogCache();
@@ -148,7 +149,7 @@ private:
     std::unordered_map<long, uint64_t> compacted_at_;
     std::unique_ptr<Histogram> compacted_lifetime_histogram_;
     static const int HISTOGRAM_BUCKETS = 20;
-    static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (262144 * 6) * 4;
+    static const uint64_t DEFAULT_HALF_LIFE_IN_BLOCKS = (16384 * 6) * 4;
     static constexpr double TCO_EVICTION_WEIGHT = 2.8;
     static const std::size_t TCO_HISTORY_SIZE = 4;
     bool is_ghost_cache = false;
@@ -158,6 +159,7 @@ private:
     EwmaRatio eviction_ratio_in_ghost_cache;
     EwmaRatio compaction_ratio_in_ghost_cache;
     double periodic_ratio_ = 2.88;
+    bool renew_on_read_ = false;
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
     uint64_t ghost_compacted_blocks = 0;
@@ -169,7 +171,7 @@ private:
 
     /* ── Lifetime histogram (entire trace) ────────────────── */
     bool lifetime_tracking_active_ = false;
-    static constexpr uint64_t LIFETIME_BUCKET_WIDTH = 262144; // 1 GB in 4KB blocks
+    static constexpr uint64_t LIFETIME_BUCKET_WIDTH = 16384; // 64 MB in 4KB blocks
     std::map<uint64_t, uint64_t> lifetime_hist_invalidate_;   // bucket → count
     std::map<uint64_t, uint64_t> lifetime_hist_evict_;        // bucket → count
 

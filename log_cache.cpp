@@ -33,7 +33,8 @@ LogCache::LogCache(uint64_t              cold_capacity,
              double valid_rate_period_gb,
              double valid_rate_min,
              double valid_rate_max,
-             double periodic_ratio
+             double periodic_ratio,
+             bool renew_on_read
              )
     : ICache(cold_capacity, waf_log_file, stat_log_file),
       cache_block_size(blk_sz),
@@ -62,6 +63,7 @@ LogCache::LogCache(uint64_t              cold_capacity,
       gc_valid_pages_ratio_(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
 {
     periodic_ratio_ = periodic_ratio;
+    renew_on_read_ = renew_on_read;
     segment_size_blocks = cfg_.segment_bytes / blk_sz;
     g_segment_blocks = static_cast<double>(segment_size_blocks);
     total_segments = cache_block_count * blk_sz / cfg_.segment_bytes;
@@ -330,8 +332,20 @@ void LogCache::batch_insert(int stream_id,
                             const std::map<long,int>& newBlocks,
                             OP_TYPE                   op_type)
 {
-    if (op_type == OP_TYPE::READ || newBlocks.empty())
-        return;                          // 요구사항 ③ – read 무시
+    if (newBlocks.empty())
+        return;
+
+    if (op_type == OP_TYPE::READ) {
+        for (auto [key, lba_sz] : newBlocks) {
+            if (exists(key)) {
+                auto& loc = mapping[key];
+                if (renew_on_read_)
+                    loc.seg->blocks[loc.idx].create_timestamp = log_cache_timestamp;
+                loc.seg->blocks[loc.idx].was_read = true;
+            }
+        }
+        return;
+    }
     
     /* 1) 스트림별 active segment 확보 */
     LogCacheSegment* seg = nullptr;
@@ -364,7 +378,7 @@ void LogCache::batch_insert(int stream_id,
         record_rewrite(key);
         invalidate(key, lba_sz);
 
-        seg->blocks[seg->write_ptr] = { key, true, log_cache_timestamp };
+        seg->blocks[seg->write_ptr] = { key, true, log_cache_timestamp, false };
         mapping[key]                = { seg, seg->write_ptr };
 
         ++seg->write_ptr;
@@ -423,6 +437,7 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
     LogCacheSegment *seg = nullptr;
     uint64_t previous_blk_create_timestamp = log_cache_timestamp;
     
+    bool blk_was_read = false;
     if (exists(key))
     {
         auto loc = mapping[key];
@@ -431,9 +446,10 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
         if (loc.seg->blocks[loc.idx].valid)
         {
             previous_blk_create_timestamp = loc.seg->blocks[loc.idx].create_timestamp;
+            blk_was_read = loc.seg->blocks[loc.idx].was_read;
         }
     }
-    int stream_id = stream_policy->Classify(key, gc, log_cache_timestamp, previous_blk_create_timestamp);
+    int stream_id = stream_policy->Classify(key, gc, log_cache_timestamp, previous_blk_create_timestamp, blk_was_read);
     assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
 
     // Cycle wrap detected → dummy fill old active GC segments before reuse
@@ -529,16 +545,14 @@ void LogCache::check_and_evict_if_needed(int max_victims)
     g_threshold = threshold + cfg_.segment_bytes / cache_block_size;
    // printf("%d\n", low_water);
     int processed = 0;
+    static constexpr int COMPACT_STALL_LIMIT = 12;
+    int compact_stall_count = 0;
     while (free_pool.size() <= 3 ||
            (max_victims > 0 && processed < max_victims && free_pool.size() <= 10))
     {
-        /* eviction 후보 수집 */
-        bool compact = false;
-        if (target_valid_blk_rate >= 0.1) {
-            if (compactor && (double)target_valid_blk_rate * total_cache_block_count  > global_valid_blocks) {
-                compact = true;
-            }
-        }
+        /* compactor가 있으면 항상 compact (evict 경로 제거) */
+        bool compact = (compactor != nullptr);
+        size_t free_pool_before = free_pool.size();
 
         LogCacheSegment* victim = nullptr; 
         if (compact == true){
@@ -559,36 +573,15 @@ void LogCache::check_and_evict_if_needed(int max_victims)
         gc_victim_count++;
         gc_victim_valid_ratio_sum += (double)victim->valid_cnt / victim->blocks.size();
         if (victim->valid_cnt == 0) {
-            printf("[GC] event=RESET_EMPTY valid_cnt=0 free_pool=%zu global_valid=%lu ts=%lu\n",
-                   free_pool.size(), global_valid_blocks, log_cache_timestamp);
             reset_segment(victim);
         }
         else if (compact == false) {
-            printf("[GC] event=EVICT_SEG valid_cnt=%ld seg_age=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                   victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                   free_pool.size(), global_valid_blocks, log_cache_timestamp, victim->get_class_num());
             evicted_segment_age = victim->get_create_time();
             evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
             evict_segment(victim);
-            printf("[GC] event=EVICT_SEG_DONE free_pool=%zu global_valid=%lu\n",
-                   free_pool.size(), global_valid_blocks);
         }
         else if (compact == true) {
-            if (victim->valid_cnt > 0.95 * segment_size_blocks) {
-                compact = false;
-                compactor->add(victim, log_cache_timestamp);
-                victim = (LogCacheSegment *)evictor->choose_segment();
-                printf("[GC] event=COMPACT_TOO_FULL->EVICT_SEG valid_cnt=%ld seg_age=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                       victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                       free_pool.size(), global_valid_blocks, log_cache_timestamp, victim->get_class_num());
-                evicted_segment_age = victim->get_create_time();
-                evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
-                evict_segment(victim);
-                printf("[GC] event=COMPACT_TOO_FULL->EVICT_SEG_DONE free_pool=%zu global_valid=%lu\n",
-                       free_pool.size(), global_valid_blocks);
-            }
-            // Ghost compaction cost estimation
-            else {
+            {
                 /*if(is_ghost_cache && compactor) {
                 double u_step = ghost_util_ratio.has_value() ? ghost_util_ratio.value() : 0.9;
                 if (u_step < 0.01) u_step = 0.01; // 0 나누기 방지
@@ -610,27 +603,28 @@ void LogCache::check_and_evict_if_needed(int max_victims)
             }*/
 
                 int stream_id = victim->get_class_num();
-                printf("[GC] event=COMPACT valid_cnt=%ld seg_age=%lu threshold=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                       victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                       threshold, free_pool.size(), global_valid_blocks, log_cache_timestamp, stream_id);
                 compacted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
                 last_target_seg = (LogCacheSegment *)evict_and_compaction(victim, threshold, stream_id);
-                printf("[GC] event=COMPACT_DONE free_pool=%zu global_valid=%lu\n",
-                       free_pool.size(), global_valid_blocks);
                 if (last_target_seg) {
                     segment_list.push_back(last_target_seg);
                 }
             }
         }
         else {
-            printf("[GC] event=EVICT_SEG_FALLBACK valid_cnt=%ld seg_age=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                   victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                   free_pool.size(), global_valid_blocks, log_cache_timestamp, victim->get_class_num());
             evicted_segment_age = victim->get_create_time();
             evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
             evict_segment(victim);
-            printf("[GC] event=EVICT_SEG_FALLBACK_DONE free_pool=%zu global_valid=%lu\n",
-                   free_pool.size(), global_valid_blocks);
+        }
+
+        // compact가 free pool을 늘렸는지 검사 → 못 늘렸으면 stall 카운트 증가
+        if (compact) {
+            if (free_pool.size() > free_pool_before) {
+                compact_stall_count = 0;
+            } else {
+                compact_stall_count++;
+            }
+        } else {
+            compact_stall_count = 0;
         }
 
         if (stream_policy && compact == true) {
@@ -677,8 +671,6 @@ void LogCache::dummy_fill_segment(LogCacheSegment* s)
 {
     if (s) {
         ++dummy_fill_segment_count;
-        printf("[GC] event=DUMMY_FILL valid_cnt=%ld write_ptr=%zu/%zu free_pool=%zu global_valid=%lu class=%d\n",
-               s->valid_cnt, s->write_ptr, s->blocks.size(), free_pool.size(), global_valid_blocks, s->get_class_num());
         for (std::size_t i = s->write_ptr; i < s->blocks.size(); ++i)
         {
             s->blocks[i] = { 0, false, UINT64_MAX };
@@ -701,26 +693,7 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
     {
         auto &blk = s->blocks[i];
         if (!blk.valid) continue;
-        if (threshold > 0 && log_cache_timestamp - blk.create_timestamp >= threshold) { 
-            if (is_ghost_cache) {
-                ghost_cache.push(blk.key);
-            }
-            print_objects("evict", log_cache_timestamp - blk.create_timestamp);
-            evicted_blocks += cfg_.evicted_blk_size;
-            evicted_ages_histogram->inc(log_cache_timestamp - blk.create_timestamp);
-            {
-                auto cit = compacted_at_.find(blk.key);
-                if (cit != compacted_at_.end()) {
-                    compacted_lifetime_histogram_->inc(log_cache_timestamp - cit->second);
-                    compacted_at_.erase(cit);
-                }
-            }
-            evicted_timestamp[blk.key] = log_cache_timestamp;
-            evicted_blocks_for_victim += 1;
-            // map erase and blk valid false is done in this function
-            evict(blk);
-            continue;
-        }
+        // block-level evict removed: always compact (단일 storage 모드)
         if (stream_policy) {
             target_seg = get_segment_with_stream_policy(true, blk.key);
         }

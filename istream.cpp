@@ -3,6 +3,7 @@
 #include "hot_cold.h"
 #include "multi_hot_cold.h"
 #include "hot_cold_midas.h"
+#include "readwrite_stream.h"
 #include <string>
 #include <cassert>
 #include <algorithm>
@@ -51,6 +52,22 @@ IStream* createIstreamPolicy(std::string policy_type) {
     }
     else if (policy_type == "midas_hotcold") {
         return new MiDASHotCold();
+    }
+    else if (policy_type == "readwrite_hotcold") {
+        // write hot/cold only, GC by created_timestamp
+        return new ReadWriteStream(false, kMultiHotColdStreams, interval);
+    }
+    else if (policy_type == "readwrite_hotcold_read") {
+        // write hot/cold + separate read GC stream
+        return new ReadWriteStream(true, kMultiHotColdStreams, interval);
+    }
+    else if (policy_type == "readwrite_hotcold_circular") {
+        // write hot/cold, circular cycle-based sub-streams
+        return new ReadWriteStream(false, kMultiHotColdStreams, interval, true);
+    }
+    else if (policy_type == "readwrite_hotcold_read_circular") {
+        // write hot/cold + read separation, circular cycle-based sub-streams
+        return new ReadWriteStream(true, kMultiHotColdStreams, interval, true);
     }
     else {
         assert(false);

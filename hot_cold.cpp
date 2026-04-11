@@ -9,7 +9,7 @@ HotCold::HotCold() {
    
 }
 
-int HotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+int HotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp, bool is_read) {
   // We set global timerstamp as "time stamp diff"
   static int cold = 0;
   static int hot = 0;
