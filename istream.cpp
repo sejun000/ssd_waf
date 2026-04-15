@@ -4,13 +4,14 @@
 #include "multi_hot_cold.h"
 #include "hot_cold_midas.h"
 #include "readwrite_stream.h"
+#include "dogi_stream.h"
 #include <string>
 #include <cassert>
 #include <algorithm>
 
 uint64_t interval = 1;
 namespace {
-constexpr int kMultiHotColdStreams = 5;
+constexpr int kMultiHotColdStreams = IStream::kDefaultGcStreams;
 }
 
 void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_blocks) {
@@ -68,6 +69,9 @@ IStream* createIstreamPolicy(std::string policy_type) {
     else if (policy_type == "readwrite_hotcold_read_circular") {
         // write hot/cold + read separation, circular cycle-based sub-streams
         return new ReadWriteStream(true, kMultiHotColdStreams, interval, true);
+    }
+    else if (policy_type == "dogi_heuristic") {
+        return new DogiStream(/*num_gc_streams=*/6);
     }
     else {
         assert(false);

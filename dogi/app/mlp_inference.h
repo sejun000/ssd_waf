@@ -10,10 +10,14 @@
 class MlpInference {
  public:
   static constexpr int kBatch = 128;
+#ifdef DOGI_READ_FEATURE
+  static constexpr int kInputDim = 7;
+#else
   static constexpr int kInputDim = 6;
+#endif
   // Input feature order expected by the trained model:
-  // [LBA, freq_bit, freq_bit2, interval_bit, seg_accessed, prev_lba]
-  // The runtime collector provides [LBA, prev_lba, interval, freq_bit, freq_bit2, seg_accessed];
+  // [LBA, freq_bit, freq_bit2, interval_bit, seg_accessed, prev_lba(, was_read)]
+  // The runtime collector provides [LBA, prev_lba, interval, freq_bit, freq_bit2, seg_accessed(, was_read)];
   // RunBatch permutes/normalizes internally, so callers can keep using the runtime order.
   static constexpr int kHidden1 = 32;
   static constexpr int kHidden2 = 32;

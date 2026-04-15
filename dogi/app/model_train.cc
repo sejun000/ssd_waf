@@ -31,7 +31,7 @@ ModelTrainer::~ModelTrainer() {
     // Destructor logic if needed
 }
 
-void ModelTrainer::SaveTrainingData(std::array<uint64_t, 6>* features, uint64_t featuretime, bool isHot) { 
+void ModelTrainer::SaveTrainingData(std::array<uint64_t, MlpInference::kInputDim>* features, uint64_t featuretime, bool isHot) { 
     if (Complete_on) return;
     if (isHot) {
         _SaveTrueLBAData((*features)[0], featuretime, false);
@@ -40,7 +40,7 @@ void ModelTrainer::SaveTrainingData(std::array<uint64_t, 6>* features, uint64_t 
     }
 }
 
-void ModelTrainer::_SaveTrainingData(std::array<uint64_t, 6>* features, uint64_t featuretime) {
+void ModelTrainer::_SaveTrainingData(std::array<uint64_t, MlpInference::kInputDim>* features, uint64_t featuretime) {
     // Sample non-hot blocks based on sampling ratio
     if (number_of_samples < _max_sample_num) {
         if (number_of_nonhot == sampling_ratio) {
@@ -53,7 +53,11 @@ void ModelTrainer::_SaveTrainingData(std::array<uint64_t, 6>* features, uint64_t
                          << (*features)[2] << ","
                          << (*features)[3] << ","
                          << (*features)[4] << ","
-                         << (*features)[5] << "\n";
+                         << (*features)[5];
+#ifdef DOGI_READ_FEATURE
+            feature_file << "," << (*features)[6];
+#endif
+            feature_file << "\n";
             number_of_nonhot=0;
             number_of_samples++;
             if (!sampled_lba.set(static_cast<uint32_t>((*features)[0]))) {

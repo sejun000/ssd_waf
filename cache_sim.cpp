@@ -238,6 +238,7 @@ int main(int argc, char* argv[]) {
     uint64_t cold_capacity = 0;
     int lba_scale = 1;
     bool lba_remap = false;
+    int repeat = 1;
 
     // 추가 인자 파싱
     for (int i = 3; i < argc; i++) {
@@ -274,6 +275,8 @@ int main(int argc, char* argv[]) {
             periodic_ratio = std::stod(argv[++i]);
         } else if (arg == "--lba_remap") {
             lba_remap = true;
+        } else if (arg == "--repeat" && i + 1 < argc) {
+            repeat = std::stoi(argv[++i]);
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -294,6 +297,7 @@ int main(int argc, char* argv[]) {
     printf("periodic_ratio = %.2f\n", periodic_ratio);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
     printf("lba_remap = %s\n", lba_remap ? "enabled" : "disabled");
+    printf("repeat = %d\n", repeat);
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
@@ -322,62 +326,59 @@ int main(int argc, char* argv[]) {
     long long read_hit_size = 0, write_hit_size = 0;
     long long cache_write_size = 0, cold_tier_write_size = 0, cold_tier_read_size = 0;
     
-    std::ifstream infile(trace_file);
-    if (!infile) {
-        std::cerr << "File Error" << std::endl;
-        std::cerr << "Cannot open file: " << trace_file << std::endl;
-        return 1;
-    }
-    
-    std::string line;
-    long long line_count = 0;
-    const long long line_count_limit = 270000000000000000ULL;
-    
-    while (std::getline(infile, line) && line_count < line_count_limit) {
-        line_count++;
-        if (line_count % 1000000 == 0) {
-            print_stats(true, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
+    for (int rep = 0; rep < repeat; ++rep) {
+        if (rep > 0) {
+            printf("[repeat] starting pass %d/%d\n", rep + 1, repeat);
         }
-        cache->print_stats();
-        if (static_cast<uint64_t>(cache_write_size) > CACHE_WRITE_SIZE_LIMIT) {
-            break;
+        std::ifstream infile(trace_file);
+        if (!infile) {
+            std::cerr << "File Error" << std::endl;
+            std::cerr << "Cannot open file: " << trace_file << std::endl;
+            return 1;
         }
-        // 사용자 구현 parse_trace 함수 호출
-        ParsedRow parsed = parser->parseTrace(line);
-        // printf ("parsed.dev_id = %s, parsed.op_type = %s, parsed.lba_offset = %lld, parsed.lba_size = %d, parsed.timestamp = %f\n", parsed.dev_id.c_str(), parsed.op_type.c_str(), parsed.lba_offset, parsed.lba_size, parsed.timestamp);
-        if (parsed.dev_id.empty()) {
-            continue;
-        }
-        parsed.lba_offset *= lba_scale;
-        parsed.lba_size   *= lba_scale;
-        long long write_bytes_to_cache;
-        long long evicted_blocks;
-        if (parsed.op_type == "R" || parsed.op_type == "RS") {
-            std::tie(write_bytes_to_cache, evicted_blocks, write_hit_size) = cache->get_status();
-            //if (cache.is_cache_filled()) {
+
+        std::string line;
+        long long line_count = 0;
+        const long long line_count_limit = 270000000000000000ULL;
+        bool limit_hit = false;
+
+        while (std::getline(infile, line) && line_count < line_count_limit) {
+            line_count++;
+            if (line_count % 1000000 == 0) {
+                print_stats(true, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
+            }
+            cache->print_stats();
+            if (static_cast<uint64_t>(cache_write_size) > CACHE_WRITE_SIZE_LIMIT) {
+                limit_hit = true;
+                break;
+            }
+            ParsedRow parsed = parser->parseTrace(line);
+            if (parsed.dev_id.empty()) {
+                continue;
+            }
+            parsed.lba_offset *= lba_scale;
+            parsed.lba_size   *= lba_scale;
+            long long write_bytes_to_cache;
+            long long evicted_blocks;
+            if (parsed.op_type == "R" || parsed.op_type == "RS") {
+                std::tie(write_bytes_to_cache, evicted_blocks, write_hit_size) = cache->get_status();
                 total_read++;
                 total_read_size += parsed.lba_size;
-            //}
-            if (policy == "all" || policy == "read-only") {
-                issue_op_to_cache(*cache, parsed.lba_offset, parsed.lba_size, OP_TYPE::READ);
-            }
-        } else if (parsed.op_type == "W" || parsed.op_type == "WS") {
-            std::tie(write_bytes_to_cache, evicted_blocks, write_hit_size) = cache->get_status();
-            
-            //if (cache.is_cache_filled()) {
+                if (policy == "all" || policy == "read-only") {
+                    issue_op_to_cache(*cache, parsed.lba_offset, parsed.lba_size, OP_TYPE::READ);
+                }
+            } else if (parsed.op_type == "W" || parsed.op_type == "WS") {
+                std::tie(write_bytes_to_cache, evicted_blocks, write_hit_size) = cache->get_status();
                 total_write++;
                 total_write_size += parsed.lba_size;
                 cache_write_size = write_bytes_to_cache;
                 cold_tier_write_size = block_size * evicted_blocks;
-            //}
-            if (policy == "all" || policy == "write-only") {
-                issue_op_to_cache(*cache, parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
+                if (policy == "all" || policy == "write-only") {
+                    issue_op_to_cache(*cache, parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
+                }
             }
-            if (policy == "write-only") {
-             //   cache->print_cache_trace(parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
-            }
-
         }
+        if (limit_hit) break;
     }
     
     double final_read_hit_ratio, final_write_hit_ratio;

@@ -18,10 +18,14 @@
 namespace {
 
 // The training pipeline expects features in this order:
-// [LBA, freq_bit, freq_bit2, interval_bit, seg_accessed, prev_lba]
-// The runtime feature collector builds: [LBA, prev_lba, interval, freq_bit, freq_bit2, seg_accessed]
+// [LBA, freq_bit, freq_bit2, interval_bit, seg_accessed, prev_lba, was_read]
+// The runtime feature collector builds: [LBA, prev_lba, interval, freq_bit, freq_bit2, seg_accessed, was_read]
 // Use this permutation to map runtime->model order.
+#ifdef DOGI_READ_FEATURE
+constexpr int kFeaturePermute[MlpInference::kInputDim] = {0, 3, 4, 2, 5, 1, 6};
+#else
 constexpr int kFeaturePermute[MlpInference::kInputDim] = {0, 3, 4, 2, 5, 1};
+#endif
 
 void *aligned_malloc64(size_t bytes) {
   void *p = nullptr;

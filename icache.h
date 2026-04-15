@@ -109,6 +109,7 @@ public:
     void set_start_ts(const std::string& ts) { start_ts_ = ts; }
     const std::string& start_ts() const { return start_ts_; }
     void rename_stat_log(const std::string& new_name);
+    void rename_compare_log(const std::string& new_name);
     PageMappingFTL ftl;
     long long write_size_to_cache;
     long long evicted_blocks;
@@ -116,10 +117,13 @@ public:
     long long next_write_size_to_cache;
     FILE *fp;
     FILE *fp_stats = nullptr;
+    FILE *fp_compare = nullptr;
     FILE *fp_object = nullptr;
 protected:
     std::string stats_prefix_;
     std::string start_ts_;
 };
+
+extern uint64_t g_dogi_hot_bir;  // DOGI hot group BIR, updated by DogiStream
 
 ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88);

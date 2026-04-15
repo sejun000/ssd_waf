@@ -6,11 +6,13 @@
 #include <stdexcept>
 #include <list>
 #include <set>
+#include <sstream>
 
 extern uint64_t interval;
 extern double g_segment_blocks;
 extern uint64_t g_threshold;
 extern uint64_t g_timestamp;
+#include "dogi/app/global.h"
 
 /* ------------------------------------------------------------------ */
 /* ctor / dtor                                                        */
@@ -393,10 +395,11 @@ void LogCache::batch_insert(int stream_id,
             take_inv_snapshot();
         }
 
-        /* proactive GC: 1 segment per batch, like async impl */
-        if (log_cache_timestamp % (segment_size_blocks / 2) == 0 && free_pool.size() <= 10) {
-            check_and_evict_if_needed(1);
-        }
+        /* proactive GC disabled: let segments accumulate more invalidations
+         * before GC. Only emergency GC (free_pool <= 3) remains. */
+        // if (log_cache_timestamp % (segment_size_blocks / 2) == 0 && free_pool.size() <= 10) {
+        //     check_and_evict_if_needed(1);
+        // }
     }
     /* async-like: max 1 segment per batch_insert call, not burst */
     /*if (free_pool.size() <= 10) {
@@ -445,11 +448,17 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
         assert(loc.idx < loc.seg->blocks.size());
         if (loc.seg->blocks[loc.idx].valid)
         {
-            previous_blk_create_timestamp = loc.seg->blocks[loc.idx].create_timestamp;
+            // Use SEGMENT's creation timestamp (like DOGI Manager::GetSegmentAge)
+            // not block's timestamp, to match DOGI's 8-bit counter semantics.
+            previous_blk_create_timestamp = loc.seg->create_timestamp;
             blk_was_read = loc.seg->blocks[loc.idx].was_read;
         }
     }
     int stream_id = stream_policy->Classify(key, gc, log_cache_timestamp, previous_blk_create_timestamp, blk_was_read);
+    if (stream_id >= 0 && static_cast<size_t>(stream_id) < g_dogi_host_active_counts.size()) {
+        if (gc) ++g_dogi_gc_active_counts[stream_id];
+        else ++g_dogi_host_active_counts[stream_id];
+    }
     assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
 
     // Cycle wrap detected → dummy fill old active GC segments before reuse
@@ -547,8 +556,34 @@ void LogCache::check_and_evict_if_needed(int max_victims)
     int processed = 0;
     static constexpr int COMPACT_STALL_LIMIT = 12;
     int compact_stall_count = 0;
-    while (free_pool.size() <= 3 ||
-           (max_victims > 0 && processed < max_victims && free_pool.size() <= 10))
+
+    auto should_gc = [&]() -> bool {
+        if (dogi_gc_trigger_) {
+            if (free_pool.size() <= 3) return true;
+            std::size_t open_segs = active_seg.size() + gc_active_seg.size();
+            std::size_t used_segs = all_segments.size() - free_pool.size();
+            std::size_t sealed_segs = (used_segs > open_segs) ? (used_segs - open_segs) : 0;
+            if (sealed_segs == 0) return false;
+            uint64_t sealed_valid_blocks = 0;
+            for (const auto &seg_uptr : all_segments) {
+                const auto *seg = seg_uptr.get();
+                if (!seg) continue;
+                int class_num = seg->class_num;
+                bool is_free = std::find(free_pool.begin(), free_pool.end(), seg) != free_pool.end();
+                if (is_free) continue;
+                if (active_seg.count(class_num) && active_seg.at(class_num) == seg) continue;
+                if (gc_active_seg.count(class_num) && gc_active_seg.at(class_num) == seg) continue;
+                sealed_valid_blocks += seg->valid_cnt;
+            }
+            uint64_t total_used_blocks = sealed_segs * segment_size_blocks;
+            double invalid_ratio = 1.0 - (double)sealed_valid_blocks / total_used_blocks;
+            return invalid_ratio >= dogi_gc_threshold_;
+        }
+        return free_pool.size() <= 3 ||
+               (max_victims > 0 && processed < max_victims && free_pool.size() <= 10);
+    };
+
+    while (should_gc())
     {
         /* compactor가 있으면 항상 compact (evict 경로 제거) */
         bool compact = (compactor != nullptr);
@@ -570,6 +605,10 @@ void LogCache::check_and_evict_if_needed(int max_victims)
 
         //printf("compact %d\n", compact);
         assert (victim != nullptr);
+        if (victim->class_num >= 0 &&
+            static_cast<size_t>(victim->class_num) < g_dogi_gc_victim_class_counts.size()) {
+            ++g_dogi_gc_victim_class_counts[victim->class_num];
+        }
         gc_victim_count++;
         gc_victim_valid_ratio_sum += (double)victim->valid_cnt / victim->blocks.size();
         if (victim->valid_cnt == 0) {
@@ -708,8 +747,9 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
             target_seg = get_segment_to_active_stream(true, assigned_class_num);
         }
         assert(target_seg != s);
-        // get p2L index
-        if (target_seg->create_timestamp > blk.create_timestamp) {
+        // DOGI mode: keep segment's original creation timestamp (like DOGI Manager).
+        // Default: pull segment timestamp to oldest block (legacy behavior).
+        if (!dogi_keep_seg_timestamp_ && target_seg->create_timestamp > blk.create_timestamp) {
             target_seg->create_timestamp = blk.create_timestamp;
         }
 
@@ -1028,6 +1068,35 @@ void LogCache::print_stats() {
         fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu gc_victim_avg_valid_ratio: %.6f gc_victim_count: %lu dummy_fill_segments: %lu\n",
                 prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks, avg_victim_valid_ratio, gc_victim_count, dummy_fill_segment_count);
         fflush(fp_stats);
+        if (fp_compare) {
+            auto fmt_counts = [](const std::array<uint64_t, 40> &counts) {
+                std::ostringstream oss;
+                for (size_t i = 0; i < counts.size(); ++i) {
+                    if (i) oss << ",";
+                    oss << i << ":" << counts[i];
+                }
+                return oss.str();
+            };
+            double waf = write_size_to_cache > 0
+                ? (static_cast<double>(write_size_to_cache) + static_cast<double>(compacted_blocks) * 4096.0) /
+                  static_cast<double>(write_size_to_cache)
+                : 0.0;
+            fprintf(fp_compare,
+                    "%s host_write_bytes=%llu gc_write_blocks=%lu waf=%.6f host_hot=%lu host_cold=%lu gc_frozen=%lu gc_nonfrozen=%lu gc_victim_count=%lu host_active=%s gc_active=%s victim_class=%s\n",
+                    prefix_cstr,
+                    write_size_to_cache,
+                    compacted_blocks,
+                    waf,
+                    g_dogi_host_hot_writes,
+                    g_dogi_host_cold_writes,
+                    g_dogi_gc_frozen_writes,
+                    g_dogi_gc_nonfrozen_writes,
+                    gc_victim_count,
+                    fmt_counts(g_dogi_host_active_counts).c_str(),
+                    fmt_counts(g_dogi_gc_active_counts).c_str(),
+                    fmt_counts(g_dogi_gc_victim_class_counts).c_str());
+            fflush(fp_compare);
+        }
         next_written_bytes += written_window_bytes;
     }
 }

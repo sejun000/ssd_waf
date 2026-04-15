@@ -7,11 +7,13 @@
 #include "midas_cache.h"
 #include "fairywren_cache.h"
 #include "dogi_cache.h"
+#include "dogi_stream.h"
 #include "evict_policy_fifo.h"
 #include "evict_policy_fifo_zero.h"
 #include "evict_policy_greedy.h"
 #include "evict_policy_cost_benefit.h"
 #include "evict_policy_cb_greedy.h"
+#include "readwrite_stream.h"
 #include "evict_policy_lambda.h"
 #include "evict_policy_selective_fifo.h"
 #include "evict_policy_k_cost_benefit.h"
@@ -43,6 +45,27 @@ double score_age(Segment *seg) {
 
 uint64_t g_threshold = 0;
 uint64_t g_timestamp = 0;
+
+// DOGI expired-first victim selection globals
+uint64_t g_dogi_hot_bir = 2 * 98304;  // BIR[0] = hotThreshold * kSegmentBlocks = 196608 blocks
+
+// DOGI expired-first score: hot group segments past BIR get highest priority,
+// rest use cost-benefit (gp/(1-gp) * sqrt(age)), mirroring DogiSelect.
+static double score_dogi_expired_first(Segment *seg) {
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+    uint64_t age = g_timestamp > 0 ? (g_timestamp - seg->create_timestamp) : 0;
+
+    // Hot group (class_num 0): expired if age > BIR → highest priority
+    if (seg->class_num == 0 && age > g_dogi_hot_bir) {
+        return 1e18 + static_cast<double>(age);  // huge base + age tiebreak
+    }
+
+    // All other segments: cost-benefit like DogiSelect
+    if (u < 0.0001) u = 0.0001;
+    double gp = 1.0 - u;  // invalid ratio
+    return gp / (1.0 - gp) * sqrt(static_cast<double>(age));
+}
 
 // Score functions for CbEvictPolicy (same as icache.cpp)
 /*static double score_age_evict(Segment *seg) {
@@ -79,7 +102,6 @@ static inline bool is_old_cycle_segment(Segment *seg) {
 }
 
 static double score_warm_first(Segment *seg) {
-    if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
     if (u >= 0.95) return 0;
@@ -193,6 +215,8 @@ T* attach_prefix(T* cache, const std::string& prefix, const std::string& start_t
     if (cache) {
         cache->set_stats_prefix(prefix);
         cache->set_start_ts(start_ts);
+        std::string compare_name = prefix + ".dogi_cmp.log." + start_ts;
+        cache->rename_compare_log(compare_name);
         if (!keep_stat_log) {
             std::string stat_name = prefix + ".stat.log." + start_ts;
             cache->rename_stat_log(stat_name);
@@ -236,7 +260,9 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         return attach_prefix(new NoCache(cold_capacity, cache_block_size, waf_log_file), cache_type, start_ts);
     }
     else if (cache_type == "DOGI") {
-        return attach_prefix(new DogiCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file), cache_type, start_ts);
+        const char* no_ml = std::getenv("DOGI_NO_ML");
+        const std::string dogi_prefix = (no_ml != nullptr) ? "DOGI_NOML" : "DOGI_ML";
+        return attach_prefix(new DogiCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file), dogi_prefix, start_ts);
     }
     else if (cache_type == "LOG_GREEDY") {
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file), cache_type, start_ts);
@@ -495,7 +521,16 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             nullptr, input_stream_policy, 0.85, std::make_unique<CbEvictPolicy>(score_greedy_first), 0, false), cache_type, start_ts);
     }
     else if (cache_type == "LOG_HOTCOLD_CIRCULAR_WARM_85") {
-        IStream *input_stream_policy = createIstreamPolicy("readwrite_hotcold_circular");
+        uint64_t coldest_threshold = static_cast<uint64_t>(capacity * 1.67);
+        IStream *input_stream_policy = new ReadWriteStream(false, IStream::kDefaultGcStreams, interval, true, coldest_threshold);
+        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.85, std::make_unique<CbGreedyEvictPolicy>(score_sepbit_age), 0, false,
+            "", 0.0, 0.0, 0.0, 2.88, true), cache_type, start_ts);
+    }
+    else if (cache_type == "LOG_HOTCOLD_BOTH_CIRCULAR_85") {
+        uint64_t coldest_threshold = static_cast<uint64_t>(capacity * 1.3);
+        IStream *input_stream_policy = new ReadWriteStream(true, 3, interval, true, coldest_threshold);
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
             nullptr, input_stream_policy, 0.85, std::make_unique<CbGreedyEvictPolicy>(score_sepbit_age), 0, false,
@@ -525,6 +560,43 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
             nullptr, input_stream_policy, 0.85, std::make_unique<CbGreedyEvictPolicy>(score_sepbit_age), 0, false), cache_type, start_ts);
+    }
+    else if (cache_type == "LOG_DOGI_HEURISTIC_88") {
+        // renew_on_read OFF, expired-first victim selection
+        auto *dogi_stream = new DogiStream(/*num_gc_streams=*/6);
+        // Warmup: match DOGI standalone pass_time_blocks = logical_device_blocks
+        // LogicalSizeGb ~ capacity / (1+OP) / 1e9; pass_time_blocks = LogicalSizeGb * 1e9 / 4096
+        uint64_t logical_bytes = static_cast<uint64_t>(capacity * cache_block_size / 1.13636);
+        dogi_stream->setPassTimeBlocks(logical_bytes / 4096);
+        IStream *input_stream_policy = dogi_stream;
+        auto *lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.88, std::make_unique<CbEvictPolicy>(score_dogi_expired_first), 0, false,
+            "", 0.0, 0.0, 0.0, 2.88, false);
+        lc->setDogiGcMode(true, 0.12);
+        lc->setDogiKeepSegTimestamp(true);
+        return attach_prefix(lc, cache_type, start_ts);
+    }
+    else if (cache_type == "LOG_DOGI_HEURISTIC_ROR_88") {
+        // renew_on_read ON, expired-first victim selection
+        IStream *input_stream_policy = createIstreamPolicy("dogi_heuristic");
+        auto *lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.88, std::make_unique<CbEvictPolicy>(score_dogi_expired_first), 0, false,
+            "", 0.0, 0.0, 0.0, 2.88, true);
+        lc->setDogiGcMode(true, 0.12);
+        lc->setDogiKeepSegTimestamp(true);
+        return attach_prefix(lc, cache_type, start_ts);
+    }
+    else if (cache_type == "LOG_DOGI_HEURISTIC_85") {
+        IStream *input_stream_policy = createIstreamPolicy("dogi_heuristic");
+        auto *lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.85, std::make_unique<CbEvictPolicy>(score_dogi_expired_first), 0, false,
+            "", 0.0, 0.0, 0.0, 2.88, false);
+        lc->setDogiGcMode(true, 0.15);
+        lc->setDogiKeepSegTimestamp(true);
+        return attach_prefix(lc, cache_type, start_ts);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD_80") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
@@ -778,6 +850,8 @@ ICache::ICache(uint64_t cold_capacity, const std::string& waf_log_file, const st
     }
     std::string object_log_file = "object.log.";
     object_log_file += get_timestamp();
+    std::string compare_log_file = "dogi_cmp.log.";
+    compare_log_file += get_timestamp();
     fp = fopen(waf_log_file.c_str(), "w");
     if (fp == NULL) {
         std::cerr << "Cannot open file: " << waf_log_file << std::endl;
@@ -793,10 +867,16 @@ ICache::ICache(uint64_t cold_capacity, const std::string& waf_log_file, const st
         std::cerr << "Cannot open file: " << object_log_file << std::endl;
         exit(1);
     }
+    fp_compare = fopen(compare_log_file.c_str(), "w");
+    if (fp_compare == NULL) {
+        std::cerr << "Cannot open file: " << compare_log_file << std::endl;
+        exit(1);
+    }
     
     printf("waf log : %s, stat log : %s, object log : %s\n", waf_log_file.c_str(), stat_log_file.c_str(), object_log_file.c_str());
     assert(fp != NULL);
     assert(fp_stats != NULL);
+    assert(fp_compare != NULL);
     assert(fp_object != NULL);
 }
 
@@ -816,6 +896,17 @@ void ICache::rename_stat_log(const std::string& new_name) {
     fp_stats = fopen(new_name.c_str(), "w");
     if (fp_stats) {
         printf("stat log renamed to: %s\n", new_name.c_str());
+    }
+}
+
+void ICache::rename_compare_log(const std::string& new_name) {
+    if (fp_compare) {
+        fclose(fp_compare);
+        fp_compare = nullptr;
+    }
+    fp_compare = fopen(new_name.c_str(), "w");
+    if (fp_compare) {
+        printf("compare log renamed to: %s\n", new_name.c_str());
     }
 }
 

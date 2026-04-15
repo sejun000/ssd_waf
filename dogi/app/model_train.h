@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <cstdlib>
+#include "app/mlp_inference.h"
 
 /*
 * Bitmap class to track sampled LBAs for model training
@@ -165,11 +166,11 @@ public:
     * @param featuretime Timestamp associated with the feature set
     * @param isHot Boolean indicating if the block is classified as hot
     */
-    void SaveTrainingData(std::array<uint64_t, 6>* features, uint64_t featuretime, bool isHot);
+    void SaveTrainingData(std::array<uint64_t, MlpInference::kInputDim>* features, uint64_t featuretime, bool isHot);
 
     void MakingMLModel();
 private:
-    void _SaveTrainingData(std::array<uint64_t, 6>* features, uint64_t featuretime);
+    void _SaveTrainingData(std::array<uint64_t, MlpInference::kInputDim>* features, uint64_t featuretime);
     void _SaveTrueLBAData(uint64_t LBA, uint64_t featuretime,bool force_save = false);
     void _MakingNewFile(uint64_t featuretime);
     void _CleanUp();

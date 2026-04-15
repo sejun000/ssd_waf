@@ -1,7 +1,9 @@
 #include "src/placement/dogi.h"
+#include "src/logstore/manager.h"
 #include "app/classifier.h"
 #include "app/global.h"
 #include "app/group_optimizer.h"
+#include <algorithm>
 
 DOGI::DOGI() {}
 
@@ -23,16 +25,20 @@ int DOGI::Classify(uint32_t blockAddr, bool isGcAppend, uint64_t /*Age*/, uint32
   uint64_t filterValue = FrozenFilterManager::Instance().Query(blockAddr);
   if (filterValue == (uint64_t)0) {
     // frozen -> send to frozen group (original behavior)
+    ++g_dogi_gc_frozen_writes;
     return NumGroup - 1;
   }
+  ++g_dogi_gc_nonfrozen_writes;
 
   // 'category' carries category on first GC; otherwise -1 for later GCs
   int next = MapCategoryFirstGc(category, static_cast<int>(PrevClass));
-  if (APPLY_ML && (++gcPrintCounter % kPrintEvery == 0)) {
-    //printf("GC category: %d, PrevGroup: %u -> NextGroup: %d\n", category, PrevClass, next);
+
+  // Read optimization: if block was read since last write → go hotter (-1).
+  // Stay within GC groups only (group 2+), don't invade user write groups (0, 1).
+  if (g_dogi_read_opt && g_dogi_last_read_ts.count(blockAddr)) {
+    next = std::max(static_cast<int>(PrevClass) - 1, 2);
   }
-  //if (next < 0) next = PrevClass;
-  //if (next >= static_cast<int>(NumGroup)) next = static_cast<int>(NumGroup) - 1;
+
   return next;
 }
 

@@ -3,6 +3,7 @@
 
 #include <stdint.h>  // uint32_t, uint64_t
 #include <stdio.h>   // FILE*
+#include <array>
 
 // Global configuration knobs shared across app components.
 extern char *PlacementName;
@@ -28,4 +29,18 @@ extern const uint64_t kSegmentBytes;          // bytes per segment
 inline uint64_t GetPassTimeBlocks() {
   return static_cast<uint64_t>(LogicalSizeGb) * 1000ull * 1000ull * 1000ull / kBlockBytes;
 }
+// Read optimization: global read tracker for GC relocation adjustment
+#include <unordered_map>
+extern bool g_dogi_read_opt;
+extern std::unordered_map<uint32_t, uint64_t> g_dogi_last_read_ts;
+
+// Cross-implementation DOGI comparison telemetry (cumulative counters).
+extern uint64_t g_dogi_host_hot_writes;
+extern uint64_t g_dogi_host_cold_writes;
+extern uint64_t g_dogi_gc_frozen_writes;
+extern uint64_t g_dogi_gc_nonfrozen_writes;
+extern std::array<uint64_t, 40> g_dogi_host_active_counts;
+extern std::array<uint64_t, 40> g_dogi_gc_active_counts;
+extern std::array<uint64_t, 40> g_dogi_gc_victim_class_counts;
+
 #endif // GLOBALS_H

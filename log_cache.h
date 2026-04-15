@@ -160,6 +160,19 @@ private:
     EwmaRatio compaction_ratio_in_ghost_cache;
     double periodic_ratio_ = 2.88;
     bool renew_on_read_ = false;
+
+    /* DOGI-style options (independent flags) */
+    bool dogi_gc_trigger_ = false;       // invalid ratio based GC trigger
+    bool dogi_keep_seg_timestamp_ = false; // don't pull segment timestamp to oldest block on compaction
+    double dogi_gc_threshold_ = 0.12;
+public:
+    void setDogiGcMode(bool trigger, double threshold = 0.12) {
+        dogi_gc_trigger_ = trigger;
+        dogi_gc_threshold_ = threshold;
+    }
+    void setDogiKeepSegTimestamp(bool on) {
+        dogi_keep_seg_timestamp_ = on;
+    }
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
     uint64_t ghost_compacted_blocks = 0;

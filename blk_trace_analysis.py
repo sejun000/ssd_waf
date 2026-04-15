@@ -28,7 +28,7 @@ def estimate_device_size(file_path, trace_format):
     
     return max_value  # 블록 크기를 4KB로 가정하고 크기 근사
 
-def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate='', scale=1, periodic_ratio=None, lba_remap=False):
+def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='csv', cache_policy="LRU", valid_rate='', scale=1, periodic_ratio=None, lba_remap=False, repeat=1):
     """캐시 크기를 1%, 5%, 10%, 15%, 20%, 25%, 30%로 변경하며 실행"""
     #cache_ratios = [0.125]
     cache_ratios = [0.125]
@@ -69,6 +69,8 @@ def run_cache_analysis(trace_file, device_size, rw_policy='all', trace_format='c
             base_args += ["--fill"]
             if lba_remap:
                 base_args += ["--lba_remap"]
+            if repeat > 1:
+                base_args += ["--repeat", str(repeat)]
             if scale != 1:
                 base_args += ["--scale", str(scale)]
             if (valid_rate != ''):
@@ -98,9 +100,10 @@ if __name__ == "__main__":
     parser.add_argument("--scale", type=int, default=1, help="LBA scale factor (e.g. 2 = lba*2, size*2)")
     parser.add_argument("--periodic_ratio", type=float, default=None, help="Periodic ratio for ghost cache eviction decision (default: 2.88)")
     parser.add_argument("--lba_remap", action="store_true", help="Pass --lba_remap to cache_sim (log-append style LBA remapping)")
+    parser.add_argument("--repeat", type=int, default=1, help="Replay trace N times (default: 1)")
     #[prefill] done, total 2174461292544 bytes (target 3288206467072, align 4096)
     #parser.add_argument("--device_size", type=int, default=501861437440, help="Device size in bytes") # lsmtree
     args = parser.parse_args()
     estimated_device_size = args.device_size
     print(f"Estimated Device Size: {estimated_device_size} bytes")
-    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate, args.scale, args.periodic_ratio, args.lba_remap)
+    run_cache_analysis(args.trace_file, estimated_device_size, args.rw_policy, args.trace_format, args.cache_policy, args.valid_rate, args.scale, args.periodic_ratio, args.lba_remap, args.repeat)

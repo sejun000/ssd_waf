@@ -13,7 +13,7 @@
 #include "app/group_optimizer.h"
 
 uint64_t Manager::globalTimestamp = 0;
-Manager::Manager(int numOpenSegments) {
+Manager::Manager(int numOpenSegments, uint64_t maxSegments) : mMaxSegments(maxSegments) {
   mIndexMap = std::unique_ptr<IndexMap>(IndexMapFactory::GetInstance(Config::GetInstance().indexMap));
   mPlacement = std::unique_ptr<Placement>(PlacementFactory::GetInstance(Config::GetInstance().placement));
   mStorageAdapter = std::unique_ptr<StorageAdapter>(StorageAdapterFactory::GetInstance(Config::GetInstance().storageAdapter));
@@ -78,6 +78,9 @@ void Manager::Append(const void *buf, off64_t addr, int group) {
   }
   // 'group' is treated as category (0=hot, 1..N=ML output)
   classId = mPlacement->Classify(blockAddr, false, (uint64_t)PrevAge, (uint32_t)PrevClass, /*category=*/static_cast<int>(group));
+  if (classId >= 0 && static_cast<size_t>(classId) < g_dogi_host_active_counts.size()) {
+    ++g_dogi_host_active_counts[classId];
+  }
 
   std::shared_ptr<DogiSegment> currentSegment = mOpenSegments[classId];
   newPhyAddr = currentSegment->Append(blockAddr, /*category=*/static_cast<int>(group));
@@ -125,6 +128,9 @@ bool Manager::GcAppend(const void *buf, uint32_t blockAddr, off64_t oldPhyAddr) 
   CurrClass = oldSegment->GetClassNum();
   int catState = oldSegment->GetCategory(oldPhyAddr % kSegmentBlocks);
   classId = mPlacement->Classify(blockAddr, true, (uint64_t)CurrAge, (uint32_t)CurrClass, /*category=*/catState);
+  if (classId >= 0 && static_cast<size_t>(classId) < g_dogi_gc_active_counts.size()) {
+    ++g_dogi_gc_active_counts[classId];
+  }
   HotIntervalTracker::Instance().AccumulateGcAge(blockAddr, CurrAge);
 
   std::shared_ptr<DogiSegment> currentSegment = mOpenSegments[classId];

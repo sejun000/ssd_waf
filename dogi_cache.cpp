@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <sys/types.h>
 
 // DOGI headers
@@ -83,11 +84,13 @@ DogiCache::DogiCache(uint64_t cold_capacity,
     // BIR[0] is the upper bound of Hot Filter (in blocks); paper init = 2 * kSegmentBlocks.
     BIR[0] = 2ull * kSegmentBlocks;
 
-    printf("[DOGI] init: LogicalSizeGb=%d OpRatio=%.4f GpThreshold=%.4f NumGroup=%u kSegmentBlocks=%lu\n",
-           LogicalSizeGb, OpRatio, GpThreshold, NumGroup, (unsigned long)kSegmentBlocks);
+    // Max segments = physical cache capacity / segment size.
+    const uint64_t maxSegments = cache_bytes / kSegmentBytes;
+    printf("[DOGI] init: LogicalSizeGb=%d OpRatio=%.4f GpThreshold=%.4f NumGroup=%u kSegmentBlocks=%lu maxSegments=%lu\n",
+           LogicalSizeGb, OpRatio, GpThreshold, NumGroup, (unsigned long)kSegmentBlocks, (unsigned long)maxSegments);
 
     // Construct Manager directly (no LogStore wrapper -> no buse dependency).
-    manager_ = std::make_unique<Manager>(static_cast<int>(NumGroup));
+    manager_ = std::make_unique<Manager>(static_cast<int>(NumGroup), maxSegments);
 
     // Selection: dispatched via factory using Config; mirrors Scheduler::Scheduler() body.
     selection_.reset(SelectionFactory::GetInstance(Config::GetInstance().selection));
@@ -106,8 +109,16 @@ DogiCache::DogiCache(uint64_t cold_capacity,
 
     pass_time_blocks_ = GetPassTimeBlocks();
 
-    // Try to load any pre-existing trained model (matches main.cc startup).
-    {
+    // DOGI_NO_ML=1 disables model loading and training entirely (heuristic-only mode).
+    no_ml_ = std::getenv("DOGI_NO_ML") != nullptr;
+    // DOGI_READ_OPT=1 enables read-aware GC relocation (+1 colder group if recently read).
+    read_opt_ = std::getenv("DOGI_READ_OPT") != nullptr;
+    g_dogi_read_opt = read_opt_;
+
+    if (no_ml_) {
+        printf("[DOGI] ML disabled (DOGI_NO_ML set)\n");
+    } else {
+        // Try to load any pre-existing trained model (matches main.cc startup).
         auto pair = ResolveModelDirAndName();
         if (!pair.first.empty()) {
             std::string err;
@@ -152,7 +163,10 @@ void DogiCache::batch_insert(int /*stream_id*/,
 {
     if (newBlocks.empty()) return;
     if (op_type == OP_TYPE::READ) {
-        // DOGI prototype's main.cc only handles writes (op==1). Skip reads.
+        // Always track reads (used by ML feature was_read + GC read opt)
+        for (auto [key, lba_sz] : newBlocks) {
+            g_dogi_last_read_ts[static_cast<uint32_t>(key)] = logical_time_;
+        }
         return;
     }
 
@@ -167,6 +181,8 @@ void DogiCache::batch_insert(int /*stream_id*/,
         auto hotResult = hot_classifier_->Classify(lba, segmentAge);
         const bool isHot = (logical_time_ > pass_time_blocks_) ? hotResult.isHot : false;
         const uint64_t interval = static_cast<uint64_t>(hotResult.interval);
+        if (isHot) ++g_dogi_host_hot_writes;
+        else ++g_dogi_host_cold_writes;
 
         buffer_.push_back({lba, interval, isHot});
         if (!isHot) ++non_hot_count_;
@@ -206,7 +222,10 @@ void DogiCache::flush_buffer() {
             static_cast<uint64_t>(w.interval),
             static_cast<uint64_t>(bits),
             static_cast<uint64_t>(bitCount),
-            static_cast<uint64_t>(segFreq)
+            static_cast<uint64_t>(segFreq),
+#ifdef DOGI_READ_FEATURE
+            g_dogi_last_read_ts.count(static_cast<uint32_t>(w.lba)) ? 1ULL : 0ULL,
+#endif
         };
         prev_lba_ = w.lba;
         ++feature_time_;
@@ -241,6 +260,8 @@ void DogiCache::flush_buffer() {
             category = mlPred[predIdx] + 1;
             ++predIdx;
         }
+        // Clear read timestamp on write (track "read since last write")
+        if (read_opt_) g_dogi_last_read_ts.erase(static_cast<uint32_t>(w.lba));
         // Manager::Append expects byte-addressed logical address; null adapter ignores buf.
         manager_->Append(/*buf=*/nullptr,
                          /*addr=*/static_cast<off64_t>(w.lba) * 4096,
@@ -257,7 +278,14 @@ void DogiCache::flush_buffer() {
 }
 
 void DogiCache::run_inline_gc() {
-    while (manager_->GetGp() >= GpThreshold) {
+    // GC when: invalid ratio too high OR segment count at physical capacity limit.
+    auto need_gc = [&]() {
+        if (manager_->GetGp() >= GpThreshold) return true;
+        uint64_t maxSeg = manager_->GetMaxSegments();
+        if (maxSeg > 0 && manager_->GetSegmentCount() >= maxSeg) return true;
+        return false;
+    };
+    while (need_gc()) {
         // Mirror Scheduler::scheduling() inner loop body.
         std::vector<DogiSegment> segments;
         manager_->GetSegments(segments);
@@ -265,8 +293,13 @@ void DogiCache::run_inline_gc() {
         auto res = selection_->Select(segments);
         if (res.empty()) break;
         const int sid = res[0].second;
-
         DogiSegment seg = manager_->ReadSegment(sid);
+        const int victim_class = seg.GetClassNum();
+        if (victim_class >= 0 &&
+            static_cast<size_t>(victim_class) < g_dogi_gc_victim_class_counts.size()) {
+            ++g_dogi_gc_victim_class_counts[victim_class];
+        }
+
         manager_->CollectSegment(seg.GetSegmentId());
         uint64_t nRewrite = 0;
         for (uint64_t i = 0; i < kSegmentBlocks; ++i) {
@@ -284,9 +317,8 @@ void DogiCache::run_inline_gc() {
 }
 
 void DogiCache::try_run_config_step() {
-    // Mirror configWorker thread: once enough samples are collected, train ML +
-    // reload + run group optimizer. Run only once per training cycle.
-    if (config_applied_) return;
+    if (no_ml_) return;
+    // Mirror configWorker: runs every time IsCollectingDone() fires (repeating, not one-shot).
     if (!model_trainer_->IsCollectingDone()) return;
 
     printf("[DOGI] training trigger fired (logical_time=%lu)\n", logical_time_);
@@ -309,11 +341,45 @@ void DogiCache::try_run_config_step() {
     if (ok) {
         APPLY_ML = 1;
     }
-    config_applied_ = true;
     printf("[DOGI/GCONF] group optimizer %s (APPLY_ML=%d)\n", ok ? "success" : "failed", APPLY_ML);
 }
 
 void DogiCache::print_stats() {
-    // No-op: cache_sim calls print_stats() per trace line. DOGI's manager.cc
-    // already self-throttles PrintRealStats() every 20 GiB inside Manager::Append.
+    static uint64_t next_written_bytes = kSegmentBytes;
+    const uint64_t host_write_bytes = manager_ ? manager_->GetTotalUserWrites() * 4096ull : 0;
+    if (!fp_compare || host_write_bytes < next_written_bytes) return;
+
+    auto fmt_counts = [](const std::array<uint64_t, 40> &counts) {
+        std::ostringstream oss;
+        for (size_t i = 0; i < counts.size(); ++i) {
+            if (i) oss << ",";
+            oss << i << ":" << counts[i];
+        }
+        return oss.str();
+    };
+    const uint64_t gc_write_blocks = manager_ ? manager_->GetTotalGcWrites() : 0;
+    uint64_t gc_victim_count = 0;
+    for (uint64_t c : g_dogi_gc_victim_class_counts) gc_victim_count += c;
+    double waf = host_write_bytes > 0
+        ? (static_cast<double>(host_write_bytes) + static_cast<double>(gc_write_blocks) * 4096.0) /
+          static_cast<double>(host_write_bytes)
+        : 0.0;
+    const std::string &prefix = stats_prefix();
+    const char *prefix_cstr = prefix.empty() ? "DOGI" : prefix.c_str();
+    fprintf(fp_compare,
+            "%s host_write_bytes=%llu gc_write_blocks=%llu waf=%.6f host_hot=%lu host_cold=%lu gc_frozen=%lu gc_nonfrozen=%lu gc_victim_count=%llu host_active=%s gc_active=%s victim_class=%s\n",
+            prefix_cstr,
+            static_cast<unsigned long long>(host_write_bytes),
+            static_cast<unsigned long long>(gc_write_blocks),
+            waf,
+            g_dogi_host_hot_writes,
+            g_dogi_host_cold_writes,
+            g_dogi_gc_frozen_writes,
+            g_dogi_gc_nonfrozen_writes,
+            static_cast<unsigned long long>(gc_victim_count),
+            fmt_counts(g_dogi_host_active_counts).c_str(),
+            fmt_counts(g_dogi_gc_active_counts).c_str(),
+            fmt_counts(g_dogi_gc_victim_class_counts).c_str());
+    fflush(fp_compare);
+    next_written_bytes += 10ull * 1024ull * 1024ull * 1024ull;
 }

@@ -85,6 +85,8 @@ private:
     uint64_t pass_time_blocks_ = 0;
     uint32_t prev_lba_ = 0;
     bool config_applied_ = false;
+    bool no_ml_ = false;
+    bool read_opt_ = false;
 
     std::string latest_model_name_;
     std::string latest_model_dir_;

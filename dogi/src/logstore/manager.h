@@ -20,7 +20,7 @@ class Manager {
 
 public:
     static uint64_t globalTimestamp;
-    Manager(int numOpenSegments);
+    Manager(int numOpenSegments, uint64_t maxSegments = 0);
     ~Manager();
 
     // group <0: let placement decide; otherwise force class id
@@ -39,6 +39,10 @@ public:
     void CollectSegment(int id);
     uint32_t NewClassNum(uint32_t id);
 
+    uint64_t GetSegmentCount() const { return mSegments.size(); }
+    uint64_t GetMaxSegments() const { return mMaxSegments; }
+    uint64_t GetTotalUserWrites() const { return mTotalUserWrites; }
+    uint64_t GetTotalGcWrites() const { return mTotalGcWrites; }
     void GetSegments(std::vector<DogiSegment> &segs);
     DogiSegment ReadSegment(int id);
     uint64_t GetSegmentAge(uint32_t blockAddr);
@@ -52,6 +56,7 @@ private:
     std::vector<std::shared_ptr<DogiSegment>> mOpenSegments;
 
     uint64_t mCurrentSegmentId{};
+    uint64_t mMaxSegments = 0;  // 0 = unlimited (original DOGI behavior)
 
     uint64_t mTotalBlocks = 0;
     uint64_t mTotalInvalidBlocks = 0;

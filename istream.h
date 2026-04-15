@@ -13,6 +13,7 @@ public:
     }
     virtual int getNumHostStreams() const { return 2; }  // default: hot/cold
 static const int MAX_STREAMS = 40;
+    static constexpr int kDefaultGcStreams = 5;
 };
 
 IStream* createIstreamPolicy(std::string policy_type);

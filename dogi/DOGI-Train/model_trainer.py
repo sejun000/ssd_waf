@@ -87,13 +87,17 @@ DEFAULT_THRESHOLDS3 = np.array([335544.0, 671088.0, 1342176.0, 2684352.0,
 # Will be computed at runtime from loaded samples (balanced / equal-frequency groups)
 DEFAULT_THRESHOLDS4 = np.array([], dtype=np.float32)
 
-# Input features (6 features) - ORDER MUST MATCH mlp_inference.h
-# [LBA, freq_bit, freq_bit2, interval_bit, seg_accessed, prev_lba]
-INPUT_FEATURES = ['LBA', 'FreqBits', 'FreqBits2', 'Interval', 'SegFreq', 'PrevLBA']
+# Input features - ORDER MUST MATCH mlp_inference.h
+# Auto-detect: if CSV has 9 columns (idx + 7 features + real_interval) → 7 features
+#              if CSV has 8 columns (idx + 6 features + real_interval) → 6 features
+# Default to 6; overridden at runtime after reading CSV.
+INPUT_FEATURES_6 = ['LBA', 'FreqBits', 'FreqBits2', 'Interval', 'SegFreq', 'PrevLBA']
+INPUT_FEATURES_7 = ['LBA', 'FreqBits', 'FreqBits2', 'Interval', 'SegFreq', 'PrevLBA', 'WasRead']
+INPUT_FEATURES = INPUT_FEATURES_6  # default
 TARGET_FEATURE = 'RealInterval'
 
 # Model architecture - MUST MATCH mlp_inference.h
-INPUT_DIM = 6
+INPUT_DIM = 6  # auto-detected at runtime
 HIDDEN_LAYERS = [32, 32]  # kHidden1=32, kHidden2=32
 NUM_GROUPS = 10           # kOutputDim=10
 
