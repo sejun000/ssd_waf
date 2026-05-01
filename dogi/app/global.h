@@ -46,6 +46,8 @@ extern std::array<uint64_t, 40> g_dogi_gc_active_counts;
 extern std::array<uint64_t, 40> g_dogi_gc_victim_class_counts;
 extern std::array<uint64_t, 3>  g_nodap_victim_case_counts;
 extern std::array<std::array<uint64_t, 40>, 3> g_nodap_victim_case_x_class_counts;
+extern std::array<double, 3>    g_nodap_victim_case_valid_ratio_sum;
+extern std::array<int64_t, 40>  g_nodap_sealed_per_class;
 extern std::array<uint64_t, 12> g_dogi_host_age_bucket_counts;
 extern std::array<uint64_t, 12> g_dogi_host_est_bucket_counts;
 extern std::array<uint64_t, 12> g_dogi_victim_age_bucket_counts;

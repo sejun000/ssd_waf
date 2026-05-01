@@ -205,6 +205,10 @@ void LogCache::evict_policy_add(LogCacheSegment *s) {
     if (compactor) {
         compactor->add(s, log_cache_timestamp);
     }
+    if (g_nodap_num_groups > 0 && s->class_num >= 0 &&
+        static_cast<size_t>(s->class_num) < g_nodap_sealed_per_class.size()) {
+        ++g_nodap_sealed_per_class[s->class_num];
+    }
     if (dogi_gc_trigger_) {
         dogi_total_sealed_blocks_ += segment_size_blocks;
         // Per DOGI Manager::Append: at seal time, accumulate the segment's
@@ -672,6 +676,14 @@ void LogCache::check_and_evict_if_needed(int max_victims)
             if (idx >= 0 && static_cast<size_t>(idx) <
                 g_nodap_victim_case_x_class_counts[case_idx].size()) {
                 ++g_nodap_victim_case_x_class_counts[case_idx][idx];
+            }
+            g_nodap_victim_case_valid_ratio_sum[case_idx] +=
+                (seg_blocks > 0)
+                    ? static_cast<double>(victim->valid_cnt) / static_cast<double>(seg_blocks)
+                    : 0.0;
+            if (idx >= 0 && static_cast<size_t>(idx) <
+                g_nodap_sealed_per_class.size()) {
+                --g_nodap_sealed_per_class[idx];
             }
         }
         ++g_dogi_victim_age_bucket_counts[dogi_bucket_index(
@@ -1179,8 +1191,13 @@ void LogCache::print_stats() {
             std::string case0 = fmt_counts(g_nodap_victim_case_x_class_counts[0]);
             std::string case1 = fmt_counts(g_nodap_victim_case_x_class_counts[1]);
             std::string case2 = fmt_counts(g_nodap_victim_case_x_class_counts[2]);
+            std::string sealed_pc = fmt_counts(g_nodap_sealed_per_class);
+            auto case_avg_vr = [](int c) {
+                uint64_t n = g_nodap_victim_case_counts[c];
+                return n > 0 ? g_nodap_victim_case_valid_ratio_sum[c] / static_cast<double>(n) : 0.0;
+            };
             fprintf(fp_compare,
-                    "%s host_write_bytes=%llu gc_write_blocks=%lu waf=%.6f host_hot=%lu host_cold=%lu gc_frozen=%lu gc_nonfrozen=%lu gc_victim_count=%lu host_active=%s gc_active=%s victim_class=%s host_age_bucket=%s host_est_bucket=%s victim_age_bucket=%s victim_valid_ratio_bucket=%s nodap_case_total=%lu/%lu/%lu nodap_case0_x_class=%s nodap_case1_x_class=%s nodap_case2_x_class=%s\n",
+                    "%s host_write_bytes=%llu gc_write_blocks=%lu waf=%.6f host_hot=%lu host_cold=%lu gc_frozen=%lu gc_nonfrozen=%lu gc_victim_count=%lu host_active=%s gc_active=%s victim_class=%s host_age_bucket=%s host_est_bucket=%s victim_age_bucket=%s victim_valid_ratio_bucket=%s nodap_case_total=%lu/%lu/%lu nodap_case_avg_vr=%.4f/%.4f/%.4f nodap_sealed_per_class=%s nodap_case0_x_class=%s nodap_case1_x_class=%s nodap_case2_x_class=%s\n",
                     prefix_cstr,
                     write_size_to_cache,
                     compacted_blocks,
@@ -1200,6 +1217,8 @@ void LogCache::print_stats() {
                     g_nodap_victim_case_counts[0],
                     g_nodap_victim_case_counts[1],
                     g_nodap_victim_case_counts[2],
+                    case_avg_vr(0), case_avg_vr(1), case_avg_vr(2),
+                    sealed_pc.c_str(),
                     case0.c_str(), case1.c_str(), case2.c_str());
             fflush(fp_compare);
         }

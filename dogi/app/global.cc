@@ -30,6 +30,10 @@ std::array<uint64_t, 40> g_dogi_gc_victim_class_counts = {0,};
 std::array<uint64_t, 3> g_nodap_victim_case_counts = {0,};
 // Per-class breakdown: counts[case][class_num]. 3 cases × 40 max classes.
 std::array<std::array<uint64_t, 40>, 3> g_nodap_victim_case_x_class_counts = {};
+// Sum of valid_ratio per case for averaging.
+std::array<double, 3> g_nodap_victim_case_valid_ratio_sum = {0.0, 0.0, 0.0};
+// Currently-sealed segment count per class (gauge: ++ on seal, -- on victim pick).
+std::array<int64_t, 40> g_nodap_sealed_per_class = {0,};
 std::array<uint64_t, 12> g_dogi_host_age_bucket_counts = {0,};
 std::array<uint64_t, 12> g_dogi_host_est_bucket_counts = {0,};
 std::array<uint64_t, 12> g_dogi_victim_age_bucket_counts = {0,};
