@@ -303,7 +303,7 @@ int main(int argc, char* argv[]) {
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio));
+    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio, trace_file, trace_format, lba_scale));
 
     std::unique_ptr<LbaRemapper> remapper;
     if (lba_remap) {

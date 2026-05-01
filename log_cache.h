@@ -164,7 +164,13 @@ private:
     /* DOGI-style options (independent flags) */
     bool dogi_gc_trigger_ = false;       // invalid ratio based GC trigger
     bool dogi_keep_seg_timestamp_ = false; // don't pull segment timestamp to oldest block on compaction
+    bool dogi_share_active_segments_ = false; // host/gc writes share logical-group open segments
     double dogi_gc_threshold_ = 0.12;
+    // Standalone DOGI Manager-style cumulative counters: GP = inv/total over
+    // every block ever sealed. Trigger only fires once total >= device size
+    // (one full first-pass), matching the reference implementation.
+    uint64_t dogi_total_sealed_blocks_ = 0;
+    uint64_t dogi_total_sealed_invalid_blocks_ = 0;
 public:
     void setDogiGcMode(bool trigger, double threshold = 0.12) {
         dogi_gc_trigger_ = trigger;
@@ -172,6 +178,9 @@ public:
     }
     void setDogiKeepSegTimestamp(bool on) {
         dogi_keep_seg_timestamp_ = on;
+    }
+    void setDogiShareActiveSegments(bool on) {
+        dogi_share_active_segments_ = on;
     }
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;

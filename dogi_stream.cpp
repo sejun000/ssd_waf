@@ -4,6 +4,16 @@
 #include <cstdio>
 #include <algorithm>
 
+namespace {
+std::size_t dogi_bucket_index(uint64_t v) {
+    if (v <= 7) return static_cast<std::size_t>(v);
+    if (v <= 15) return 8;
+    if (v <= 31) return 9;
+    if (v <= 63) return 10;
+    return 11;
+}
+}
+
 DogiStream::DogiStream(int num_gc_streams, uint64_t hot_threshold_init,
                        uint64_t hot_step, uint64_t hot_window_blocks,
                        uint64_t frozen_clear_interval)
@@ -17,6 +27,9 @@ DogiStream::DogiStream(int num_gc_streams, uint64_t hot_threshold_init,
 }
 
 uint8_t DogiStream::estimateInterval(uint64_t blockAddr, uint64_t segmentAge) {
+    if (!tracksHotState(blockAddr)) {
+        return 255;
+    }
     auto it = intervals_.find(blockAddr);
     uint8_t base = (it != intervals_.end()) ? it->second : 0;
     uint64_t delta = segmentAge / kIntervalUnit;
@@ -47,7 +60,12 @@ int DogiStream::Classify(uint64_t blockAddr, bool isGcAppend,
         uint64_t segmentAge = (created_timestamp < global_timestamp)
             ? (global_timestamp - created_timestamp) : 0;
         uint8_t est = estimateInterval(blockAddr, segmentAge);
-        intervals_[blockAddr] = 0;
+        const uint64_t age_units = segmentAge / kIntervalUnit;
+        ++g_dogi_host_age_bucket_counts[dogi_bucket_index(age_units)];
+        ++g_dogi_host_est_bucket_counts[dogi_bucket_index(est)];
+        if (tracksHotState(blockAddr)) {
+            intervals_[blockAddr] = 0;
+        }
         bool isHot = (total_writes_ > pass_time_blocks_)
             ? (static_cast<uint64_t>(est) < hot_threshold_)
             : false;
@@ -64,7 +82,7 @@ int DogiStream::Classify(uint64_t blockAddr, bool isGcAppend,
     // Accumulate segment age into 8-bit counter (like DOGI AccumulateGcAge)
     uint64_t segmentAge = (created_timestamp < global_timestamp)
         ? (global_timestamp - created_timestamp) : 0;
-    {
+    if (tracksHotState(blockAddr)) {
         uint64_t delta = segmentAge / kIntervalUnit;
         auto it2 = intervals_.find(blockAddr);
         uint8_t base = (it2 != intervals_.end()) ? it2->second : 0;
@@ -75,7 +93,7 @@ int DogiStream::Classify(uint64_t blockAddr, bool isGcAppend,
     auto it = ever_overwritten_.find(blockAddr);
     if (it == ever_overwritten_.end() || !it->second) {
         ++g_dogi_gc_frozen_writes;
-        return Segment::GC_STREAM_START + num_gc_streams_ - 1; // frozen = last GC stream
+        return num_gc_streams_ - 1; // standalone NO_ML frozen group = logical last group
     }
     ++g_dogi_gc_nonfrozen_writes;
 
@@ -93,11 +111,22 @@ int DogiStream::Classify(uint64_t blockAddr, bool isGcAppend,
     }
 
     gc_stream_[blockAddr] = next_stream;
-    return Segment::GC_STREAM_START + next_stream;
+    return next_stream; // standalone NO_ML reuses the same logical group ids for host/GC
 }
 
 void DogiStream::Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) {
     ++total_writes_;
+
+    // At warmup boundary, mark every block touched during warmup as
+    // ever-overwritten. Stands in for SSD pre-conditioning so --no_fill
+    // doesn't leave residual warmup blocks as permanent frozen (u=1.0
+    // class-5 self-loop in score_dogi_expired_first GC).
+    if (total_writes_ == pass_time_blocks_ + 1) {
+        ever_overwritten_.reserve(intervals_.size());
+        for (const auto &kv : intervals_) {
+            ever_overwritten_[kv.first] = true;
+        }
+    }
 
     // Track overwrites for Frozen Filter (only after warmup, like DOGI main.cc)
     if (total_writes_ > pass_time_blocks_) {

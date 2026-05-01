@@ -11,7 +11,7 @@ from matplotlib.colors import to_rgb
 
 
 LINE_RE = re.compile(
-    r"^(?P<label>\S+)\s+host_write_bytes=(?P<host>\d+)\s+gc_write_blocks=(?P<gc>\d+)\s+waf=(?P<waf>[0-9.]+).*?host_active=(?P<host_active>[0-9:,]+)\s+gc_active=(?P<gc_active>[0-9:,]+)"
+    r"^(?P<label>\S+)\s+host_write_bytes=(?P<host>\d+)\s+gc_write_blocks=(?P<gc>\d+)\s+waf=(?P<waf>[0-9.]+).*?host_active=(?P<host_active>[0-9:,]+)\s+gc_active=(?P<gc_active>[0-9:,]+)(?:.*?host_age_bucket=(?P<host_age_bucket>[0-9:,]+)\s+host_est_bucket=(?P<host_est_bucket>[0-9:,]+))?"
 )
 
 
@@ -34,6 +34,8 @@ def parse_compare_log(path: str):
             waf = float(m.group("waf"))
             host_active = parse_counts(m.group("host_active"))
             gc_active = parse_counts(m.group("gc_active"))
+            host_age_bucket = parse_counts(m.group("host_age_bucket")) if m.group("host_age_bucket") else {}
+            host_est_bucket = parse_counts(m.group("host_est_bucket")) if m.group("host_est_bucket") else {}
             rows.append(
                 {
                     "host_bytes": host_bytes,
@@ -43,6 +45,8 @@ def parse_compare_log(path: str):
                     "waf": waf,
                     "host_active": host_active,
                     "gc_active": gc_active,
+                    "host_age_bucket": host_age_bucket,
+                    "host_est_bucket": host_est_bucket,
                 }
             )
     if not rows:
@@ -101,6 +105,46 @@ def add_active_series(ax, rows, label, key, idx, color=None, linestyle="-", alph
     )
 
 
+def add_active_series_mapped(ax, rows, label, key, idx_map, color=None, linestyle="-", alpha=0.75):
+    xs = [r["host_gib"] for r in rows]
+    ys = [r[key].get(src_idx, 0) for r, src_idx in zip(rows, idx_map)]
+    ax.plot(
+        xs,
+        ys,
+        marker="o",
+        markersize=2.5,
+        linewidth=1.5,
+        label=label,
+        color=color,
+        linestyle=linestyle,
+        alpha=alpha,
+    )
+
+
+def add_bucket_bars(ax, datasets, key, title, ylabel):
+    bucket_labels = ["0", "1", "2", "3", "4", "5", "6", "7", "8-15", "16-31", "32-63", "64+"]
+    xs = list(range(len(bucket_labels)))
+    width = 0.24
+    offsets = [-width, 0.0, width]
+
+    for (label, rows, color), offset in zip(datasets, offsets):
+        if not rows:
+            continue
+        counts = rows[-1].get(key, {})
+        total = sum(counts.values())
+        if total == 0:
+            continue
+        ys = [counts.get(i, 0) / total for i in range(len(bucket_labels))]
+        ax.bar([x + offset for x in xs], ys, width=width, label=label, color=color, alpha=0.8)
+
+    ax.set_xticks(xs)
+    ax.set_xticklabels(bucket_labels)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ml", default=None, help="DOGI_ML compare log")
@@ -139,8 +183,8 @@ def main():
         4: 0.48,
     }
 
-    fig, axes = plt.subplots(4, 1, figsize=(11, 15), sharex=True)
-    ax1, ax2, ax3, ax4 = axes
+    fig, axes = plt.subplots(6, 1, figsize=(12, 21), sharex=False)
+    ax1, ax2, ax3, ax4, ax5, ax6 = axes
 
     add_series(ax1, ml_rows, "DOGI ML", "waf",
                color=policy_palette["ml"], linestyle=policy_style["ml"]["linestyle"], alpha=policy_style["ml"]["alpha"])
@@ -189,28 +233,37 @@ def main():
 
     for idx in range(5):
         add_active_series(
-            ax4, ml_rows, f"DOGI ML g{idx}", "gc_active", idx,
+            ax4, ml_rows, f"DOGI ML g{idx}", "gc_active", idx + 1,
             color=blend_with_white(policy_palette["ml"], gc_tone[idx]),
             linestyle=policy_style["ml"]["linestyle"],
             alpha=policy_style["ml"]["alpha"],
         )
         add_active_series(
-            ax4, noml_rows, f"DOGI NO_ML g{idx}", "gc_active", idx,
+            ax4, noml_rows, f"DOGI NO_ML g{idx}", "gc_active", idx + 1,
             color=blend_with_white(policy_palette["noml"], gc_tone[idx]),
             linestyle=policy_style["noml"]["linestyle"],
             alpha=policy_style["noml"]["alpha"],
         )
         add_active_series(
-            ax4, stream_rows, f"DOGI stream g{idx}", "gc_active", idx,
+            ax4, stream_rows, f"DOGI stream g{idx}", "gc_active", idx + 11,
             color=blend_with_white(policy_palette["stream"], gc_tone[idx]),
             linestyle=policy_style["stream"]["linestyle"],
             alpha=policy_style["stream"]["alpha"],
         )
     ax4.set_xlabel("Host Write (GiB)")
     ax4.set_ylabel("GC Active Writes")
-    ax4.set_title("gc_active[0:4]")
+    ax4.set_title("gc_active stages 0:4 (DOGI=1:5, stream=11:15)")
     ax4.grid(True, alpha=0.3)
     ax4.legend(ncol=3, fontsize=8)
+
+    bucket_datasets = [
+        ("DOGI ML", ml_rows, policy_palette["ml"]),
+        ("DOGI NO_ML", noml_rows, policy_palette["noml"]),
+        ("DOGI stream", stream_rows, policy_palette["stream"]),
+    ]
+    add_bucket_bars(ax5, bucket_datasets, "host_age_bucket", "host_age_bucket (final row ratio)", "Ratio")
+    add_bucket_bars(ax6, bucket_datasets, "host_est_bucket", "host_est_bucket (final row ratio)", "Ratio")
+    ax6.set_xlabel("Bucket")
 
     fig.tight_layout()
     fig.savefig(args.out, dpi=160, bbox_inches="tight")

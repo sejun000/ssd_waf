@@ -39,6 +39,25 @@ int DOGI::Classify(uint32_t blockAddr, bool isGcAppend, uint64_t /*Age*/, uint32
     next = std::max(static_cast<int>(PrevClass) - 1, 2);
   }
 
+  // NO_ML-only: read hint → age cascade(+1) 위에 한 단계 더 cold(+1) 누적.
+  // 상한은 NumGroup-2 (frozen 직전). frozen filter 결정은 그대로 둠.
+  if (APPLY_ML == 0 && g_dogi_read_opt_colder &&
+      g_dogi_last_read_ts.count(blockAddr)) {
+    int colder = next + 1;
+    int cap = static_cast<int>(NumGroup) - 2;
+    if (colder > cap) colder = cap;
+    next = colder;
+  }
+
+  // NO_ML-only: colder의 대칭. read hint → age cascade 위에 한 단계 hotter(-1).
+  // 하한은 GC 최하위 group 2 (host 영역 0,1 침범 금지).
+  if (APPLY_ML == 0 && g_dogi_read_opt_hotter &&
+      g_dogi_last_read_ts.count(blockAddr)) {
+    int hotter = next - 1;
+    if (hotter < 2) hotter = 2;
+    next = hotter;
+  }
+
   return next;
 }
 

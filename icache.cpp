@@ -8,6 +8,8 @@
 #include "fairywren_cache.h"
 #include "dogi_cache.h"
 #include "dogi_stream.h"
+#include "nodap_stream.h"
+#include "trace_parser.h"
 #include "evict_policy_fifo.h"
 #include "evict_policy_fifo_zero.h"
 #include "evict_policy_greedy.h"
@@ -21,8 +23,9 @@
 #include "evict_policy_midas.h"
 #include "istream.h"
 #include <cassert>
+#include <cstdlib>
 #include <string>
-#include <algorithm> 
+#include <algorithm>
 #include <cmath>
 
 #define TEN_GB (10 * 1024ULL * 1024ULL * 1024ULL)
@@ -49,8 +52,10 @@ uint64_t g_timestamp = 0;
 // DOGI expired-first victim selection globals
 uint64_t g_dogi_hot_bir = 2 * 98304;  // BIR[0] = hotThreshold * kSegmentBlocks = 196608 blocks
 
-// DOGI expired-first score: hot group segments past BIR get highest priority,
-// rest use cost-benefit (gp/(1-gp) * sqrt(age)), mirroring DogiSelect.
+// DOGI expired-first score:
+// 1) expired hot segments (class 0, age > BIR) are highest priority
+// 2) young hot segments are protected from GC selection
+// 3) everything else uses cost-benefit, matching DogiSelect more closely
 static double score_dogi_expired_first(Segment *seg) {
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
     double u = seg->valid_cnt / segment_size;
@@ -60,11 +65,51 @@ static double score_dogi_expired_first(Segment *seg) {
     if (seg->class_num == 0 && age > g_dogi_hot_bir) {
         return 1e18 + static_cast<double>(age);  // huge base + age tiebreak
     }
+    // Standalone DogiSelect does not even consider young hot segments as victims.
+    if (seg->class_num == 0) {
+        return -1e18;
+    }
 
     // All other segments: cost-benefit like DogiSelect
     if (u < 0.0001) u = 0.0001;
     double gp = 1.0 - u;  // invalid ratio
     return gp / (1.0 - gp) * sqrt(static_cast<double>(age));
+}
+
+// NoDaP victim selection (paper §3.1) with progressive non-expired fallback:
+//   Tier 1) expired G_1..G_{N-1} (residence > BIR upper) → top priority
+//   Tier 2) G_N: fewest valid (paper's stated fallback)
+//   Tier 3+) G_{N-1}, G_{N-2}, ... fewest valid (paper-spirit emergency,
+//            picks coldest non-expired group when G_N has no garbage)
+//   Fully-valid (≥95%) anywhere → never pick (self-copy would stall)
+// The (idx - G_N) * blocks term naturally tiers groups: G_N=0, G_{N-1}=-blocks,
+// G_{N-2}=-2*blocks ... so within each tier fewest valid wins, but a single
+// partial G_N always beats a partial G_{N-1}, etc.
+static double score_nodap_expired(Segment *seg) {
+    int idx = seg->class_num;
+    int g_n_idx = g_nodap_num_groups - 1;
+    uint64_t age = g_timestamp > 0 ? (g_timestamp - seg->create_timestamp) : 0;
+    double seg_blocks = g_segment_blocks;
+
+    // Skip fully-valid (>=95%) — picking these results in self-copy (target
+    // alloc -1 + victim reset +1 = 0 net free pool change → infinite stall).
+    if (static_cast<double>(seg->valid_cnt) >= 0.95 * seg_blocks) {
+        return -1e18;
+    }
+
+    // Tier 1: expired G_1..G_{N-1}
+    if (idx >= 0 && idx < g_n_idx) {
+        if (age > g_nodap_bir_upper[idx]) {
+            return 1e18 + static_cast<double>(age);
+        }
+    }
+    // Tier 2..N: paper's "G_N fewest valid" extended to colder→hotter as
+    // emergency fallback. (idx - g_n_idx) ≤ 0, so G_N gets the highest tier
+    // (offset 0). Within a tier, fewest valid wins. The COMPACT_STALL_LIMIT
+    // safety break in check_and_evict_if_needed handles the rare all-100%-
+    // valid pathological case (would otherwise self-copy forever).
+    return static_cast<double>(idx - g_n_idx) * seg_blocks
+         - static_cast<double>(seg->valid_cnt);
 }
 
 // Score functions for CbEvictPolicy (same as icache.cpp)
@@ -226,7 +271,7 @@ T* attach_prefix(T* cache, const std::string& prefix, const std::string& start_t
 }
 }
 
-ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold, std::string stat_log_file, double periodic_ratio) {
+ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold, std::string stat_log_file, double periodic_ratio, const std::string &input_trace_file, const std::string &input_trace_format, int input_lba_scale) {
     if (capacity <= 0) {
         capacity = 1;
     }
@@ -259,9 +304,17 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     else if (cache_type == "NO_CACHE") {
         return attach_prefix(new NoCache(cold_capacity, cache_block_size, waf_log_file), cache_type, start_ts);
     }
-    else if (cache_type == "DOGI") {
+    else if (cache_type == "DOGI" || cache_type == "DOGI_COLDER" || cache_type == "DOGI_HOTTER") {
         const char* no_ml = std::getenv("DOGI_NO_ML");
-        const std::string dogi_prefix = (no_ml != nullptr) ? "DOGI_NOML" : "DOGI_ML";
+        std::string dogi_prefix = (no_ml != nullptr) ? "DOGI_NOML" : "DOGI_ML";
+        // Policy-name suffixed variants: read-aware GC cascade adjustment (NO_ML path).
+        if (cache_type == "DOGI_COLDER") {
+            setenv("DOGI_READ_OPT_COLDER", "1", /*overwrite=*/1);
+            dogi_prefix += "_COLDER";
+        } else if (cache_type == "DOGI_HOTTER") {
+            setenv("DOGI_READ_OPT_HOTTER", "1", /*overwrite=*/1);
+            dogi_prefix += "_HOTTER";
+        }
         return attach_prefix(new DogiCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file), dogi_prefix, start_ts);
     }
     else if (cache_type == "LOG_GREEDY") {
@@ -575,6 +628,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             "", 0.0, 0.0, 0.0, 2.88, false);
         lc->setDogiGcMode(true, 0.12);
         lc->setDogiKeepSegTimestamp(true);
+        lc->setDogiShareActiveSegments(true);
         return attach_prefix(lc, cache_type, start_ts);
     }
     else if (cache_type == "LOG_DOGI_HEURISTIC_ROR_88") {
@@ -586,6 +640,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             "", 0.0, 0.0, 0.0, 2.88, true);
         lc->setDogiGcMode(true, 0.12);
         lc->setDogiKeepSegTimestamp(true);
+        lc->setDogiShareActiveSegments(true);
         return attach_prefix(lc, cache_type, start_ts);
     }
     else if (cache_type == "LOG_DOGI_HEURISTIC_85") {
@@ -596,6 +651,67 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             "", 0.0, 0.0, 0.0, 2.88, false);
         lc->setDogiGcMode(true, 0.15);
         lc->setDogiKeepSegTimestamp(true);
+        lc->setDogiShareActiveSegments(true);
+        return attach_prefix(lc, cache_type, start_ts);
+    }
+    else if (cache_type == "LOG_NODAP_88") {
+        // NoDaP oracle (FAST'26 DOGI paper §3.1): perfect-future-knowledge
+        // baseline. 7 groups by BIR (Table 2 YCSB-A defaults). Pre-passes
+        // the input trace once to build per-LBA invalidation timestamp queue.
+        // Override BIR via env: NODAP_BIR=200,9000,17000,...,inf
+        NodapStream *nodap = nullptr;
+        const char *bir_env = std::getenv("NODAP_BIR");
+        if (bir_env && *bir_env) {
+            std::vector<uint64_t> bir_upper;
+            std::string s(bir_env);
+            size_t pos = 0;
+            while (pos <= s.size()) {
+                size_t comma = s.find(',', pos);
+                std::string tok = s.substr(pos,
+                    comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!tok.empty()) {
+                    if (tok == "inf" || tok == "INF" || tok == "Inf") {
+                        bir_upper.push_back(UINT64_MAX);
+                    } else {
+                        bir_upper.push_back(std::stoull(tok));
+                    }
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            if (!bir_upper.empty()) {
+                std::cout << "[NoDaP] BIR override (n=" << bir_upper.size() << "):";
+                for (auto v : bir_upper) {
+                    if (v == UINT64_MAX) std::cout << " inf";
+                    else std::cout << " " << v;
+                }
+                std::cout << std::endl;
+                nodap = new NodapStream(bir_upper.size(), bir_upper);
+            }
+        }
+        if (!nodap) nodap = new NodapStream();
+        if (!input_trace_file.empty()) {
+            std::unique_ptr<ITraceParser> oracle_parser(createTraceParser(input_trace_format));
+            if (oracle_parser) {
+                nodap->LoadOracle(input_trace_file, *oracle_parser, cache_block_size, input_lba_scale);
+            } else {
+                std::cerr << "[NoDaP] cannot create parser for format=" << input_trace_format << std::endl;
+            }
+        } else {
+            std::cerr << "[NoDaP] WARNING: no input_trace_file given, oracle empty (all blocks → coldest group)" << std::endl;
+        }
+        IStream *input_stream_policy = nodap;
+        auto *lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.88, std::make_unique<CbEvictPolicy>(score_nodap_expired), 0, false,
+            "", 0.0, 0.0, 0.0, 2.88, false);
+        lc->setDogiGcMode(true, 0.12);
+        // KeepSegTimestamp=false: pull GC target's create_ts back to oldest
+        // copied block's host-write timestamp. Makes seg-age reflect oldest
+        // block's lifetime, so among "expired" candidates max-age picks the
+        // genuinely most-invalidated segment (paper §3.1 spirit).
+        lc->setDogiKeepSegTimestamp(false);
+        lc->setDogiShareActiveSegments(true);
         return attach_prefix(lc, cache_type, start_ts);
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_COLD_80") {

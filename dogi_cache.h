@@ -87,6 +87,8 @@ private:
     bool config_applied_ = false;
     bool no_ml_ = false;
     bool read_opt_ = false;
+    bool read_opt_colder_ = false;
+    bool read_opt_hotter_ = false;
 
     std::string latest_model_name_;
     std::string latest_model_dir_;

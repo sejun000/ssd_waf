@@ -5,6 +5,7 @@
 #include "hot_cold_midas.h"
 #include "readwrite_stream.h"
 #include "dogi_stream.h"
+#include "nodap_stream.h"
 #include <string>
 #include <cassert>
 #include <algorithm>
@@ -72,6 +73,12 @@ IStream* createIstreamPolicy(std::string policy_type) {
     }
     else if (policy_type == "dogi_heuristic") {
         return new DogiStream(/*num_gc_streams=*/6);
+    }
+    else if (policy_type == "nodap") {
+        // NoDaP without oracle pre-pass: caller must invoke LoadOracle()
+        // afterwards. Without it, every block is treated as cold (BIR=∞)
+        // → all writes go to G_N. Used only for plumbing tests.
+        return new NodapStream();
     }
     else {
         assert(false);

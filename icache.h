@@ -126,4 +126,4 @@ protected:
 
 extern uint64_t g_dogi_hot_bir;  // DOGI hot group BIR, updated by DogiStream
 
-ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88);
+ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88, const std::string &input_trace_file = "", const std::string &input_trace_format = "csv", int input_lba_scale = 1);

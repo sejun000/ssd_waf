@@ -51,6 +51,7 @@ private:
     double prev_window_waf_ = DBL_MAX;
 
     // Per-LBA 8-bit saturating counter (matches DOGI HotIntervalTracker)
+    static constexpr uint64_t kTrackerCapacity = 128ull * 1024ull * 1024ull;
     static constexpr uint64_t kIntervalUnit = 65536;
     std::unordered_map<uint64_t, uint8_t> intervals_;
 
@@ -70,6 +71,9 @@ private:
     // Expired segment detection
     std::vector<int> pending_victim_streams_;
 
+    bool tracksHotState(uint64_t blockAddr) const {
+        return blockAddr < kTrackerCapacity;
+    }
     uint8_t estimateInterval(uint64_t blockAddr, uint64_t segmentAge);
     void adjustHotThreshold(double current_waf);
 };

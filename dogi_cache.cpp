@@ -50,6 +50,21 @@ std::pair<std::string, std::string> ResolveModelDirAndName() {
     }
     return {modelDir, basename(modelDir)};
 }
+
+std::size_t dogi_bucket_index(uint64_t v) {
+    if (v <= 7) return static_cast<std::size_t>(v);
+    if (v <= 15) return 8;
+    if (v <= 31) return 9;
+    if (v <= 63) return 10;
+    return 11;
+}
+
+std::size_t dogi_valid_ratio_bucket(uint64_t valid_blocks, uint64_t total_blocks) {
+    if (total_blocks == 0) return 0;
+    uint64_t bucket = (valid_blocks * 10ull) / total_blocks;
+    if (bucket > 10) bucket = 10;
+    return static_cast<std::size_t>(bucket);
+}
 } // namespace
 
 DogiCache::DogiCache(uint64_t cold_capacity,
@@ -111,9 +126,15 @@ DogiCache::DogiCache(uint64_t cold_capacity,
 
     // DOGI_NO_ML=1 disables model loading and training entirely (heuristic-only mode).
     no_ml_ = std::getenv("DOGI_NO_ML") != nullptr;
-    // DOGI_READ_OPT=1 enables read-aware GC relocation (+1 colder group if recently read).
+    // DOGI_READ_OPT=1 enables read-aware GC relocation (-1 hotter group if recently read).
     read_opt_ = std::getenv("DOGI_READ_OPT") != nullptr;
     g_dogi_read_opt = read_opt_;
+    // DOGI_READ_OPT_COLDER=1: NO_ML GC cascade에서 read 힌트가 있으면 한 단계 더 cold(+1)로 밀어냄.
+    read_opt_colder_ = std::getenv("DOGI_READ_OPT_COLDER") != nullptr;
+    g_dogi_read_opt_colder = read_opt_colder_;
+    // DOGI_READ_OPT_HOTTER=1: NO_ML GC cascade 위에 한 단계 hotter(-1) 적용 (colder의 대칭).
+    read_opt_hotter_ = std::getenv("DOGI_READ_OPT_HOTTER") != nullptr;
+    g_dogi_read_opt_hotter = read_opt_hotter_;
 
     if (no_ml_) {
         printf("[DOGI] ML disabled (DOGI_NO_ML set)\n");
@@ -181,6 +202,9 @@ void DogiCache::batch_insert(int /*stream_id*/,
         auto hotResult = hot_classifier_->Classify(lba, segmentAge);
         const bool isHot = (logical_time_ > pass_time_blocks_) ? hotResult.isHot : false;
         const uint64_t interval = static_cast<uint64_t>(hotResult.interval);
+        const uint64_t age_units = segmentAge / HotIntervalTracker::kIntervalUnit;
+        ++g_dogi_host_age_bucket_counts[dogi_bucket_index(age_units)];
+        ++g_dogi_host_est_bucket_counts[dogi_bucket_index(interval)];
         if (isHot) ++g_dogi_host_hot_writes;
         else ++g_dogi_host_cold_writes;
 
@@ -261,7 +285,7 @@ void DogiCache::flush_buffer() {
             ++predIdx;
         }
         // Clear read timestamp on write (track "read since last write")
-        if (read_opt_) g_dogi_last_read_ts.erase(static_cast<uint32_t>(w.lba));
+        if (read_opt_ || read_opt_colder_ || read_opt_hotter_) g_dogi_last_read_ts.erase(static_cast<uint32_t>(w.lba));
         // Manager::Append expects byte-addressed logical address; null adapter ignores buf.
         manager_->Append(/*buf=*/nullptr,
                          /*addr=*/static_cast<off64_t>(w.lba) * 4096,
@@ -299,6 +323,10 @@ void DogiCache::run_inline_gc() {
             static_cast<size_t>(victim_class) < g_dogi_gc_victim_class_counts.size()) {
             ++g_dogi_gc_victim_class_counts[victim_class];
         }
+        ++g_dogi_victim_age_bucket_counts[dogi_bucket_index(
+            seg.GetAge() / HotIntervalTracker::kIntervalUnit)];
+        ++g_dogi_victim_valid_ratio_bucket_counts[dogi_valid_ratio_bucket(
+            seg.GetTotalValidBlocks(), seg.GetTotalBlocks())];
 
         manager_->CollectSegment(seg.GetSegmentId());
         uint64_t nRewrite = 0;
@@ -349,7 +377,7 @@ void DogiCache::print_stats() {
     const uint64_t host_write_bytes = manager_ ? manager_->GetTotalUserWrites() * 4096ull : 0;
     if (!fp_compare || host_write_bytes < next_written_bytes) return;
 
-    auto fmt_counts = [](const std::array<uint64_t, 40> &counts) {
+    auto fmt_counts = [](const auto &counts) {
         std::ostringstream oss;
         for (size_t i = 0; i < counts.size(); ++i) {
             if (i) oss << ",";
@@ -367,7 +395,7 @@ void DogiCache::print_stats() {
     const std::string &prefix = stats_prefix();
     const char *prefix_cstr = prefix.empty() ? "DOGI" : prefix.c_str();
     fprintf(fp_compare,
-            "%s host_write_bytes=%llu gc_write_blocks=%llu waf=%.6f host_hot=%lu host_cold=%lu gc_frozen=%lu gc_nonfrozen=%lu gc_victim_count=%llu host_active=%s gc_active=%s victim_class=%s\n",
+            "%s host_write_bytes=%llu gc_write_blocks=%llu waf=%.6f host_hot=%lu host_cold=%lu gc_frozen=%lu gc_nonfrozen=%lu gc_victim_count=%llu host_active=%s gc_active=%s victim_class=%s host_age_bucket=%s host_est_bucket=%s victim_age_bucket=%s victim_valid_ratio_bucket=%s\n",
             prefix_cstr,
             static_cast<unsigned long long>(host_write_bytes),
             static_cast<unsigned long long>(gc_write_blocks),
@@ -379,7 +407,11 @@ void DogiCache::print_stats() {
             static_cast<unsigned long long>(gc_victim_count),
             fmt_counts(g_dogi_host_active_counts).c_str(),
             fmt_counts(g_dogi_gc_active_counts).c_str(),
-            fmt_counts(g_dogi_gc_victim_class_counts).c_str());
+            fmt_counts(g_dogi_gc_victim_class_counts).c_str(),
+            fmt_counts(g_dogi_host_age_bucket_counts).c_str(),
+            fmt_counts(g_dogi_host_est_bucket_counts).c_str(),
+            fmt_counts(g_dogi_victim_age_bucket_counts).c_str(),
+            fmt_counts(g_dogi_victim_valid_ratio_bucket_counts).c_str());
     fflush(fp_compare);
     next_written_bytes += 10ull * 1024ull * 1024ull * 1024ull;
 }
