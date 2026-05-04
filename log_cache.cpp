@@ -244,10 +244,10 @@ void LogCache::periodic_ghost_delta() {
                 eviction_ratio.has_value() &&
                 eviction_ratio_in_ghost_cache.has_value()){
                 if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
-                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + ghost_reanchor_step_);
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + UTIL_STEP);
                 }
                 else {
-                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - ghost_reanchor_step_);
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - UTIL_STEP);
                 }
             }
         }
@@ -604,7 +604,7 @@ void LogCache::check_and_evict_if_needed(int max_victims)
     {
         /* eviction 후보 수집 */
         bool compact = false;
-        if (target_valid_blk_rate >= 0.1) {
+        if (target_valid_blk_rate >= UTIL_STEP) {
             if (compactor && (double)target_valid_blk_rate * total_cache_block_count  > global_valid_blocks) {
                 compact = true;
             }
