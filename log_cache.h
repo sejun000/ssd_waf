@@ -241,7 +241,11 @@ private:
     int      tdelta_last_dir_           = +1;
     double   tdelta_step_               = 0.01;
 
+    /* GhostDelta reanchoring step (default ±0.1 for original behavior) */
+    double   ghost_reanchor_step_       = 0.1;
+
 public:
     void setPeriodicMode(PeriodicMode m) { periodic_mode_ = m; }
     void setTdeltaStep(double s) { tdelta_step_ = s; }
+    void setGhostReanchorStep(double s) { ghost_reanchor_step_ = s; }
 };

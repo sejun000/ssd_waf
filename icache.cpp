@@ -456,6 +456,15 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         lc->setPeriodicMode(PeriodicMode::GhostDelta_GC);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GD002") {
+        // GhostDelta with reanchor step ±0.02 (ablation: isolate step-size effect from gradient signal)
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio);
+        lc->setGhostReanchorStep(0.02);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_11") { // for getting optimized value from dynamic algorithm
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
