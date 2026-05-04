@@ -31,6 +31,12 @@ struct Config
 
 #define GHOST_CACHE 1
 
+enum class PeriodicMode {
+    GhostDelta,   // 기존 ghost-cache 기반 비대칭 비교 (eviction delta vs compaction amount)
+    GhostDelta_GC, // GC 적용된 ghost-cache 기반 비대칭 비교 (G(u+δ)-G(u) 예측)
+    TimeDelta,    // t-delta hill-climb: f = compacted + r*evicted 의 windowed Δ로 방향 결정
+};
+
 class LogCache final : public ICache
 {
 public:
@@ -110,6 +116,9 @@ private:
     LogCacheSegment* get_segment_to_active_stream(bool gc, int stream, bool check_only = false);
     LogCacheSegment* get_segment_with_stream_policy(bool gc, uint64_t key, bool check_only = false);
     void periodic();
+    void periodic_ghost_delta();
+    void periodic_ghost_delta_gc();
+    void periodic_t_delta();
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -221,4 +230,18 @@ private:
     uint64_t cumulative_B_ = 0;            // cumulative valid pages from get_mth_score_valid_pages
     EwmaRatio net_free_seg_ratio_;         // EWMA of A (gc_victim_count - gc_active_alloc_count_)
     EwmaRatio gc_valid_pages_ratio_;       // EWMA of B (cumulative valid pages)
+
+    /* ── Periodic mode selector + t-delta hill-climb state ─────────────── */
+    PeriodicMode periodic_mode_ = PeriodicMode::GhostDelta;
+    bool     tdelta_have_prev_snapshot_ = false;
+    bool     tdelta_have_prev_f_        = false;
+    uint64_t tdelta_prev_compacted_     = 0;
+    uint64_t tdelta_prev_evicted_       = 0;
+    double   tdelta_prev_f_             = 0.0;
+    int      tdelta_last_dir_           = +1;
+    double   tdelta_step_               = 0.01;
+
+public:
+    void setPeriodicMode(PeriodicMode m) { periodic_mode_ = m; }
+    void setTdeltaStep(double s) { tdelta_step_ = s; }
 };

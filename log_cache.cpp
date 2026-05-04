@@ -195,6 +195,42 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 }
 
 void LogCache::periodic() {
+    if (periodic_mode_ == PeriodicMode::TimeDelta) {
+        periodic_t_delta();
+    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC) {
+        periodic_ghost_delta_gc();
+    } else {
+        periodic_ghost_delta();
+    }
+}
+
+void LogCache::periodic_ghost_delta_gc() {
+    if (is_ghost_cache){
+        if (log_cache_timestamp % (segment_size_blocks/4) == 0) {
+            compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+            compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
+            eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+            uint64_t evicted_in_ghost = ghost_cache.evictCount();
+            eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+        }
+        if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
+            if (compaction_ratio.has_value() &&
+                compaction_ratio_in_ghost_cache.has_value() &&
+                eviction_ratio.has_value() &&
+                eviction_ratio_in_ghost_cache.has_value()){
+                if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value())
+                        > compaction_ratio_in_ghost_cache.value() - compaction_ratio.value()) {
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + UTIL_STEP);
+                }
+                else {
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - UTIL_STEP);
+                }
+            }
+        }
+    }
+}
+
+void LogCache::periodic_ghost_delta() {
 #if 1
     if (is_ghost_cache){
         if (log_cache_timestamp % (segment_size_blocks/4) == 0) {
@@ -248,6 +284,40 @@ void LogCache::periodic() {
         }
     }
 #endif
+}
+
+void LogCache::periodic_t_delta() {
+    /* Hill-climb on f = Δcompacted + r * Δevicted across decision windows.
+     * 직전 window 의 f 와 비교해 작아지면 같은 방향 유지, 커지면 부호 뒤집기.
+     * ghost cache 비대칭 비교 없이 양쪽 cost 를 동일하게 실측. */
+    if (!is_ghost_cache) return;
+    if (log_cache_timestamp == 0) return;
+    if (log_cache_timestamp % (segment_size_blocks * 8) != 0) return;
+    if (valid_blk_rate_hard_limit <= 0.0) return;
+
+    uint64_t comp_now = compacted_blocks;
+    uint64_t evic_now = evicted_blocks;
+
+    if (tdelta_have_prev_snapshot_) {
+        uint64_t d_comp = comp_now - tdelta_prev_compacted_;
+        uint64_t d_evic = evic_now - tdelta_prev_evicted_;
+        double f_window = (double)d_comp + periodic_ratio_ * (double)d_evic;
+
+        if (tdelta_have_prev_f_ && f_window > tdelta_prev_f_) {
+            tdelta_last_dir_ = -tdelta_last_dir_;
+        }
+        tdelta_prev_f_      = f_window;
+        tdelta_have_prev_f_ = true;
+    }
+
+    double new_rate = target_valid_blk_rate + tdelta_last_dir_ * tdelta_step_;
+    if (new_rate < 0.0) new_rate = 0.0;
+    if (new_rate > valid_blk_rate_hard_limit) new_rate = valid_blk_rate_hard_limit;
+    target_valid_blk_rate = new_rate;
+
+    tdelta_prev_compacted_      = comp_now;
+    tdelta_prev_evicted_        = evic_now;
+    tdelta_have_prev_snapshot_  = true;
 }
 /*
 void LogCache::periodic() {
@@ -589,25 +659,11 @@ void LogCache::check_and_evict_if_needed(int max_victims)
             }
             // Ghost compaction cost estimation
             else {
-                /*if(is_ghost_cache && compactor) {
-                double u_step = ghost_util_ratio.has_value() ? ghost_util_ratio.value() : 0.9;
-                if (u_step < 0.01) u_step = 0.01; // 0 나누기 방지
-                double extra_blocks = UTIL_STEP * total_cache_block_count;
-                double m_segments = extra_blocks / (u_step * segment_size_blocks);
-
-                auto segments = compactor->peek_top_segments((int)total_segments);
-                double freed = 0;
-                size_t k = 0;
-                uint64_t current_valid = 0;
-                for (auto* seg : segments) {
-                    double u = (double)seg->valid_cnt / segment_size_blocks;
-                    freed += (1.0 - u);
-                    current_valid = seg->valid_cnt;
-                    k++;
-                    if (freed >= m_segments) break;
+                if(is_ghost_cache && compactor) {
+                    double m_segments = UTIL_STEP * total_segments;
+                    auto valid_pages = compactor->get_kth_segment_valid_cnt_for_free_segments(m_segments);
+                    ghost_compacted_blocks += valid_pages;
                 }
-                ghost_compacted_blocks += current_valid;
-            }*/
 
                 int stream_id = victim->get_class_num();
                 printf("[GC] event=COMPACT valid_cnt=%ld seg_age=%lu threshold=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
