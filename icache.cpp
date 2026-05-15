@@ -208,7 +208,7 @@ T* attach_prefix(T* cache, const std::string& prefix, const std::string& start_t
 }
 }
 
-ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold, std::string stat_log_file, double periodic_ratio) {
+ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold, std::string stat_log_file, double periodic_ratio, double util_step, const std::string& moving_avg_type, double moving_avg_window, int gs_decision_period_segs) {
     if (capacity <= 0) {
         capacity = 1;
     }
@@ -436,24 +436,77 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
-        return attach_prefix(new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
-            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio), cache_type, start_ts, !stat_log_file.empty());
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_TDELTA") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
-            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio);
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
         lc->setPeriodicMode(PeriodicMode::TimeDelta);
+        lc->setTdeltaStep(util_step);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GC") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
-            nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio);
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
         lc->setPeriodicMode(PeriodicMode::GhostDelta_GC);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GS") {
+        // GhostDelta_GC_SUM: G(u+θ) via cumulative CB-sorted scan.
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setGsDecisionPeriodSegs(gs_decision_period_segs);  // BEFORE setPeriodicMode (which uses this to derive θ).
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GC_NAND") {
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_NAND);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GC_AUTO") {
+        // GhostDelta_GC + GP/UCB autotuner over (dir, half-life, compare-window, step).
+        // Round 0 returns DefaultArm() — same as stock GC — so this policy
+        // matches GhostDelta_GC for the first 1 TiB of host writes before the
+        // autotuner observes its first reward.
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_AUTO);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        lc->setGpTuner(std::make_unique<auto_tune::GpTuner>(periodic_ratio));
+        // Derive a per-run autotune csv path from stat_log_file:
+        //   foo.stat_pr4  ->  foo.autotune_pr4.csv
+        // Falls back to <cache_type>.autotune.csv if stat_log_file is empty.
+        std::string autotune_csv = stat_log_file;
+        if (autotune_csv.empty()) {
+            autotune_csv = cache_type + ".autotune.csv";
+        } else {
+            const auto pos = autotune_csv.find(".stat");
+            if (pos != std::string::npos) {
+                autotune_csv.replace(pos, 5, ".autotune");
+            }
+            autotune_csv += ".csv";
+        }
+        lc->setAutotuneCsv(autotune_csv);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GD002") {
@@ -463,6 +516,7 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
             nullptr, input_stream_policy, 0.6, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio);
         lc->setGhostReanchorStep(0.02);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_11") { // for getting optimized value from dynamic algorithm
@@ -684,7 +738,9 @@ void ICache::_evict_one_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type
     }
     if (write_size_to_cache > next_write_size_to_cache) {
         next_write_size_to_cache += TEN_GB;
-        fprintf(fp, "%lld %lld %ld %ld\n", write_size_to_cache, evicted_blocks * get_block_size(), ftl.GetHostWritePages() * NAND_PAGE_SIZE, ftl.GetNandWritePages() * NAND_PAGE_SIZE);
+        last_ftl_host_write_pages = ftl.GetHostWritePages();
+        last_ftl_nand_write_pages = ftl.GetNandWritePages();
+        fprintf(fp, "%lld %lld %ld %ld\n", write_size_to_cache, evicted_blocks * get_block_size(), last_ftl_host_write_pages * NAND_PAGE_SIZE, last_ftl_nand_write_pages * NAND_PAGE_SIZE);
         fflush(fp);
     }
 }

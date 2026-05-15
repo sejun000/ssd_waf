@@ -225,6 +225,10 @@ int main(int argc, char* argv[]) {
     std::string stat_log_file = "";
     double valid_ratio = 0.0;
     double periodic_ratio = 2.88;
+    double util_step = 0.02;
+    std::string moving_avg_type = "ewma";
+    double moving_avg_window = 0.0;   // 0 → use LogCache default
+    int gs_decision_period_segs = 8;  // GS-only knob; auto-derives util_step + ghost shadow size
     bool cache_trace = false;
     bool no_fill = true;
     uint64_t cold_capacity = 0;
@@ -261,6 +265,14 @@ int main(int argc, char* argv[]) {
             lba_scale = std::stoi(argv[++i]);
         } else if (arg == "--periodic_ratio" && i + 1 < argc) {
             periodic_ratio = std::stod(argv[++i]);
+        } else if (arg == "--util_step" && i + 1 < argc) {
+            util_step = std::stod(argv[++i]);
+        } else if (arg == "--moving_avg_type" && i + 1 < argc) {
+            moving_avg_type = argv[++i];
+        } else if (arg == "--moving_avg_window" && i + 1 < argc) {
+            moving_avg_window = std::stod(argv[++i]);
+        } else if (arg == "--gs_decision_period_segs" && i + 1 < argc) {
+            gs_decision_period_segs = std::stoi(argv[++i]);
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -279,13 +291,17 @@ int main(int argc, char* argv[]) {
     printf("cold_capacity = %lu\n", cold_capacity);
     printf("lba_scale = %d\n", lba_scale);
     printf("periodic_ratio = %.2f\n", periodic_ratio);
+    printf("util_step = %.4f\n", util_step);
+    printf("moving_avg_type = %s\n", moving_avg_type.c_str());
+    printf("moving_avg_window = %.0f blocks\n", moving_avg_window);
+    printf("gs_decision_period_segs = %d\n", gs_decision_period_segs);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio));
+    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio, util_step, moving_avg_type, moving_avg_window, gs_decision_period_segs));
 
     if (!no_fill) {
         std::cout << "[prefill] start: trace=" << trace_file

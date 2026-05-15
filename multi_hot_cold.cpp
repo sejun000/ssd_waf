@@ -23,6 +23,14 @@ MultiHotCold::MultiHotCold(int max_gc_streams, int timestamp_granularity, bool c
 extern uint64_t g_threshold;
 
 int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) {
+    // Sync granularity with current g_threshold each call: interval = g_threshold
+    // / kMultiHotColdStreams (segment-aligned).  Pre-warmup falls back to
+    // set_stream_interval's saved cache_block_count.
+    uint64_t fresh_interval = compute_stream_interval(0);
+    if (fresh_interval > 0 && static_cast<uint64_t>(mTimestampGranularity) != fresh_interval) {
+        mTimestampGranularity = static_cast<int>(fresh_interval);
+        g_cycle_length        = static_cast<uint64_t>(mTimestampGranularity) * mMaxGcStreams;
+    }
     uint64_t time_diff = global_timestamp - created_timestamp;
     if (!isGcAppend) {
         uint64_t lifespan = time_diff;
@@ -43,10 +51,7 @@ int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_
         int cycle = raw_id / mMaxGcStreams;
         stream_id = raw_id % mMaxGcStreams;
 
-        // Detect per-stream cycle wrap
-        if (mStreamCycles[stream_id] >= 0 && cycle < mStreamCycles[stream_id]) {
-            printf("#### Detected cycle wrap for stream %d: %d -> %d, timestamp: %d\n", stream_id, mStreamCycles[stream_id], cycle, global_timestamp);
-        }
+        // Detect per-stream cycle wrap (silenced — was a hot printf).
         if (mStreamCycles[stream_id] >= 0 && cycle > mStreamCycles[stream_id]) {
             // This stream is about to be reused in a new cycle → queue for dummy fill
             mPendingVictimStreams.push_back(stream_id);

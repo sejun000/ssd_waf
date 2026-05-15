@@ -33,7 +33,8 @@ LogCache::LogCache(uint64_t              cold_capacity,
              double valid_rate_period_gb,
              double valid_rate_min,
              double valid_rate_max,
-             double periodic_ratio
+             double periodic_ratio,
+             double input_util_step
              )
     : ICache(cold_capacity, waf_log_file, stat_log_file),
       cache_block_size(blk_sz),
@@ -52,14 +53,15 @@ LogCache::LogCache(uint64_t              cold_capacity,
       evicted_cache_blocks_per_evict(std::make_unique<Histogram>("evicted_cache_blocks_per_evict", 1, 100, fp_stats)),
       compacted_lifetime_histogram_(std::make_unique<Histogram>("compacted_lifetime", interval/4, HISTOGRAM_BUCKETS * 2, fp_stats)),
       is_ghost_cache(input_ghost_cache),
-      compaction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      eviction_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      eviction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      compaction_ratio_in_ghost_cache(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      ghost_util_ratio(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      ghost_cache(cache_block_count * 0.1),
-      net_free_seg_ratio_(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      gc_valid_pages_ratio_(EwmaRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
+      util_step_(input_util_step),
+      compaction_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      eviction_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      eviction_ratio_in_ghost_cache(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      compaction_ratio_in_ghost_cache(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ghost_util_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ghost_cache(cache_block_count * util_step_),
+      net_free_seg_ratio_(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      gc_valid_pages_ratio_(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
 {
     periodic_ratio_ = periodic_ratio;
     segment_size_blocks = cfg_.segment_bytes / blk_sz;
@@ -120,6 +122,7 @@ LogCache::~LogCache()
     print_inv_time_scatter();
     if (trace_fp_)      std::fclose(trace_fp_);
     if (cold_trace_fp_) std::fclose(cold_trace_fp_);
+    if (autotune_csv_)  std::fclose(autotune_csv_);
 }
 
 /* ------------------------------------------------------------------ */
@@ -195,14 +198,32 @@ void LogCache::evict_policy_update(LogCacheSegment *s) {
 }
 
 void LogCache::periodic() {
+    static uint64_t t = 0;
+    t++;
+    if (t >= 188743680) { // 1200 MB/s * 10 minutes (t is 4k page unit)
+        t = 0;
+        uint64_t host_delta = ftl.GetHostWritePages() - lc_last_ftl_host_pages;
+        uint64_t nand_delta = ftl.GetNandWritePages() - lc_last_ftl_nand_pages;
+        current_waf = host_delta > 0 ? static_cast<double>(nand_delta) / host_delta : 0.0;
+        lc_last_ftl_host_pages += host_delta;
+        lc_last_ftl_nand_pages += nand_delta;
+    }
     if (periodic_mode_ == PeriodicMode::TimeDelta) {
         periodic_t_delta();
     } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC) {
         periodic_ghost_delta_gc();
+    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_NAND) {
+        periodic_ghost_delta_gc_nand();
+    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_AUTO) {
+        periodic_ghost_delta_gc_auto();
+    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM) {
+        periodic_ghost_delta_gc_sum();
+        periodic_gs_predict_track();    // Phase 1: passive candidate tracking
     } else {
         periodic_ghost_delta();
     }
 }
+
 
 void LogCache::periodic_ghost_delta_gc() {
     if (is_ghost_cache){
@@ -220,14 +241,376 @@ void LogCache::periodic_ghost_delta_gc() {
                 eviction_ratio_in_ghost_cache.has_value()){
                 if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value())
                         > compaction_ratio_in_ghost_cache.value() - compaction_ratio.value()) {
-                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + UTIL_STEP);
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + util_step_);
                 }
                 else {
-                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - UTIL_STEP);
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - util_step_);
                 }
             }
         }
     }
+}
+
+void LogCache::update_ghost_compacted_blocks(LogCacheSegment* victim) {
+    // GhostDelta_GC / GC_NAND / GC_AUTO ghost signal: at each real compaction
+    // event, take the m-th best segment in the compactor's CB heap (where
+    // m = θ·N segments) as a single-point estimate of "what GC would have cost
+    // had we run at u+θ", scaled by free-space equivalence (1-u_cur)/(1-u_m).
+    if (!compactor) return;
+    double m_segments    = util_step_ * total_segments;
+    auto   valid_pages   = compactor->get_kth_segment_valid_cnt_for_free_segments(m_segments);
+    double u_cur         = (double)victim->valid_cnt / (double)segment_size_blocks;
+    double u_m           = (double)valid_pages       / (double)segment_size_blocks;
+    if (u_m < 1.0) {
+        double scale = (1.0 - u_cur) / (1.0 - u_m);
+        ghost_compacted_blocks += static_cast<uint64_t>(valid_pages * scale);
+    } else {
+        ghost_compacted_blocks += valid_pages;
+    }
+}
+
+void LogCache::update_ghost_compacted_blocks_sum() {
+    // GhostDelta_GC_SUM ghost signal: at each real compaction event, advance a
+    // synthetic counter ghost_compacted_blocks_sum_ by (dt × u_avg/(1-u_avg))
+    // where u_avg comes from the CB-sorted cumulative scan up to θ·N·seg
+    // invalid pages (so it estimates the average valid/invalid ratio in the
+    // would-be θ-regime victims).
+    //
+    // Invalidation-aware target: host writes invalidate the freshly freed
+    // region at rate i; only the fraction landing there (≈ θ uniform) reduces
+    // net free fill, so target_free_segs = θ·N·seg / (1 - θ·i).
+    if (!compactor) return;
+    double inv_corr = 1.0;
+    if (ghost_sum_initialized_ && log_cache_timestamp > last_ghost_sum_ts_) {
+        const uint64_t win_writes = log_cache_timestamp - last_ghost_sum_ts_;
+        const uint64_t win_inv    = (invalidate_blocks > last_invalidate_at_comp_)
+                                  ? (invalidate_blocks - last_invalidate_at_comp_)
+                                  : 0;
+        const double i_rate = std::min(0.95,
+            static_cast<double>(win_inv) / static_cast<double>(win_writes));
+        const double theta_i = util_step_ * i_rate;
+        inv_corr = 1.0 / (1.0 - std::min(0.95, theta_i));
+    }
+    const double target_free_segs = util_step_ *
+        static_cast<double>(total_segments) * inv_corr;
+    auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs);
+    if (s.cum_invalid > 0.0) {
+        if (ghost_sum_initialized_) {
+            const double rate = s.cum_valid / s.cum_invalid;
+            const uint64_t dt = (log_cache_timestamp > last_ghost_sum_ts_)
+                              ? (log_cache_timestamp - last_ghost_sum_ts_)
+                              : 0;
+            // Anchor ghost_compacted_blocks_sum_ on the real compacted_blocks
+            // baseline plus the θ-regime increment over this window.  This
+            // keeps G(u+δ) − G(u) ≈ ghost_increment / total_writes, instead of
+            // letting the synthetic counter drift independently of real GC.
+            ghost_compacted_blocks_sum_ = static_cast<double>(compacted_blocks) +
+                                          static_cast<double>(dt) * rate;
+        } else {
+            // First real comp: anchor to current compacted_blocks (dt=0 -> no
+            // ghost increment yet).
+            ghost_compacted_blocks_sum_ = static_cast<double>(compacted_blocks);
+            ghost_sum_initialized_ = true;
+        }
+        last_ghost_sum_ts_       = log_cache_timestamp;
+        last_invalidate_at_comp_ = invalidate_blocks;
+    }
+}
+
+void LogCache::periodic_gs_predict_track() {
+    // Phase 1: emit G(u+δ_k) for δ_k ∈ {(segs-1), segs, (segs+1)} every
+    // segment/4 tick, buffer with timestamp.  When an entry has aged δ_k
+    // worth of host writes, compare its G_pred against the currently-published
+    // EWMA G(u) and accumulate relative + squared error.  Read-only w.r.t.
+    // the live policy — `gs_decision_period_segs_` is not modified here.
+    if (!is_ghost_cache || !compactor) return;
+    if (log_cache_timestamp == 0) return;
+    if (log_cache_timestamp % (segment_size_blocks / 4) != 0) return;
+
+    // Lazy init around the configured segs.
+    if (!gs_cand_initialized_) {
+        for (int k = 0; k < 3; ++k) {
+            int s = std::max(1, gs_decision_period_segs_ + (k - 1));
+            gs_cand_[k].segs       = s;
+            gs_cand_[k].util_step  = static_cast<double>(s) *
+                static_cast<double>(segment_size_blocks) /
+                static_cast<double>(total_cache_block_count);
+        }
+        gs_cand_initialized_ = true;
+    }
+
+    // inv_corr shared with the live ghost-sum advance (same i_rate window).
+    double inv_corr = 1.0;
+    if (ghost_sum_initialized_ && log_cache_timestamp > last_ghost_sum_ts_) {
+        const uint64_t win_writes = log_cache_timestamp - last_ghost_sum_ts_;
+        const uint64_t win_inv    = (invalidate_blocks > last_invalidate_at_comp_)
+                                  ? (invalidate_blocks - last_invalidate_at_comp_)
+                                  : 0;
+        const double i_rate  = std::min(0.95,
+            static_cast<double>(win_inv) / static_cast<double>(win_writes));
+        const double theta_i = util_step_ * i_rate;
+        inv_corr = 1.0 / (1.0 - std::min(0.95, theta_i));
+    }
+
+    const double G_now            = compaction_ratio.has_value()
+                                  ? compaction_ratio.value() : 0.0;
+    const double F_now            = eviction_ratio.has_value()
+                                  ? eviction_ratio.value() : 0.0;
+    const double F_ghost_marginal = eviction_ratio_in_ghost_cache.has_value()
+                                  ? eviction_ratio_in_ghost_cache.value() : 0.0;
+
+    for (int k = 0; k < 3; ++k) {
+        auto& c = gs_cand_[k];
+        const uint64_t delta_ts = static_cast<uint64_t>(c.segs) *
+            static_cast<uint64_t>(segment_size_blocks);
+
+        // --- G(u+δ_k) emit + drain ---
+        const double target_free_segs = c.util_step *
+            static_cast<double>(total_segments) * inv_corr;
+        auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs);
+        if (s.cum_invalid > 0.0) {
+            const double rate   = s.cum_valid / s.cum_invalid;
+            const double g_pred = G_now + rate;       // v4-style: G(u) + ghost_marginal
+            c.g_pred_buf.emplace_back(log_cache_timestamp, g_pred);
+        }
+        while (!c.g_pred_buf.empty() &&
+               log_cache_timestamp - c.g_pred_buf.front().first >= delta_ts) {
+            const double pred = c.g_pred_buf.front().second;
+            const double real = G_now;
+            const double diff = real - pred;
+            c.g_sq_err_sum += diff * diff;
+            if (real > 1e-12) c.g_err_sum += std::fabs(diff) / real;
+            c.g_err_n      += 1;
+
+            // Smoothed (SWMA 64 segs) err: feed paired (pred, real) into sliding
+            // windows of size kSmoothWin and compare their averages instead of
+            // the raw spikes that swamp the small-δ RMSE.
+            c.g_pred_win.push_back(pred);
+            c.g_real_win.push_back(real);
+            c.g_pred_win_sum += pred;
+            c.g_real_win_sum += real;
+            if (c.g_pred_win.size() > kSmoothWin) {
+                c.g_pred_win_sum -= c.g_pred_win.front();
+                c.g_real_win_sum -= c.g_real_win.front();
+                c.g_pred_win.pop_front();
+                c.g_real_win.pop_front();
+            }
+            if (c.g_pred_win.size() == kSmoothWin) {
+                const double avg_p = c.g_pred_win_sum / kSmoothWin;
+                const double avg_r = c.g_real_win_sum / kSmoothWin;
+                const double sdiff = avg_r - avg_p;
+                c.g_smooth_sq_err_sum += sdiff * sdiff;
+                if (avg_r > 1e-12) c.g_smooth_err_sum += std::fabs(sdiff) / avg_r;
+                c.g_smooth_err_n      += 1;
+            }
+            c.g_pred_buf.pop_front();
+        }
+
+        // --- F(u+δ_k) emit + drain ---
+        // Linear scale: F_pred_k = F(u) - (δ_k / δ_live) × F_ghost_marginal.
+        // F_ghost_marginal (= eviction_ratio_in_ghost_cache) estimates how much
+        // flush the LIVE ghost δ saves; we scale by candidate-to-live ratio.
+        const double scale_k = (util_step_ > 0)
+                             ? (c.util_step / util_step_) : 1.0;
+        const double f_pred  = std::max(0.0, F_now - scale_k * F_ghost_marginal);
+        c.f_pred_buf.emplace_back(log_cache_timestamp, f_pred);
+        while (!c.f_pred_buf.empty() &&
+               log_cache_timestamp - c.f_pred_buf.front().first >= delta_ts) {
+            const double pred = c.f_pred_buf.front().second;
+            const double real = F_now;
+            const double diff = real - pred;
+            c.f_sq_err_sum += diff * diff;
+            if (real > 1e-12) c.f_err_sum += std::fabs(diff) / real;
+            c.f_err_n      += 1;
+
+            c.f_pred_win.push_back(pred);
+            c.f_real_win.push_back(real);
+            c.f_pred_win_sum += pred;
+            c.f_real_win_sum += real;
+            if (c.f_pred_win.size() > kSmoothWin) {
+                c.f_pred_win_sum -= c.f_pred_win.front();
+                c.f_real_win_sum -= c.f_real_win.front();
+                c.f_pred_win.pop_front();
+                c.f_real_win.pop_front();
+            }
+            if (c.f_pred_win.size() == kSmoothWin) {
+                const double avg_p = c.f_pred_win_sum / kSmoothWin;
+                const double avg_r = c.f_real_win_sum / kSmoothWin;
+                const double sdiff = avg_r - avg_p;
+                c.f_smooth_sq_err_sum += sdiff * sdiff;
+                if (avg_r > 1e-12) c.f_smooth_err_sum += std::fabs(sdiff) / avg_r;
+                c.f_smooth_err_n      += 1;
+            }
+            c.f_pred_buf.pop_front();
+        }
+    }
+}
+
+void LogCache::periodic_ghost_delta_gc_sum() {
+    // GhostDelta_GC variant: estimate G(u+θ) via cumulative CB-sorted scan.
+    //   m = min { k : Σ_{i<k} (seg - v_i) ≥ θ · N · seg }
+    //   G(u+θ) cost rate per host write ≈ Σ v_i / Σ (seg-v_i) = u_avg/(1-u_avg)
+    // Advance a synthetic ghost_compacted_blocks_sum_ counter at that rate so
+    // compaction_ratio_in_ghost_cache stays comparable to compaction_ratio.
+    if (!is_ghost_cache) return;
+
+    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+        // ghost_compacted_blocks_sum_ is advanced per real-compaction event
+        // in check_and_evict_if_needed (synchronized with real comps). Here we
+        // just feed the cumulative to MovingAverageRatio for rate extraction.
+        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+        compaction_ratio_in_ghost_cache.updateFromCumulative(
+            log_cache_timestamp,
+            static_cast<uint64_t>(ghost_compacted_blocks_sum_));
+        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+        uint64_t evicted_in_ghost = ghost_cache.evictCount();
+        eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+    }
+    if (log_cache_timestamp % (segment_size_blocks * gs_decision_period_segs_) == 0) {
+        if (compaction_ratio.has_value() &&
+            compaction_ratio_in_ghost_cache.has_value() &&
+            eviction_ratio.has_value() &&
+            eviction_ratio_in_ghost_cache.has_value()){
+            // Weight flush side by observed cold-tier WAF. Falls back to 1.0
+            // before the first 10-minute window closes (current_waf==0).
+            const double waf_w = (current_waf > 0.0) ? current_waf : 1.0;
+            if (periodic_ratio_ * waf_w * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value())
+                    > compaction_ratio_in_ghost_cache.value() - compaction_ratio.value()) {
+                target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + util_step_);
+            }
+            else {
+                target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - util_step_);
+            }
+        }
+    }
+}
+
+void LogCache::periodic_ghost_delta_gc_nand() {
+    if (is_ghost_cache){
+        if (log_cache_timestamp % (segment_size_blocks/4) == 0) {
+            compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+            compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
+            eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+            uint64_t evicted_in_ghost = ghost_cache.evictCount();
+            eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+        }
+        if (log_cache_timestamp % (segment_size_blocks * 8) == 0) {
+            if (compaction_ratio.has_value() &&
+                compaction_ratio_in_ghost_cache.has_value() &&
+                eviction_ratio.has_value() &&
+                eviction_ratio_in_ghost_cache.has_value()){
+                // NAND-aware: weight eviction-side benefit by observed cold-tier WAF.
+                if (periodic_ratio_ * current_waf * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value())
+                        > compaction_ratio_in_ghost_cache.value() - compaction_ratio.value()) {
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + util_step_);
+                }
+                else {
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - util_step_);
+                }
+            }
+        }
+    }
+}
+
+void LogCache::periodic_ghost_delta_gc_auto() {
+    // FIXME: AUTO body disabled — auto_tune::Arm refactored to {signed_step}
+    // only, but this function still references the prior {dir, half_life_blk,
+    // window_segs, step_pct} schema and missing members (auto_dir_,
+    // auto_compare_segs_). Re-port against arm_grid.h's signed_step grid
+    // before re-enabling.
+    return;
+#if 0
+    if (!is_ghost_cache) return;
+
+    // 1) Feed cumulative counters; on round close apply the next arm.
+    if (gp_tuner_) {
+        gp_tuner_->observe(static_cast<uint64_t>(write_size_to_cache),
+                           static_cast<uint64_t>(evicted_blocks),
+                           static_cast<uint64_t>(compacted_blocks));
+        if (gp_tuner_->round_closed_since_last_call()) {
+            // Snapshot the round that just closed (using prev arm and the
+            // reward/mu/sigma the GP just produced for the *next* arm).
+            const auto closed_arm = auto_prev_arm_;
+            const auto arm        = gp_tuner_->close_round_and_select();
+            // setMovingAverage rebuilds the seven ratio objects, so only call
+            // it when the half-life actually changes (avoids EWMA churn).
+            if (arm.half_life_blk != auto_prev_arm_.half_life_blk) {
+                setMovingAverage(moving_avg_type_, arm.half_life_blk);
+            }
+            auto_dir_           = (arm.dir >= 0) ? +1 : -1;
+            auto_compare_segs_  = arm.window_segs;
+            util_step_          = arm.step_pct;
+            auto_prev_arm_      = arm;
+
+            // Append one row per round. round_index in the tuner is the
+            // number of rounds *closed* so far (1-based after the first
+            // close), so the row records: round N closed with closed_arm
+            // → reward → next arm chosen.
+            if (!autotune_csv_path_.empty()) {
+                if (!autotune_csv_) {
+                    autotune_csv_ = fopen(autotune_csv_path_.c_str(), "w");
+                    if (autotune_csv_) {
+                        fprintf(autotune_csv_,
+                                "round,host_TiB,closed_dir,closed_hl,closed_win,closed_step,"
+                                "flush_rate,comp_rate,f,reward,n_train,"
+                                "next_dir,next_hl,next_win,next_step,next_mu,next_sigma\n");
+                    }
+                }
+                if (autotune_csv_) {
+                    const double host_TiB =
+                        static_cast<double>(write_size_to_cache) /
+                        static_cast<double>(1ull << 40);
+                    const double flush = gp_tuner_->last_flush_rate();
+                    const double comp  = gp_tuner_->last_comp_rate();
+                    const double f     = -gp_tuner_->last_reward();
+                    fprintf(autotune_csv_,
+                            "%llu,%.4f,%d,%.0f,%.3f,%.5f,"
+                            "%.6f,%.6f,%.6f,%.6f,%zu,"
+                            "%d,%.0f,%.3f,%.5f,%.6f,%.6f\n",
+                            (unsigned long long)gp_tuner_->round_index(),
+                            host_TiB,
+                            closed_arm.dir, closed_arm.half_life_blk,
+                            closed_arm.window_segs, closed_arm.step_pct,
+                            flush, comp, f, gp_tuner_->last_reward(),
+                            gp_tuner_->train_size(),
+                            arm.dir, arm.half_life_blk,
+                            arm.window_segs, arm.step_pct,
+                            gp_tuner_->last_mu(), gp_tuner_->last_sigma());
+                    fflush(autotune_csv_);
+                }
+            }
+        }
+    }
+
+    // 2) Stock GhostDelta_GC sampling/decision loop with autotuned knobs.
+    const uint64_t sample_period = segment_size_blocks / 4;
+    const uint64_t decide_period = static_cast<uint64_t>(
+        static_cast<double>(segment_size_blocks) * auto_compare_segs_);
+    if (sample_period > 0 && log_cache_timestamp % sample_period == 0) {
+        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+        compaction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, ghost_compacted_blocks);
+        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+        const uint64_t evicted_in_ghost = ghost_cache.evictCount();
+        eviction_ratio_in_ghost_cache.updateFromCumulative(log_cache_timestamp, evicted_in_ghost);
+    }
+    if (decide_period == 0 || log_cache_timestamp % decide_period != 0) return;
+    if (!compaction_ratio.has_value() || !compaction_ratio_in_ghost_cache.has_value() ||
+        !eviction_ratio.has_value()   || !eviction_ratio_in_ghost_cache.has_value()) return;
+
+    // GC's asymmetric comparison gives raise/lower evidence; auto_dir_ acts
+    // as a polarity multiplier (dir=-1 inverts the evidence — exposed so the
+    // GP can confirm dir=+1 is the right call).
+    const bool raise_evidence =
+        periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value())
+            > compaction_ratio_in_ghost_cache.value() - compaction_ratio.value();
+    const int  applied = auto_dir_ * (raise_evidence ? +1 : -1);
+    const double base  = static_cast<double>(global_valid_blocks) / total_cache_block_count;
+    if (applied >= 0) {
+        target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, base + util_step_);
+    } else {
+        target_valid_blk_rate = std::max(0.0, base - util_step_);
+    }
+#endif
 }
 
 void LogCache::periodic_ghost_delta() {
@@ -243,11 +626,11 @@ void LogCache::periodic_ghost_delta() {
             if (compaction_ratio.has_value() &&
                 eviction_ratio.has_value() &&
                 eviction_ratio_in_ghost_cache.has_value()){
-                if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value()) {
-                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + UTIL_STEP);
+                if (periodic_ratio_ * (eviction_ratio.value() - eviction_ratio_in_ghost_cache.value()) > compaction_ratio.value() * 1.00) {
+                    target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, (double) global_valid_blocks / total_cache_block_count + ghost_reanchor_step_);
                 }
                 else {
-                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - UTIL_STEP);
+                    target_valid_blk_rate = std::max(0.0, (double)global_valid_blocks / total_cache_block_count - ghost_reanchor_step_);
                 }
             }
         }
@@ -287,26 +670,25 @@ void LogCache::periodic_ghost_delta() {
 }
 
 void LogCache::periodic_t_delta() {
-    /* Hill-climb on f = Δcompacted + r * Δevicted across decision windows.
-     * 직전 window 의 f 와 비교해 작아지면 같은 방향 유지, 커지면 부호 뒤집기.
-     * ghost cache 비대칭 비교 없이 양쪽 cost 를 동일하게 실측. */
+    /* Hill-climb on smoothed f = compaction_rate + r * eviction_rate.
+     * MovingAverage(EWMA or SMA) 를 통해 누적값으로부터 평활화된 rate 를 계산하고,
+     * 이전 window 의 smoothed f 와 비교해 방향을 결정. */
     if (!is_ghost_cache) return;
     if (log_cache_timestamp == 0) return;
-    if (log_cache_timestamp % (segment_size_blocks * 8) != 0) return;
     if (valid_blk_rate_hard_limit <= 0.0) return;
 
-    uint64_t comp_now = compacted_blocks;
-    uint64_t evic_now = evicted_blocks;
+    if (log_cache_timestamp % (segment_size_blocks/4) == 0) {
+        compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
+        eviction_ratio.updateFromCumulative(log_cache_timestamp, evicted_blocks);
+    }
+    if (log_cache_timestamp % (segment_size_blocks * 8) != 0) return;
 
-    if (tdelta_have_prev_snapshot_) {
-        uint64_t d_comp = comp_now - tdelta_prev_compacted_;
-        uint64_t d_evic = evic_now - tdelta_prev_evicted_;
-        double f_window = (double)d_comp + periodic_ratio_ * (double)d_evic;
-
-        if (tdelta_have_prev_f_ && f_window > tdelta_prev_f_) {
+    if (compaction_ratio.has_value() && eviction_ratio.has_value()) {
+        double f_curr = compaction_ratio.value() + periodic_ratio_ * eviction_ratio.value();
+        if (tdelta_have_prev_f_ && f_curr > tdelta_prev_f_) {
             tdelta_last_dir_ = -tdelta_last_dir_;
         }
-        tdelta_prev_f_      = f_window;
+        tdelta_prev_f_      = f_curr;
         tdelta_have_prev_f_ = true;
     }
 
@@ -314,10 +696,6 @@ void LogCache::periodic_t_delta() {
     if (new_rate < 0.0) new_rate = 0.0;
     if (new_rate > valid_blk_rate_hard_limit) new_rate = valid_blk_rate_hard_limit;
     target_valid_blk_rate = new_rate;
-
-    tdelta_prev_compacted_      = comp_now;
-    tdelta_prev_evicted_        = evic_now;
-    tdelta_have_prev_snapshot_  = true;
 }
 /*
 void LogCache::periodic() {
@@ -512,9 +890,6 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
         while (victim_id >= Segment::GC_STREAM_START) {
             auto vit = gc_active_seg.find(victim_id);
             if (vit != gc_active_seg.end()) {
-                printf("[CycleWrap] dummy_fill stream %d, seg=%p, write_ptr=%zu/%zu, valid_cnt=%ld, free_pool=%zu\n",
-                       victim_id, (void*)vit->second, vit->second->write_ptr, vit->second->blocks.size(),
-                       vit->second->valid_cnt, free_pool.size());
                 dummy_fill_segment(vit->second);
                 gc_active_seg.erase(vit);
             }
@@ -604,7 +979,7 @@ void LogCache::check_and_evict_if_needed(int max_victims)
     {
         /* eviction 후보 수집 */
         bool compact = false;
-        if (target_valid_blk_rate >= UTIL_STEP) {
+        if (target_valid_blk_rate >= 0.1) {
             if (compactor && (double)target_valid_blk_rate * total_cache_block_count  > global_valid_blocks) {
                 compact = true;
             }
@@ -629,64 +1004,41 @@ void LogCache::check_and_evict_if_needed(int max_victims)
         gc_victim_count++;
         gc_victim_valid_ratio_sum += (double)victim->valid_cnt / victim->blocks.size();
         if (victim->valid_cnt == 0) {
-            printf("[GC] event=RESET_EMPTY valid_cnt=0 free_pool=%zu global_valid=%lu ts=%lu\n",
-                   free_pool.size(), global_valid_blocks, log_cache_timestamp);
             reset_segment(victim);
         }
         else if (compact == false) {
-            printf("[GC] event=EVICT_SEG valid_cnt=%ld seg_age=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                   victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                   free_pool.size(), global_valid_blocks, log_cache_timestamp, victim->get_class_num());
             evicted_segment_age = victim->get_create_time();
             evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
             evict_segment(victim);
-            printf("[GC] event=EVICT_SEG_DONE free_pool=%zu global_valid=%lu\n",
-                   free_pool.size(), global_valid_blocks);
         }
         else if (compact == true) {
             if (victim->valid_cnt > 0.95 * segment_size_blocks) {
                 compact = false;
                 compactor->add(victim, log_cache_timestamp);
                 victim = (LogCacheSegment *)evictor->choose_segment();
-                printf("[GC] event=COMPACT_TOO_FULL->EVICT_SEG valid_cnt=%ld seg_age=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                       victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                       free_pool.size(), global_valid_blocks, log_cache_timestamp, victim->get_class_num());
                 evicted_segment_age = victim->get_create_time();
                 evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
                 evict_segment(victim);
-                printf("[GC] event=COMPACT_TOO_FULL->EVICT_SEG_DONE free_pool=%zu global_valid=%lu\n",
-                       free_pool.size(), global_valid_blocks);
             }
             // Ghost compaction cost estimation
             else {
-                if(is_ghost_cache && compactor) {
-                    double m_segments = UTIL_STEP * total_segments;
-                    auto valid_pages = compactor->get_kth_segment_valid_cnt_for_free_segments(m_segments);
-                    ghost_compacted_blocks += valid_pages;
+                if (is_ghost_cache && compactor) {
+                    update_ghost_compacted_blocks(victim);       // GhostDelta_GC variants
+                    update_ghost_compacted_blocks_sum();          // GhostDelta_GC_SUM
                 }
 
                 int stream_id = victim->get_class_num();
-                printf("[GC] event=COMPACT valid_cnt=%ld seg_age=%lu threshold=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                       victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                       threshold, free_pool.size(), global_valid_blocks, log_cache_timestamp, stream_id);
                 compacted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
                 last_target_seg = (LogCacheSegment *)evict_and_compaction(victim, threshold, stream_id);
-                printf("[GC] event=COMPACT_DONE free_pool=%zu global_valid=%lu\n",
-                       free_pool.size(), global_valid_blocks);
                 if (last_target_seg) {
                     segment_list.push_back(last_target_seg);
                 }
             }
         }
         else {
-            printf("[GC] event=EVICT_SEG_FALLBACK valid_cnt=%ld seg_age=%lu free_pool=%zu global_valid=%lu ts=%lu class=%d\n",
-                   victim->valid_cnt, log_cache_timestamp - victim->create_timestamp,
-                   free_pool.size(), global_valid_blocks, log_cache_timestamp, victim->get_class_num());
             evicted_segment_age = victim->get_create_time();
             evicted_ages_with_segment_histogram->inc(log_cache_timestamp - victim->create_timestamp);
             evict_segment(victim);
-            printf("[GC] event=EVICT_SEG_FALLBACK_DONE free_pool=%zu global_valid=%lu\n",
-                   free_pool.size(), global_valid_blocks);
         }
 
         if (stream_policy && compact == true) {
@@ -733,8 +1085,6 @@ void LogCache::dummy_fill_segment(LogCacheSegment* s)
 {
     if (s) {
         ++dummy_fill_segment_count;
-        printf("[GC] event=DUMMY_FILL valid_cnt=%ld write_ptr=%zu/%zu free_pool=%zu global_valid=%lu class=%d\n",
-               s->valid_cnt, s->write_ptr, s->blocks.size(), free_pool.size(), global_valid_blocks, s->get_class_num());
         for (std::size_t i = s->write_ptr; i < s->blocks.size(); ++i)
         {
             s->blocks[i] = { 0, false, UINT64_MAX };
@@ -1108,8 +1458,53 @@ void LogCache::print_stats() {
         const std::string& prefix = stats_prefix();
         const char* prefix_cstr = prefix.empty() ? "LOG_CACHE" : prefix.c_str();
         double avg_victim_valid_ratio = (gc_victim_count > 0) ? gc_victim_valid_ratio_sum / gc_victim_count : 0.0;
-        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu gc_victim_avg_valid_ratio: %.6f gc_victim_count: %lu dummy_fill_segments: %lu\n",
-                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks, avg_victim_valid_ratio, gc_victim_count, dummy_fill_segment_count);
+        double F_u   = eviction_ratio.has_value()                ? eviction_ratio.value()                : 0.0;
+        double F_ud  = eviction_ratio_in_ghost_cache.has_value() ? eviction_ratio_in_ghost_cache.value() : 0.0;
+        double G_u   = compaction_ratio.has_value()              ? compaction_ratio.value()              : 0.0;
+        double G_ud  = compaction_ratio_in_ghost_cache.has_value()? compaction_ratio_in_ghost_cache.value(): 0.0;
+        // Phase-1 candidate tracker columns:
+        //   candK_segs
+        //   candK_g_n  candK_g_mre  candK_g_rmse  candK_g_smre  candK_g_srmse
+        //   candK_f_n  candK_f_mre  candK_f_rmse  candK_f_smre  candK_f_srmse
+        //   (K = 0,1,2 = segs-1, segs, segs+1)
+        // mre/rmse  = raw drain pair stats
+        // smre/srmse = SMA(64 segs) window of paired (pred, real) before err calc
+        double g_mre[3] = {0,0,0}, g_rmse[3] = {0,0,0};
+        double f_mre[3] = {0,0,0}, f_rmse[3] = {0,0,0};
+        double g_smre[3] = {0,0,0}, g_srmse[3] = {0,0,0};
+        double f_smre[3] = {0,0,0}, f_srmse[3] = {0,0,0};
+        int    cand_segs[3] = {0,0,0};
+        uint64_t g_n[3] = {0,0,0}, f_n[3] = {0,0,0};
+        uint64_t g_sn[3] = {0,0,0}, f_sn[3] = {0,0,0};
+        for (int k = 0; k < 3; ++k) {
+            const auto& c = gs_cand_[k];
+            cand_segs[k] = c.segs;
+            g_n[k]  = c.g_err_n;
+            f_n[k]  = c.f_err_n;
+            g_sn[k] = c.g_smooth_err_n;
+            f_sn[k] = c.f_smooth_err_n;
+            if (c.g_err_n > 0) {
+                g_mre[k]  = c.g_err_sum    / static_cast<double>(c.g_err_n);
+                g_rmse[k] = std::sqrt(c.g_sq_err_sum / static_cast<double>(c.g_err_n));
+            }
+            if (c.f_err_n > 0) {
+                f_mre[k]  = c.f_err_sum    / static_cast<double>(c.f_err_n);
+                f_rmse[k] = std::sqrt(c.f_sq_err_sum / static_cast<double>(c.f_err_n));
+            }
+            if (c.g_smooth_err_n > 0) {
+                g_smre[k]  = c.g_smooth_err_sum    / static_cast<double>(c.g_smooth_err_n);
+                g_srmse[k] = std::sqrt(c.g_smooth_sq_err_sum / static_cast<double>(c.g_smooth_err_n));
+            }
+            if (c.f_smooth_err_n > 0) {
+                f_smre[k]  = c.f_smooth_err_sum    / static_cast<double>(c.f_smooth_err_n);
+                f_srmse[k] = std::sqrt(c.f_smooth_sq_err_sum / static_cast<double>(c.f_smooth_err_n));
+            }
+        }
+        fprintf (fp_stats, "%s invalidate_blocks: %lu compacted_blocks: %lu global_valid_blocks: %lu write_size_to_cache: %llu evicted_blocks: %llu write_hit_size: %llu total_cache_size: %lu reinsert_blocks: %lu read_blocks_in_partial_write %lu evicted_in_ghost: %zu ghost_compacted_blocks: %lu gc_victim_avg_valid_ratio: %.6f gc_victim_count: %lu dummy_fill_segments: %lu ftl_host_pages: %lu ftl_nand_pages: %lu F_u: %.6f F_u_delta: %.6f G_u: %.6f G_u_delta: %.6f target_valid_rate: %.6f util_step: %.6f cand0_segs: %d cand0_g_n: %lu cand0_g_mre: %.6f cand0_g_rmse: %.6f cand0_g_sn: %lu cand0_g_smre: %.6f cand0_g_srmse: %.6f cand0_f_n: %lu cand0_f_mre: %.6f cand0_f_rmse: %.6f cand0_f_sn: %lu cand0_f_smre: %.6f cand0_f_srmse: %.6f cand1_segs: %d cand1_g_n: %lu cand1_g_mre: %.6f cand1_g_rmse: %.6f cand1_g_sn: %lu cand1_g_smre: %.6f cand1_g_srmse: %.6f cand1_f_n: %lu cand1_f_mre: %.6f cand1_f_rmse: %.6f cand1_f_sn: %lu cand1_f_smre: %.6f cand1_f_srmse: %.6f cand2_segs: %d cand2_g_n: %lu cand2_g_mre: %.6f cand2_g_rmse: %.6f cand2_g_sn: %lu cand2_g_smre: %.6f cand2_g_srmse: %.6f cand2_f_n: %lu cand2_f_mre: %.6f cand2_f_rmse: %.6f cand2_f_sn: %lu cand2_f_smre: %.6f cand2_f_srmse: %.6f\n",
+                prefix_cstr, invalidate_blocks, compacted_blocks, global_valid_blocks, write_size_to_cache, evicted_blocks, write_hit_size, total_capacity_bytes, reinsert_blocks, read_blocks_in_partial_write, ghost_cache.evictCount(), ghost_compacted_blocks, avg_victim_valid_ratio, gc_victim_count, dummy_fill_segment_count, (uint64_t)ftl.GetHostWritePages(), (uint64_t)ftl.GetNandWritePages(), F_u, F_ud, G_u, G_ud, target_valid_blk_rate, util_step_,
+                cand_segs[0], g_n[0], g_mre[0], g_rmse[0], g_sn[0], g_smre[0], g_srmse[0], f_n[0], f_mre[0], f_rmse[0], f_sn[0], f_smre[0], f_srmse[0],
+                cand_segs[1], g_n[1], g_mre[1], g_rmse[1], g_sn[1], g_smre[1], g_srmse[1], f_n[1], f_mre[1], f_rmse[1], f_sn[1], f_smre[1], f_srmse[1],
+                cand_segs[2], g_n[2], g_mre[2], g_rmse[2], g_sn[2], g_smre[2], g_srmse[2], f_n[2], f_mre[2], f_rmse[2], f_sn[2], f_smre[2], f_srmse[2]);
         fflush(fp_stats);
         next_written_bytes += written_window_bytes;
     }

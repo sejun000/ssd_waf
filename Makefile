@@ -18,7 +18,8 @@ SRCS_cache_sim     := cache_sim.cpp trace_parser.cpp allocator.cpp \
 					  ftl.cpp log_fifo_cache.cpp fairywren_cache.cpp \
 					  histogram.cpp \
 					  istream.cpp sepbit.cpp hot_cold.cpp hot_cold_midas.cpp multi_hot_cold.cpp \
-					  emwa.cpp ghost_cache.cpp \
+					  emwa.cpp sma.cpp ghost_cache.cpp \
+					  auto_tune/gp_tuner.cpp \
 					  MiDAS/algorithm.cpp MiDAS/hf.cpp MiDAS/model.cpp MiDAS/queue.cpp MiDAS/ssd_config.cpp MiDAS/ssdsimul.cpp
 
 SRCS_trace_replayer:= trace_replayer.cpp trace_parser.cpp

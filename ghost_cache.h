@@ -23,6 +23,12 @@ public:
     // 현재 cache 크기
     std::size_t size() const { return cache_.size(); }
 
+    // capacity_ 변경. 새 capacity 가 현재 size 보다 작으면 front 부터 evict
+    // (FIFO 의미 보존 + evict_count_ 누적). 키우는 쪽은 추가 작업 없음.
+    void setCapacity(std::size_t new_capacity);
+
+    std::size_t capacity() const { return capacity_; }
+
 private:
     using ListIt = std::list<uint64_t>::iterator;
 

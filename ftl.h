@@ -24,7 +24,7 @@
 #define SECTOR_SIZE        512                   // bytes – typical logical sector (LBA)
 #endif
 #ifndef NAND_BLOCK_SIZE
-#define NAND_BLOCK_SIZE         (32 * 1024 * 1024)    // bytes – 32 MiB physical block
+#define NAND_BLOCK_SIZE         (6ULL * 1024 * 1024 * 1024)    // bytes - 6 GiB physical block (test)
 #endif
 
 #define NOT_ALLOCATED 0xFFFFFFFFFFFFFFFFULL

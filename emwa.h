@@ -3,7 +3,17 @@
 
 #include <cstdint>
 
-class Ewma {
+// Common moving-average interface.
+class MovingAverage {
+public:
+    virtual ~MovingAverage() = default;
+    virtual void   updateWithBlocks(double x, double written_blocks) = 0;
+    virtual double value() const = 0;
+    virtual bool   has_value() const = 0;
+    virtual void   reset() = 0;
+};
+
+class Ewma : public MovingAverage {
 public:
     explicit Ewma(double alpha,
                   bool bias_correction = false,
@@ -23,7 +33,7 @@ public:
         return FromHalfLife(half_life_blocks, bias_correction, /*base_interval_units=*/1.0);
     }
 
-    void reset();
+    void reset() override;
 
     // 한 단위(step) 업데이트
     void update(double x);
@@ -32,17 +42,17 @@ public:
     void updateWithUnits(double x, double units);
 
     // 편의: 블록 수로 가중 업데이트 (units = written_blocks)
-    void updateWithBlocks(double x, double written_blocks) {
+    void updateWithBlocks(double x, double written_blocks) override {
         updateWithUnits(x, written_blocks);
     }
 
     // 현재 값 (bias-corrected 선택)
-    double value() const;
+    double value() const override;
 
     // 디버그용 raw
     double raw() const { return initialized_ ? m_ : __builtin_nan(""); }
 
-    bool has_value() const { return initialized_; }
+    bool has_value() const override { return initialized_; }
 
     double alpha() const { return alpha_; }
     double base_interval_units() const { return base_interval_units_; }

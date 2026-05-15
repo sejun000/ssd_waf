@@ -7,8 +7,10 @@
 #include "histogram.h"
 #include "emwa_ratio.h"
 #include "ghost_cache.h"
+#include "auto_tune/gp_tuner.h"
 
 #include <unordered_map>
+#include <array>
 #include <deque>
 #include <list>
 #include <memory>
@@ -26,7 +28,7 @@ struct Config
 
     double      free_ratio_low = 0.04;                ///< 25% (~50 segments for 512 total)
     int         evicted_blk_size = 1;    // 4k eviction
-    uint64_t         print_stats_interval = 10 * 1024ull * 1024 * 1024; // 10 GB
+    uint64_t         print_stats_interval = 6ull * 1024 * 1024 * 1024; // 6 GiB (= segment_bytes)
 };
 
 #define GHOST_CACHE 1
@@ -34,7 +36,10 @@ struct Config
 enum class PeriodicMode {
     GhostDelta,   // 기존 ghost-cache 기반 비대칭 비교 (eviction delta vs compaction amount)
     GhostDelta_GC, // GC 적용된 ghost-cache 기반 비대칭 비교 (G(u+δ)-G(u) 예측)
+    GhostDelta_GC_NAND, // GC 비대칭 비교 + cold-tier WAF (current_waf) 가중
     TimeDelta,    // t-delta hill-climb: f = compacted + r*evicted 의 windowed Δ로 방향 결정
+    GhostDelta_GC_AUTO, // GhostDelta_GC + GP/UCB autotuner over (dir, HL, window, step)
+    GhostDelta_GC_SUM,  // G(u+θ) via cumulative CB-sorted scan: m s.t. Σ(seg-v_i)=θ·N·seg
 };
 
 class LogCache final : public ICache
@@ -59,7 +64,8 @@ public:
              double valid_rate_period_gb = 0.0,
              double valid_rate_min = 0.0,
              double valid_rate_max = 0.0,
-             double periodic_ratio = 2.88
+             double periodic_ratio = 2.88,
+             double input_util_step = 0.02
             );
 
     ~LogCache();
@@ -119,6 +125,19 @@ private:
     void periodic_ghost_delta();
     void periodic_ghost_delta_gc();
     void periodic_t_delta();
+    void periodic_ghost_delta_gc_nand();
+    void periodic_ghost_delta_gc_auto();
+    void periodic_ghost_delta_gc_sum();
+    void periodic_gs_predict_track();   // Phase 1: passive candidate-segs tracking
+
+    // Per-compaction ghost-signal updates.  Called from check_and_evict_if_needed
+    // every time a real compaction event commits.  Separated by policy:
+    //   - update_ghost_compacted_blocks: GhostDelta_GC / GC_NAND / GC_AUTO
+    //     (single m-th segment estimate, scaled by (1-u_cur)/(1-u_m)).
+    //   - update_ghost_compacted_blocks_sum: GhostDelta_GC_SUM
+    //     (CB-sorted cumulative scan up to θ·N·seg, rate * dt accumulator).
+    void update_ghost_compacted_blocks(LogCacheSegment* victim);
+    void update_ghost_compacted_blocks_sum();
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -162,6 +181,8 @@ private:
     static const std::size_t TCO_HISTORY_SIZE = 4;
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
+    double util_step_ = 0.02;  // ghost cache size factor + GC anchor step (per-policy override)
+    int    gs_decision_period_segs_ = 8;  // GS hill-climb decision period (in segments)
     EwmaRatio compaction_ratio;
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
@@ -170,9 +191,57 @@ private:
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
     uint64_t ghost_compacted_blocks = 0;
+    // GhostDelta_GC_SUM state: synthetic cumulative counter advanced at each
+    // periodic tick by (timestamp_delta × u_avg/(1-u_avg)) where u_avg comes
+    // from the cumulative CB scan up to θ·N·seg invalid pages.
+    double   ghost_compacted_blocks_sum_ = 0.0;
+    uint64_t last_ghost_sum_ts_ = 0;
+    bool     ghost_sum_initialized_ = false;  // first comp event: skip dt accum, just anchor ts
+    uint64_t last_invalidate_at_comp_ = 0;    // invalidate_blocks snapshot at prev real comp
+
+    // Candidate-segs prediction tracker (Phase 1): for k ∈ {segs-1, segs, segs+1}
+    // emit G(u+δ_k) at every segment/4 tick, buffer with timestamp, and on
+    // entries older than δ_k compute |G_realized - G_predicted| / G_realized.
+    // Used to compare prediction accuracy across neighbouring δ choices without
+    // actually changing the live policy.
+    // SMA window for smoothed RMSE: 64 segments × 4 ticks/segment.
+    // The Phase-1 emit cadence is segment_size_blocks/4, so 256 paired drains
+    // covers exactly 64 segments of host writes.
+    static constexpr size_t kSmoothWin = 256;
+    struct GsCandTracker {
+        int      segs       = 0;
+        double   util_step  = 0.0;
+        // G(u+δ) prediction tracking — raw err
+        std::deque<std::pair<uint64_t, double>> g_pred_buf;  // (t_emit, G_pred)
+        double   g_err_sum    = 0.0;   // Σ |Δ| / G_realized   (relative)
+        double   g_sq_err_sum = 0.0;   // Σ (Δ)^2              (absolute)
+        uint64_t g_err_n      = 0;
+        // G smoothed err (SMA of pred / real over last kSmoothWin paired drains)
+        std::deque<double> g_pred_win;
+        std::deque<double> g_real_win;
+        double   g_pred_win_sum = 0.0;
+        double   g_real_win_sum = 0.0;
+        double   g_smooth_err_sum    = 0.0;
+        double   g_smooth_sq_err_sum = 0.0;
+        uint64_t g_smooth_err_n      = 0;
+        // F(u+δ) prediction tracking — raw err
+        std::deque<std::pair<uint64_t, double>> f_pred_buf;
+        double   f_err_sum    = 0.0;
+        double   f_sq_err_sum = 0.0;
+        uint64_t f_err_n      = 0;
+        // F smoothed err
+        std::deque<double> f_pred_win;
+        std::deque<double> f_real_win;
+        double   f_pred_win_sum = 0.0;
+        double   f_real_win_sum = 0.0;
+        double   f_smooth_err_sum    = 0.0;
+        double   f_smooth_sq_err_sum = 0.0;
+        uint64_t f_smooth_err_n      = 0;
+    };
+    std::array<GsCandTracker, 3> gs_cand_;   // index 0,1,2 = segs-1, segs, segs+1
+    bool gs_cand_initialized_ = false;
     uint64_t ghost_access_total = 0;
     uint64_t ghost_miss_total = 0;
-    static constexpr double UTIL_STEP = 0.02;
     std::deque<double> tco_history;
     bool tco_policy_higher = true;
 
@@ -243,9 +312,65 @@ private:
 
     /* GhostDelta reanchoring step (default ±0.1 for original behavior) */
     double   ghost_reanchor_step_       = 0.1;
+    std::string moving_avg_type_        = "ewma";
+    double   moving_avg_window_         = (double)DEFAULT_HALF_LIFE_IN_BLOCKS;
+    uint64_t lc_last_ftl_host_pages = 0;
+    uint64_t lc_last_ftl_nand_pages = 0;
+    double   current_waf = 0.0;
+
+    /* GhostDelta_GC_AUTO state — GP/UCB autotuner state. gp_tuner_ is null
+     * unless the AUTO policy is wired up; the periodic function then falls
+     * back to stock GC behavior. */
+    std::unique_ptr<auto_tune::GpTuner> gp_tuner_;
+    double         auto_signed_step_  = auto_tune::kDefaultSignedStep;  // arm value: target = clamp(base + this)
+    auto_tune::Arm auto_prev_arm_     = auto_tune::DefaultArm();
+    std::string    autotune_csv_path_;
+    FILE*          autotune_csv_      = nullptr;
 
 public:
-    void setPeriodicMode(PeriodicMode m) { periodic_mode_ = m; }
+    // GS hill-climb decision period in segments. Call BEFORE setPeriodicMode
+    // (it's the override trigger). util_step_ + ghost_cache capacity are
+    // auto-derived from this so the per-decision step matches one window's
+    // host-write coverage (N·seg host-writes / total_cache_blocks).
+    void setGsDecisionPeriodSegs(int n) {
+        if (n > 0) gs_decision_period_segs_ = n;
+    }
+    int  getGsDecisionPeriodSegs() const { return gs_decision_period_segs_; }
+
+    void setPeriodicMode(PeriodicMode m) {
+        periodic_mode_ = m;
+        if (m == PeriodicMode::GhostDelta_GC_SUM &&
+            total_cache_block_count > 0 && segment_size_blocks > 0) {
+            util_step_ = static_cast<double>(segment_size_blocks * gs_decision_period_segs_)
+                       / static_cast<double>(total_cache_block_count);
+            // Resize the LRU/FIFO shadow so it represents exactly the θ-tail
+            // the GS hill-climb reasons about. Shrinking happens immediately
+            // (front-evicted with evict_count_ accounted); growing is lazy.
+            ghost_cache.setCapacity(
+                static_cast<std::size_t>(
+                    static_cast<double>(total_cache_block_count) * util_step_));
+        }
+    }
     void setTdeltaStep(double s) { tdelta_step_ = s; }
     void setGhostReanchorStep(double s) { ghost_reanchor_step_ = s; }
+    void setUtilStep(double s) { util_step_ = s; }  // post-ctor; ghost_cache size already fixed
+    double getUtilStep() const { return util_step_; }
+    // Replace all moving-average ratios with the given (type, window_blocks).
+    // Must be called BEFORE first periodic() update for samples to be consistent.
+    // AUTO-mode hooks (no-ops unless GhostDelta_GC_AUTO is selected).
+    void setGpTuner(std::unique_ptr<auto_tune::GpTuner> t) { gp_tuner_ = std::move(t); }
+    void setAutotuneCsv(const std::string& path) { autotune_csv_path_ = path; }
+
+    void setMovingAverage(const std::string& type, double window_blocks) {
+        if (window_blocks <= 0.0) window_blocks = (double)DEFAULT_HALF_LIFE_IN_BLOCKS;
+        moving_avg_type_ = type;
+        moving_avg_window_ = window_blocks;
+        compaction_ratio                = MovingAverageRatio::Make(type, window_blocks);
+        eviction_ratio                  = MovingAverageRatio::Make(type, window_blocks);
+        eviction_ratio_in_ghost_cache   = MovingAverageRatio::Make(type, window_blocks);
+        compaction_ratio_in_ghost_cache = MovingAverageRatio::Make(type, window_blocks);
+        ghost_util_ratio                = MovingAverageRatio::Make(type, window_blocks);
+        net_free_seg_ratio_             = MovingAverageRatio::Make(type, window_blocks);
+        gc_valid_pages_ratio_           = MovingAverageRatio::Make(type, window_blocks);
+    }
 };

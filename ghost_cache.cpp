@@ -9,6 +9,16 @@ void GhostCache::reset() {
     evict_count_ = 0;
 }
 
+void GhostCache::setCapacity(std::size_t new_capacity) {
+    capacity_ = new_capacity;
+    while (cache_.size() > capacity_) {
+        uint64_t evicted = cache_.front();
+        cache_.pop_front();
+        lookup_.erase(evicted);
+        evict_count_++;
+    }
+}
+
 bool GhostCache::access(uint64_t block_id) {
     auto it = lookup_.find(block_id);
     if (it != lookup_.end()) {

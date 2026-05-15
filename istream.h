@@ -17,4 +17,8 @@ static const int MAX_STREAMS = 40;
 
 IStream* createIstreamPolicy(std::string policy_type);
 void set_stream_interval(uint64_t cache_block_count, uint64_t segment_size_blocks = 0);
+// Re-evaluate interval against current g_threshold (called from Classify so the
+// stream granularity tracks g_threshold drift).  fallback_cache_blocks is used
+// only when g_threshold == 0 (pre-warmup).
+uint64_t compute_stream_interval(uint64_t fallback_cache_blocks = 0);
 extern uint64_t interval;  // = granularity (timestamp units per GC stream)

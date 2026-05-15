@@ -66,6 +66,11 @@ public:
     long long evicted_blocks;
     long long write_hit_size;
     long long next_write_size_to_cache;
+    /* Periodic snapshot of FTL counters (refreshed every 10 GB host write
+     * inside _evict_one_block). Concrete caches (e.g. LogCache) read these
+     * to drive periodic decisions without poking the FTL each tick. */
+    uint64_t last_ftl_host_write_pages = 0;
+    uint64_t last_ftl_nand_write_pages = 0;
     FILE *fp;
     FILE *fp_stats = nullptr;
     FILE *fp_object = nullptr;
@@ -74,4 +79,4 @@ protected:
     std::string start_ts_;
 };
 
-ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88);
+ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88, double util_step = 0.02, const std::string& moving_avg_type = "ewma", double moving_avg_window = 0.0, int gs_decision_period_segs = 8);
