@@ -489,8 +489,3 @@ Host-write tick (`periodic()` 또는 매 write 호출자):
 - segs=1 보다 segs=2 가 좋은 이유: 결정 주기가 너무 짧으면 EWMA 가 한 segment
   내 노이즈에 흔들려 raise/lower 가 진동. 4 이상으로 늘리면 반응이 늦어져
   flush 가 많아짐.
-- `r` 가 클수록 flush cost 가 dominant → GS 가 더 큰 폭으로 이김. r=2.88 같은
-  낮은 r 에서는 CSAL 대비 차이가 작거나 역전될 수 있음.
-- Ghost cache 가 너무 작으면 (`util_step` 너무 작음) `evictCount()` 가 신호
-  못 잡아 `F(u+δ)` 가 0 가까이 머무름 → 항상 raise 결정 → cache 막힘.
-  그래서 `util_step_ = max(자동도출, 0.02)` floor.
