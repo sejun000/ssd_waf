@@ -217,8 +217,19 @@ GhostSumResult CbEvictPolicy::get_ghost_sum_for_free_segments(
 
 ### 6.1  실제 compaction event hook
 
-`update_ghost_compacted_blocks_sum()` — **실 compaction 이 일어날 때마다** 호출.
-`compactor` 가 victim 을 고를 때 (즉 compaction path 내부) 호출하면 된다.
+`update_ghost_compacted_blocks_sum()` — **트리거 = 실 compaction event**.
+host-write tick 단위가 아니라 **compaction 이 실제로 발생하는 시점마다 한 번**
+호출한다.  따라서 호출 빈도는 정책 활동에 따라 가변적이다: cache 가 잘 채워져
+compaction 이 자주 일어나면 dt 가 작고, 한산하면 dt 가 크다.
+
+- 호출 위치: `compactor` 가 victim segment 를 선정한 직후, 그 victim 의
+  valid 페이지를 새 segment 로 복사하기 직전.
+- `dt = log_cache_timestamp - last_ghost_sum_ts_` 는 "직전 comp event 이후
+  누적된 host write 양". `ghost_compacted_blocks_sum_` 의 증가량은 그 구간
+  동안 θ-regime CB-tail 이 *만약* 동일 호스트 쓰기 분량을 GC 했더라면
+  발생했을 valid copy 수.
+- 첫 호출에서는 `dt = 0` 이라 ghost 증가량 없이 `compacted_blocks` 에만
+  anchor (init).
 
 ```cpp
 void LogCache::update_ghost_compacted_blocks_sum() {
@@ -319,8 +330,8 @@ void LogCache::periodic_gs_sum() {
 
 | 위치 | 호출 |
 |---|---|
-| Host write 처리 마지막 (write_size_to_cache 갱신 후) | `periodic_gs_sum();` |
-| Compaction victim 선정 직후, valid 복사 직전 | `update_ghost_compacted_blocks_sum();` |
+| Host write 처리 마지막 (write_size_to_cache 갱신 후, **매 host write tick**) | `periodic_gs_sum();` |
+| Compaction victim 선정 직후, valid 복사 직전 (**매 compaction event**) | `update_ghost_compacted_blocks_sum();` |
 | Evict (cache→cold flush) 시 ghost cache 에 LBA 등록 | `ghost_cache_.insert(lba);` |
 | Host read/write 시 ghost cache lookup → hit 시 `evictCount++` | `ghost_cache_.access(lba);` |
 | `check_and_evict_if_needed` 의 compact-vs-evict gate | `if (target_valid_blk_rate >= util_step_) { compact path } else { evict path }` |
@@ -352,6 +363,28 @@ ghost cache 크기 = `total_cache_block_count × util_step_` (정책상 정의�
 Multi-hot-cold stream 분류를 쓰는 경우, GC stream 의 timestamp granularity 가
 GS 정책의 `g_threshold` (= "이 시간보다 오래된 block 은 old" 기준점) 와
 동기화돼야 stream classification 이 의미 있다.
+
+### 9.0  `g_threshold` 가 뭔지
+
+전역 변수. `log_cache.cpp` 에서 host write 누계의 "방금 cold tier 로 flush 된
+block 의 create_timestamp" 를 기록한다 — 즉 *현재 cache 가 보관 중인 가장
+오래된 데이터의 age 경계*.
+
+- **초기화** (cache ctor): `g_threshold = cache_block_count * 2` —
+  pre-warmup 동안 어떤 block 도 "old" 로 보이지 않도록 안전한 큰 값.
+- **갱신** (compaction tick / evict path): victim 으로 선택된 segment 의
+  oldest valid block 의 create_timestamp 로 업데이트 (+ segment 크기만큼
+  보정). cache 가 채워질수록 자연스럽게 작아진다 (age 경계가 좁아짐).
+- **소비자**: stream classifier 의 timestamp granularity (이 절 9.1).
+  Live-vs-old 분류 기준.
+
+기존 코드는 `set_stream_interval(cache_block_count, segment_size_blocks)` 한
+번만 호출하고 interval = `cache_block_count / 3` 로 고정했다. 그러면
+g_threshold 가 운영 중에 줄어들어도 GC stream 의 granularity 가 안 따라가
+older block 분류가 어긋난다. 이 절의 변경은 **매 Classify() 호출마다
+fresh interval 을 g_threshold 로부터 재계산** 하는 것.
+
+### 9.1  `compute_stream_interval` 신규 함수
 
 ```cpp
 // istream.cpp 의 신규 함수
@@ -385,7 +418,17 @@ int MultiHotCold::Classify(...) {
 }
 ```
 
-이 부분은 stream classifier 안 쓴다면 그대로 둬도 됨.
+### 9.2  추가 변경 사항 요약
+
+| 위치 | 변경 |
+|---|---|
+| `istream.h` | `uint64_t compute_stream_interval(uint64_t fallback_cache_blocks=0);` 선언 |
+| `istream.cpp` 익명 namespace | `g_stream_segment_size_blocks`, `g_stream_fallback_blocks` 추가 (set_stream_interval 에서 채움) |
+| `set_stream_interval()` 구현 | 기존: `interval = cache_block_count / 3`. 신규: 두 글로벌 저장 후 `interval = compute_stream_interval(cache_block_count)` |
+| `multi_hot_cold.cpp Classify()` | 진입부에서 fresh refresh (위 9.1 코드) |
+| `g_threshold` 갱신 | 기존 LogCache 의 compaction 코드에 이미 존재 — 추가 변경 없음 |
+
+`kMultiHotColdStreams` 는 기본 5 (config 따라 변경). stream classifier 안 쓴다면 이 절 전체 무시 가능.
 
 
 ## 10. 검증 체크리스트

@@ -472,6 +472,29 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         lc->setMovingAverage(moving_avg_type, moving_avg_window);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GS_FINAL") {
+        // Final variant: cum_valid accumulator + LHS=r·waf·δ + RHS=Gud−Gu.
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setGsDecisionPeriodSegs(gs_decision_period_segs);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM_Final);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GS_REPLAY") {
+        // Replay variant: target_valid_blk_rate = log.cur_util[i] + util_step_
+        // Source log path is read from env GS_REPLAY_LOG on first periodic tick.
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            nullptr, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setGsDecisionPeriodSegs(gs_decision_period_segs);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM_Replay);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GC_NAND") {
         IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
         auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,

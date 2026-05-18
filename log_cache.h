@@ -40,6 +40,8 @@ enum class PeriodicMode {
     TimeDelta,    // t-delta hill-climb: f = compacted + r*evicted 의 windowed Δ로 방향 결정
     GhostDelta_GC_AUTO, // GhostDelta_GC + GP/UCB autotuner over (dir, HL, window, step)
     GhostDelta_GC_SUM,  // G(u+θ) via cumulative CB-sorted scan: m s.t. Σ(seg-v_i)=θ·N·seg
+    GhostDelta_GC_SUM_Replay, // Replay: load gsdec.log, force target = log.cur_util[i] + util_step_
+    GhostDelta_GC_SUM_Final,  // cum_valid accumulator + LHS=r·waf·δ + RHS=Gud−Gu
 };
 
 class LogCache final : public ICache
@@ -128,6 +130,8 @@ private:
     void periodic_ghost_delta_gc_nand();
     void periodic_ghost_delta_gc_auto();
     void periodic_ghost_delta_gc_sum();
+    void periodic_ghost_delta_gc_sum_replay();   // Replay variant: target = log.cur_util[i] + util_step_
+    void periodic_ghost_delta_gc_sum_final();    // cum_valid accumulator + LHS=r·waf·δ + RHS=Gud−Gu
     void periodic_gs_predict_track();   // Phase 1: passive candidate-segs tracking
 
     // Per-compaction ghost-signal updates.  Called from check_and_evict_if_needed
@@ -138,6 +142,7 @@ private:
     //     (CB-sorted cumulative scan up to θ·N·seg, rate * dt accumulator).
     void update_ghost_compacted_blocks(LogCacheSegment* victim);
     void update_ghost_compacted_blocks_sum();
+    void update_ghost_compacted_blocks_sum_cum();  // Final: tick-based cum_valid accumulator
 
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
@@ -198,19 +203,25 @@ private:
     uint64_t last_ghost_sum_ts_ = 0;
     bool     ghost_sum_initialized_ = false;  // first comp event: skip dt accum, just anchor ts
     uint64_t last_invalidate_at_comp_ = 0;    // invalidate_blocks snapshot at prev real comp
+    uint64_t last_compacted_at_ghost_sum_ = 0; // compacted_blocks snapshot at prev tick (for realized-correction)
 
     // Candidate-segs prediction tracker (Phase 1): for k ∈ {segs-1, segs, segs+1}
     // emit G(u+δ_k) at every segment/4 tick, buffer with timestamp, and on
     // entries older than δ_k compute |G_realized - G_predicted| / G_realized.
     // Used to compare prediction accuracy across neighbouring δ choices without
     // actually changing the live policy.
-    // SMA window for smoothed RMSE: 64 segments × 4 ticks/segment.
-    // The Phase-1 emit cadence is segment_size_blocks/4, so 256 paired drains
-    // covers exactly 64 segments of host writes.
+    // SMA window for smoothed RMSE: fixed 64 segments × 4 ticks/segment = 256.
+    // All cands share the same absolute window (so noise-rate effects matter,
+    // not WIN/δ ratio).
     static constexpr size_t kSmoothWin = 256;
     struct GsCandTracker {
         int      segs       = 0;
         double   util_step  = 0.0;
+        // raw drain pred / real totals (for per-cand mean reporting)
+        double   g_pred_sum_raw = 0.0;
+        double   g_real_sum_raw = 0.0;
+        double   f_pred_sum_raw = 0.0;
+        double   f_real_sum_raw = 0.0;
         // G(u+δ) prediction tracking — raw err
         std::deque<std::pair<uint64_t, double>> g_pred_buf;  // (t_emit, G_pred)
         double   g_err_sum    = 0.0;   // Σ |Δ| / G_realized   (relative)
@@ -327,6 +338,14 @@ private:
     std::string    autotune_csv_path_;
     FILE*          autotune_csv_      = nullptr;
 
+    /* GhostDelta_GC_SUM_Replay state. Loaded once on first periodic call.
+     * Each row holds (ts in blocks, cur_util) from gsdec.log. */
+    std::vector<std::pair<uint64_t,double>> replay_log_;
+    std::size_t   replay_idx_     = 0;
+    bool          replay_loaded_  = false;
+    bool          replay_failed_  = false;
+    void load_replay_log_if_needed();
+
 public:
     // GS hill-climb decision period in segments. Call BEFORE setPeriodicMode
     // (it's the override trigger). util_step_ + ghost_cache capacity are
@@ -339,7 +358,9 @@ public:
 
     void setPeriodicMode(PeriodicMode m) {
         periodic_mode_ = m;
-        if (m == PeriodicMode::GhostDelta_GC_SUM &&
+        if ((m == PeriodicMode::GhostDelta_GC_SUM ||
+             m == PeriodicMode::GhostDelta_GC_SUM_Replay ||
+             m == PeriodicMode::GhostDelta_GC_SUM_Final) &&
             total_cache_block_count > 0 && segment_size_blocks > 0) {
             util_step_ = static_cast<double>(segment_size_blocks * gs_decision_period_segs_)
                        / static_cast<double>(total_cache_block_count);
