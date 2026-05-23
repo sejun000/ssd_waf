@@ -1,11 +1,17 @@
-// Dynamic Programming optimizer for valid ratio selection from dp.* logs
+// Dynamic Programming optimizer for U_B trajectory selection from dp.* logs.
 //
-// NEW: Uses actual utilization (global_valid_blocks / total_cache_blocks) binned
-// at 1% granularity instead of filename-based target ratios.
-// If multiple dp files map to the same (bin, step), uses the higher dp filename number.
+// 2026-05-21 redesign:
+//   - File postfix (dp.0.42 etc.) is no longer treated as the target ratio.
+//   - Each row's actual U_B is computed from global_valid_blocks * BLK_SIZE / total_cache_size.
+//   - For each step t, all files' samples are collected and sorted by actual_UB.
+//   - The optimizer operates on a fine ratio grid (default 0.1%); cost[k][t] is obtained by
+//     linear interpolation between adjacent actual_UB samples at step t.
+//   - If u_target is outside [min_UB, max_UB] at step t, that (k, t) is a boundary (INF).
+//   - Transition: |Δu| per step ≤ HOST_BYTES_PER_STEP / total_cache_size_at_step.
 //
 // Build: g++ -O2 -std=c++17 -o dp_optimizer dp_optimizer.cpp
-// Usage: ./dp_optimizer [--dir DIR] [--tmax N] [--warmup_tb TB] [--step_skip N] [--decision_interval N]
+// Usage: ./dp_optimizer --dir DIR [--tmax N] [--warmup_tb TB] [--step_skip N]
+//                      [--qlc_factor X] [--grid_stride X]
 
 #include <bits/stdc++.h>
 #include <filesystem>
@@ -14,24 +20,25 @@ using namespace std;
 namespace fs = std::filesystem;
 
 static double QLC_FACTOR = 8.64;
+static constexpr int MA_WINDOW = 24;
+static constexpr int BLK_SIZE = 4096;
+static constexpr double HOST_BYTES_PER_STEP = 6.0 * 1024.0 * 1024.0 * 1024.0; // 6 GiB
+static constexpr double HOST_BLOCKS_PER_STEP = HOST_BYTES_PER_STEP / BLK_SIZE;
 
-// Series represents a utilization bin (e.g., 0.66)
-struct Series {
-    string label;
-    double c = 0.0;                          // bin ratio (e.g., 0.66)
-    vector<long long> tc_bytes;              // total_cache_size bytes per step
-    vector<double> u_delta;                  // per-step raw compaction delta
-    vector<double> v_delta;                  // per-step raw eviction delta
-    vector<double> F;                        // smoothed cost per step
+struct Sample {
+    double actual_UB;
+    double F;
+    double u_delta;
+    double v_delta;
+    long long tc_bytes;
+    long long host_bytes; // absolute host write at this step (write_size_to_cache)
+    double source_dp;
 };
 
-static bool starts_with(const string& s, const string& p) {
-    return s.size() >= p.size() && equal(p.begin(), p.end(), s.begin());
-}
-
-static optional<double> parse_c_from_filename(const string& name) {
+static optional<double> parse_dp_num(const string& name) {
     const string prefix = "dp.";
-    if (!starts_with(name, prefix)) return nullopt;
+    if (name.size() < prefix.size()) return nullopt;
+    if (!equal(prefix.begin(), prefix.end(), name.begin())) return nullopt;
     string tail = name.substr(prefix.size());
     if (tail.empty()) return nullopt;
     try {
@@ -39,9 +46,7 @@ static optional<double> parse_c_from_filename(const string& name) {
         double v = stod(tail, &idx);
         if (idx != tail.size()) return nullopt;
         return v;
-    } catch (...) {
-        return nullopt;
-    }
+    } catch (...) { return nullopt; }
 }
 
 static bool parse_line_values(const string& line,
@@ -50,7 +55,8 @@ static bool parse_line_values(const string& line,
                               long long& total_cache_size,
                               long long& write_size_to_cache,
                               long long& global_valid_blocks) {
-    compacted = 0; evicted = 0; total_cache_size = 0; write_size_to_cache = 0; global_valid_blocks = 0;
+    compacted = 0; evicted = 0; total_cache_size = 0;
+    write_size_to_cache = 0; global_valid_blocks = 0;
     auto pos = line.find("invalidate_blocks:");
     if (pos == string::npos) return false;
     istringstream iss(line.substr(pos));
@@ -65,11 +71,11 @@ static bool parse_line_values(const string& line,
             if (!(iss >> valstr)) break;
             long long val = 0;
             try { val = stoll(valstr); } catch (...) { continue; }
-            if (key == "compacted_blocks") compacted = val;
-            else if (key == "evicted_blocks") evicted = val;
-            else if (key == "total_cache_size") total_cache_size = val;
-            else if (key == "write_size_to_cache") write_size_to_cache = val;
-            else if (key == "global_valid_blocks") global_valid_blocks = val;
+            if      (key == "compacted_blocks")     compacted = val;
+            else if (key == "evicted_blocks")       evicted = val;
+            else if (key == "total_cache_size")     total_cache_size = val;
+            else if (key == "write_size_to_cache")  write_size_to_cache = val;
+            else if (key == "global_valid_blocks")  global_valid_blocks = val;
         }
     }
     return true;
@@ -83,43 +89,39 @@ int main(int argc, char** argv) {
     long long tmax = LLONG_MAX;
     double warmup_tb = 0.0;
     int step_skip = 1;
-    int decision_interval = 1;
+    double grid_stride = 0.001; // 0.1% ratio grid
 
     for (int i = 1; i < argc; ++i) {
         string a = argv[i];
-        if (a == "--dir" && i + 1 < argc) {
-            dir = argv[++i];
-        } else if (a == "--tmax" && i + 1 < argc) {
-            tmax = atoll(argv[++i]);
-        } else if (a == "--warmup_tb" && i + 1 < argc) {
-            warmup_tb = atof(argv[++i]);
-        } else if (a == "--step_skip" && i + 1 < argc) {
-            step_skip = atoi(argv[++i]);
-        } else if (a == "--decision_interval" && i + 1 < argc) {
-            decision_interval = atoi(argv[++i]);
-        } else if (a == "--qlc_factor" && i + 1 < argc) {
-            QLC_FACTOR = atof(argv[++i]);
-        } else {
-            cerr << "Unknown or incomplete argument: " << a << "\n";
-            cerr << "Usage: " << argv[0] << " [--dir DIR] [--tmax N] [--warmup_tb TB] [--step_skip N] [--decision_interval N]\n";
+        if      (a == "--dir"          && i + 1 < argc) dir = argv[++i];
+        else if (a == "--tmax"         && i + 1 < argc) tmax = atoll(argv[++i]);
+        else if (a == "--warmup_tb"    && i + 1 < argc) warmup_tb = atof(argv[++i]);
+        else if (a == "--step_skip"    && i + 1 < argc) step_skip = atoi(argv[++i]);
+        else if (a == "--qlc_factor"   && i + 1 < argc) QLC_FACTOR = atof(argv[++i]);
+        else if (a == "--grid_stride"  && i + 1 < argc) grid_stride = atof(argv[++i]);
+        else {
+            cerr << "Unknown or incomplete argument: " << a << "\n"
+                 << "Usage: " << argv[0]
+                 << " --dir DIR [--tmax N] [--warmup_tb TB] [--step_skip N]"
+                 << " [--qlc_factor X] [--grid_stride X]\n";
             return 2;
         }
     }
     long long warmup_bytes = static_cast<long long>(warmup_tb * 1024LL * 1024 * 1024 * 1024);
 
-    // ---- Phase 1: Read all dp files, compute per-file deltas ----
+    // ---- Phase 1: Read all dp.* files; compute per-row actual_UB and smoothed F ----
     struct FileData {
         double dp_num;
         string filename;
-        vector<double> F;
+        vector<double> actual_UB;
         vector<double> u_delta;
         vector<double> v_delta;
+        vector<double> F;
         vector<long long> tc_bytes;
-        vector<long long> gvb;
+        vector<long long> host_bytes;       // write_size_to_cache per row (absolute)
+        long long warmup_compacted = 0;     // cumulative at first post-warmup row
+        long long warmup_evicted = 0;
     };
-
-    static constexpr int MA_WINDOW = 24;
-    static constexpr double HOST_BLOCKS_PER_STEP = 10.0 * 1024 * 1024 * 1024 / 4096;
 
     auto moving_avg = [](const vector<double>& raw, int win) -> vector<double> {
         size_t n = raw.size();
@@ -138,38 +140,49 @@ int main(int argc, char** argv) {
     for (auto& de : fs::directory_iterator(dir)) {
         if (!de.is_regular_file()) continue;
         string name = de.path().filename().string();
-        auto copt = parse_c_from_filename(name);
-        if (!copt) continue;
+        auto dp_opt = parse_dp_num(name);
+        if (!dp_opt) continue;
 
         FileData fd;
-        fd.dp_num = *copt;
+        fd.dp_num = *dp_opt;
         fd.filename = de.path().string();
 
         ifstream ifs(fd.filename);
         if (!ifs) { cerr << "Warning: cannot open " << fd.filename << "\n"; continue; }
 
-        vector<long long> comp, evict, tc, gvb_vec;
+        vector<long long> comp, evict, tc, gvb, host_b;
+        long long first_comp = -1, first_evict = -1;
         string line;
         int line_skip_cnt = 0;
         while (getline(ifs, line)) {
             if (line.find("invalidate_blocks:") == string::npos) continue;
             long long cval=0, eval=0, tcval=0, wval=0, gval=0;
-            if (parse_line_values(line, cval, eval, tcval, wval, gval)) {
-                if (warmup_bytes > 0 && wval < warmup_bytes) continue;
-                if (step_skip > 1 && (line_skip_cnt++ % step_skip) != 0) continue;
-                comp.push_back(cval);
-                evict.push_back(eval);
-                tc.push_back(tcval);
-                gvb_vec.push_back(gval);
-            }
+            if (!parse_line_values(line, cval, eval, tcval, wval, gval)) continue;
+            if (warmup_bytes > 0 && wval < warmup_bytes) continue;
+            if (first_comp < 0) { first_comp = cval; first_evict = eval; }
+            if (step_skip > 1 && (line_skip_cnt++ % step_skip) != 0) continue;
+            comp.push_back(cval);
+            evict.push_back(eval);
+            tc.push_back(tcval);
+            gvb.push_back(gval);
+            host_b.push_back(wval);
         }
+        fd.warmup_compacted = (first_comp  > 0) ? first_comp  : 0;
+        fd.warmup_evicted   = (first_evict > 0) ? first_evict : 0;
+        fd.host_bytes = move(host_b);
         if (comp.empty()) { cerr << "Warning: no valid lines in " << fd.filename << "\n"; continue; }
 
         size_t fT = comp.size();
         fd.tc_bytes = move(tc);
-        fd.gvb = move(gvb_vec);
 
-        // raw deltas
+        fd.actual_UB.resize(fT, 0.0);
+        for (size_t t = 0; t < fT; ++t) {
+            if (fd.tc_bytes[t] > 0) {
+                double total_blks = (double)fd.tc_bytes[t] / BLK_SIZE;
+                fd.actual_UB[t] = (double)gvb[t] / total_blks;
+            }
+        }
+
         vector<double> raw_u(fT), raw_v(fT);
         long long up = comp[0], vp = evict[0];
         for (size_t t = 0; t < fT; ++t) {
@@ -177,219 +190,236 @@ int main(int argc, char** argv) {
             raw_v[t] = (t == 0) ? 0.0 : max(0.0, (double)(evict[t] - vp));
             up = comp[t]; vp = evict[t];
         }
+        vector<double> sm_u = moving_avg(raw_u, MA_WINDOW);
+        vector<double> sm_v = moving_avg(raw_v, MA_WINDOW);
 
-        // moving average for smoothed F
-        vector<double> smooth_u = moving_avg(raw_u, MA_WINDOW);
-        vector<double> smooth_v = moving_avg(raw_v, MA_WINDOW);
-
-        fd.u_delta.resize(fT);
-        fd.v_delta.resize(fT);
+        fd.u_delta = move(raw_u);
+        fd.v_delta = move(raw_v);
         fd.F.resize(fT);
         for (size_t t = 0; t < fT; ++t) {
-            fd.u_delta[t] = raw_u[t];
-            fd.v_delta[t] = raw_v[t];
-            fd.F[t] = smooth_u[t] + QLC_FACTOR * smooth_v[t] + HOST_BLOCKS_PER_STEP;
+            fd.F[t] = sm_u[t] + QLC_FACTOR * sm_v[t] + HOST_BLOCKS_PER_STEP;
         }
-        cerr << "  Loaded " << fd.filename << " (dp_num=" << fd.dp_num << ", steps=" << fT << ")\n";
+        cerr << "  Loaded " << fd.filename
+             << " (dp_num=" << fd.dp_num << ", steps=" << fT << ")\n";
         files.push_back(move(fd));
     }
+    if (files.empty()) { cerr << "No dp.* files found in " << dir << "\n"; return 1; }
 
-    if (files.empty()) {
-        cerr << "No dp.* files found in " << dir << "\n";
-        return 1;
-    }
-
-    // ---- Phase 2: Build bin grid by actual utilization (1% bins) ----
+    // ---- Phase 2: Per-step sample list, sorted by actual_UB ----
     size_t T = 0;
     for (auto& fd : files) T = max(T, fd.F.size());
     if (tmax != LLONG_MAX) T = min(T, static_cast<size_t>(tmax));
 
-    struct CellData {
-        double F, u_delta, v_delta;
-        long long tc_bytes;
-        double source_dp;
-    };
-    // grid[bin_pct][t] — bin_pct is integer (e.g., 66 means 0.66)
-    map<int, map<size_t, CellData>> grid;
-
+    vector<vector<Sample>> samples(T);
     for (auto& fd : files) {
         size_t len = min(T, fd.F.size());
         for (size_t t = 0; t < len; ++t) {
-            double total_blks = (fd.tc_bytes[t] > 0)
-                ? static_cast<double>(fd.tc_bytes[t]) / 4096.0 : 0.0;
-            if (total_blks <= 0) continue;
-            double actual_util = static_cast<double>(fd.gvb[t]) / total_blks;
-            int bin_pct = (int)round(actual_util * 100.0);
-            if (bin_pct < 0 || bin_pct > 100) continue;
-
-            auto& cell_map = grid[bin_pct];
-            auto it = cell_map.find(t);
-            if (it == cell_map.end() || fd.dp_num > it->second.source_dp) {
-                cell_map[t] = {fd.F[t], fd.u_delta[t], fd.v_delta[t], fd.tc_bytes[t], fd.dp_num};
+            if (fd.tc_bytes[t] <= 0) continue;
+            samples[t].push_back({
+                fd.actual_UB[t], fd.F[t],
+                fd.u_delta[t], fd.v_delta[t],
+                fd.tc_bytes[t],
+                (t < fd.host_bytes.size() ? fd.host_bytes[t] : 0LL),
+                fd.dp_num
+            });
+        }
+    }
+    for (auto& v : samples) {
+        sort(v.begin(), v.end(),
+             [](const Sample& a, const Sample& b){ return a.actual_UB < b.actual_UB; });
+        // dedup near-identical actual_UB (keep higher dp_num)
+        if (v.size() > 1) {
+            vector<Sample> dedup;
+            dedup.reserve(v.size());
+            for (auto& s : v) {
+                if (!dedup.empty() && fabs(dedup.back().actual_UB - s.actual_UB) < 1e-9) {
+                    if (s.source_dp > dedup.back().source_dp) dedup.back() = s;
+                } else {
+                    dedup.push_back(s);
+                }
             }
+            v = move(dedup);
         }
     }
 
-    // ---- Phase 3: Convert bins to sorted Series ----
-    vector<int> bin_pcts;
-    for (auto& [bp, _] : grid) bin_pcts.push_back(bp);
-    // map is ordered, so bin_pcts is already sorted ascending
+    // ---- Phase 3: Fine ratio grid ----
+    const double GRID_MIN = 0.00;
+    const double GRID_MAX = 0.95;
+    const size_t K = static_cast<size_t>(round((GRID_MAX - GRID_MIN) / grid_stride)) + 1;
+    vector<double> grid(K);
+    for (size_t k = 0; k < K; ++k) grid[k] = GRID_MIN + k * grid_stride;
 
-    vector<Series> series;
-    for (int bp : bin_pcts) {
-        Series s;
-        s.c = bp / 100.0;
-        s.label = "bin_" + to_string(bp);
-        s.F.resize(T, 0.0);
-        s.u_delta.resize(T, 0.0);
-        s.v_delta.resize(T, 0.0);
-        s.tc_bytes.resize(T, 0);
-
-        for (auto& [t, cell] : grid[bp]) {
-            if (t < T) {
-                s.F[t] = cell.F;
-                s.u_delta[t] = cell.u_delta;
-                s.v_delta[t] = cell.v_delta;
-                s.tc_bytes[t] = cell.tc_bytes;
-            }
-        }
-        series.push_back(move(s));
-    }
-
-    cerr << "Bins: " << series.size() << ", T=" << T << "\n";
-    for (size_t k = 0; k < series.size(); ++k) {
-        size_t filled = grid[bin_pcts[k]].size();
-        cerr << "  " << series[k].c << ": " << filled << "/" << T << " steps filled\n";
-    }
-
-    // ---- Phase 4: Build cost matrix and tcache_blocks ----
-    const size_t K = series.size();
+    // ---- Phase 4: Cost matrix via linear interpolation ----
     const double INF = 1e300;
-
-    // tcache_blocks for transition penalty
-    vector<double> tcache_blocks(T, 0.0);
-    for (size_t t = 0; t < T; ++t) {
-        long long bytes = 0;
-        for (auto& s : series) {
-            if (t < s.tc_bytes.size() && s.tc_bytes[t] > 0) { bytes = s.tc_bytes[t]; break; }
-        }
-        tcache_blocks[t] = static_cast<double>(bytes) / 4096.0 / 4096.0;
-    }
-
-    // cost[k][t] = F if data exists for this (bin, step), else INF
     vector<vector<double>> cost(K, vector<double>(T, INF));
-    for (size_t k = 0; k < K; ++k) {
-        for (auto& [t, cell] : grid[bin_pcts[k]]) {
-            if (t < T) cost[k][t] = series[k].F[t];
+    vector<vector<double>> cost_u(K, vector<double>(T, 0.0));
+    vector<vector<double>> cost_v(K, vector<double>(T, 0.0));
+    vector<long long> step_capacity(T, 0);
+
+    for (size_t t = 0; t < T; ++t) {
+        auto& list = samples[t];
+        if (list.empty()) continue;
+        step_capacity[t] = list.front().tc_bytes; // any sample, same trace
+        const double lo_ub = list.front().actual_UB;
+        const double hi_ub = list.back().actual_UB;
+        const double tol = grid_stride * 0.5 + 1e-12;
+        for (size_t k = 0; k < K; ++k) {
+            double u = grid[k];
+            if (u + tol < lo_ub) continue;       // below boundary
+            if (u - tol > hi_ub) continue;       // above boundary
+            auto it = upper_bound(list.begin(), list.end(), u,
+                                  [](double v, const Sample& s){ return v < s.actual_UB; });
+            if (it == list.begin()) {
+                cost[k][t]   = list.front().F;
+                cost_u[k][t] = list.front().u_delta;
+                cost_v[k][t] = list.front().v_delta;
+            } else if (it == list.end()) {
+                cost[k][t]   = list.back().F;
+                cost_u[k][t] = list.back().u_delta;
+                cost_v[k][t] = list.back().v_delta;
+            } else {
+                auto hi = it;
+                auto lo = prev(it);
+                double denom = hi->actual_UB - lo->actual_UB;
+                double frac = (denom > 1e-12) ? (u - lo->actual_UB) / denom : 0.0;
+                cost[k][t]   = lo->F       + frac * (hi->F       - lo->F);
+                cost_u[k][t] = lo->u_delta + frac * (hi->u_delta - lo->u_delta);
+                cost_v[k][t] = lo->v_delta + frac * (hi->v_delta - lo->v_delta);
+            }
         }
     }
 
-    // Report reachability
-    for (size_t k = 0; k < K; ++k) {
-        size_t reachable = 0;
-        for (size_t t = 0; t < T; ++t) if (cost[k][t] < INF * 0.5) reachable++;
-        if (reachable < T)
-            cerr << "  c=" << series[k].c << ": " << reachable << "/" << T << " steps reachable\n";
+    // ---- Phase 5: Per-step transition bound ----
+    vector<int> max_step_bins(T, 0);
+    long long min_cap = LLONG_MAX, max_cap = 0;
+    for (size_t t = 0; t < T; ++t) {
+        long long cap = step_capacity[t];
+        if (cap <= 0) continue;
+        double max_du = HOST_BYTES_PER_STEP / (double)cap;
+        max_step_bins[t] = (int)ceil(max_du / grid_stride - 1e-9);
+        min_cap = min(min_cap, cap);
+        max_cap = max(max_cap, cap);
     }
+    cerr << "T=" << T << ", K=" << K
+         << ", grid_stride=" << grid_stride;
+    if (max_cap > 0) {
+        cerr << ", capacity_bytes=[" << min_cap << "," << max_cap << "]"
+             << ", per-step max ±bins ≈ "
+             << (int)ceil(HOST_BYTES_PER_STEP / (double)max_cap / grid_stride - 1e-9)
+             << ".."
+             << (int)ceil(HOST_BYTES_PER_STEP / (double)min_cap / grid_stride - 1e-9);
+    }
+    cerr << "\n";
 
-    // ---- DP ----
-    auto trans_penalty = [&](double c_prev, double c_next, size_t t)->double{
-        double diff = c_next - c_prev;
-        double blocks = tcache_blocks[t]; // already bytes/4096
-        (void)diff; (void)blocks;
-        return 0.0;
-    };
-
+    // ---- Phase 6: DP ----
     vector<vector<double>> DP(T, vector<double>(K, INF));
     vector<vector<int>> parent(T, vector<int>(K, -1));
-
-    // Initialize t=0
-    for (size_t k = 0; k < K; ++k) DP[0][k] = cost[k][0];
-
-    // Transitions
+    // Force start at the lowest valid grid at t=0 (lowest reachable U_B boundary).
+    int start_k = -1;
+    for (size_t k = 0; k < K; ++k) {
+        if (cost[k][0] < INF * 0.5) { start_k = (int)k; break; }
+    }
+    if (start_k >= 0) DP[0][start_k] = cost[start_k][0];
+    cerr << "Start anchor: k=" << start_k
+         << ", c=" << (start_k >= 0 ? grid[start_k] : -1.0) << "\n";
     for (size_t t = 1; t < T; ++t) {
-        bool can_switch = (t % decision_interval == 0);
+        int max_d = max_step_bins[t];
         for (size_t k = 0; k < K; ++k) {
+            if (cost[k][t] >= INF * 0.5) continue;
             double best = INF; int arg = -1;
-            if (can_switch) {
-                // allow ±1 normally, ±2 only to skip over INF intermediate
-                for (int j = max(0, (int)k - 2); j <= min((int)K - 1, (int)k + 2); ++j) {
-                    int dist = abs(j - (int)k);
-                    if (dist == 2) {
-                        int mid = (j + (int)k) / 2;
-                        if (cost[mid][t-1] < INF * 0.5) continue;
-                    }
-                    double cand = DP[t-1][j] + trans_penalty(series[j].c, series[k].c, t) + cost[k][t];
-                    if (cand < best) { best = cand; arg = j; }
-                }
-            } else {
-                best = DP[t-1][k] + cost[k][t];
-                arg = (int)k;
+            int j_lo = max(0, (int)k - max_d);
+            int j_hi = min((int)K - 1, (int)k + max_d);
+            for (int j = j_lo; j <= j_hi; ++j) {
+                if (DP[t-1][j] >= INF * 0.5) continue;
+                double cand = DP[t-1][j] + cost[k][t];
+                if (cand < best) { best = cand; arg = j; }
             }
-            DP[t][k] = best; parent[t][k] = arg;
+            if (arg >= 0) { DP[t][k] = best; parent[t][k] = arg; }
         }
     }
 
-    // Recover best final state
+    // ---- Phase 7: Find best terminal and backtrack ----
     double best = INF; int bestk = -1; size_t last = T - 1;
-    cout << "\nFinal DP values at t=" << last << ":\n";
     for (size_t k = 0; k < K; ++k) {
-        cout << "  c=" << series[k].c << ": " << DP[last][k] << "\n";
-        if (DP[last][k] < best) { best = DP[last][k]; bestk = static_cast<int>(k); }
+        if (DP[last][k] < best) { best = DP[last][k]; bestk = (int)k; }
     }
-    cout << "Best final state: k=" << bestk << ", c=" << series[bestk].c << ", cost=" << best << "\n";
+    if (bestk < 0) { cerr << "No feasible DP path found.\n"; return 1; }
 
-    // Backtrack
     vector<int> choice(T, -1);
     int cur = bestk;
-    for (int t = static_cast<int>(last); t >= 0; --t) {
+    for (int t = (int)last; t >= 0; --t) {
         choice[t] = cur;
         if (t > 0) cur = parent[t][cur];
     }
 
-    // Print results
+    // ---- Phase 8: Output ----
     cout.setf(std::ios::fixed); cout << setprecision(6);
-    static constexpr double BLK_TO_TB = 4096.0 / 1e12; // TB (10^12)
+    static constexpr double BLK_TO_TB = 4096.0 / 1e12;
     double total_cost_tb = best * BLK_TO_TB;
-    cout << "Steps(T): " << T << ", Ratios(K): " << K << ", MinTotalCost(blocks): " << best
+    cout << "Steps(T): " << T << ", GridSize(K): " << K
+         << ", GridStride: " << grid_stride
+         << ", MinTotalCost(blocks): " << best
          << ", TotalCost(TB): " << total_cost_tb << "\n";
-    cout << "Ratios:";
-    for (size_t k = 0; k < K; ++k) cout << (k==0?" ":", ") << series[k].c;
-    cout << "\n\n";
+    cout << "Best terminal: k=" << bestk << ", c=" << grid[bestk]
+         << ", cost=" << best << "\n\n";
 
-    cout << "t, chosen_c, base_F_t, trans_penalty, cumulative_cost\n";
+    // Warmup pre-cost (cumulative compacted/evicted blocks at first post-warmup row, avg over files)
+    double avg_warm_comp = 0.0, avg_warm_evict = 0.0;
+    int cnt_warm = 0;
+    for (auto& fd : files) {
+        if (fd.warmup_compacted > 0 || fd.warmup_evicted > 0) {
+            avg_warm_comp  += (double)fd.warmup_compacted;
+            avg_warm_evict += (double)fd.warmup_evicted;
+            cnt_warm++;
+        }
+    }
+    if (cnt_warm > 0) { avg_warm_comp /= cnt_warm; avg_warm_evict /= cnt_warm; }
+    const double TIB = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    const double warmup_host_blocks = warmup_tb * TIB / BLK_SIZE;
+
+    cout << "t, host_TB, chosen_c, base_F_t, cumulative_cost\n";
     double cum = 0.0;
     double total_compaction = 0.0;
-    double total_eviction = 0.0;
-    double total_host = 0.0;
+    double total_eviction   = 0.0;
+    double total_host       = 0.0;
     for (size_t t = 0; t < T; ++t) {
         int k = choice[t];
-        double pen = 0.0;
-        if (t > 0) pen = trans_penalty(series[choice[t-1]].c, series[k].c, t);
         double Ft = cost[k][t];
-        cum += pen + Ft;
-
-        // breakdown
-        total_compaction += series[k].u_delta[t];
-        total_eviction += series[k].v_delta[t];
-        total_host += HOST_BLOCKS_PER_STEP;
-        if (t > 0) {
-            double diff = series[k].c - series[choice[t-1]].c;
-            if (diff > 0) {
-                total_compaction += pen;
-            } else if (diff < 0) {
-                total_eviction += pen / QLC_FACTOR;
-            }
-        }
-
-        cout << t << ", " << series[k].c << ", " << Ft << ", " << pen << ", " << cum << "\n";
+        cum += Ft;
+        total_compaction += cost_u[k][t];
+        total_eviction   += cost_v[k][t];
+        total_host       += HOST_BLOCKS_PER_STEP;
+        double host_TB = samples[t].empty()
+            ? 0.0
+            : (double)samples[t].front().host_bytes / TIB;
+        cout << t << ", " << host_TB << ", " << grid[k]
+             << ", " << Ft << ", " << cum << "\n";
     }
 
-    cout << "\n=== Cost Breakdown (TB) ===\n";
+    cout << "\n=== Cost Breakdown (TB) — DP path only (warmup excluded) ===\n";
     cout << "Host write:  " << total_host * BLK_TO_TB << "\n";
     cout << "Compaction:  " << total_compaction * BLK_TO_TB << "\n";
-    cout << "Eviction:    " << total_eviction * BLK_TO_TB << " (x" << QLC_FACTOR << " = " << total_eviction * QLC_FACTOR * BLK_TO_TB << ")\n";
-    cout << "Total:       " << (total_host + total_compaction + total_eviction * QLC_FACTOR) * BLK_TO_TB << "\n";
+    cout << "Eviction:    " << total_eviction * BLK_TO_TB
+         << " (x" << QLC_FACTOR << " = "
+         << total_eviction * QLC_FACTOR * BLK_TO_TB << ")\n";
+    cout << "Total:       "
+         << (total_host + total_compaction + total_eviction * QLC_FACTOR) * BLK_TO_TB
+         << "\n";
 
+    cout << "\n=== Cost Breakdown (TB) — Full simulation (from host write 0) ===\n";
+    cout << "Warmup host:     " << warmup_host_blocks * BLK_TO_TB << "\n";
+    cout << "Warmup compact:  " << avg_warm_comp * BLK_TO_TB << "\n";
+    cout << "Warmup evict:    " << avg_warm_evict * BLK_TO_TB
+         << " (x" << QLC_FACTOR << " = " << avg_warm_evict * QLC_FACTOR * BLK_TO_TB << ")\n";
+    double full_host    = total_host       + warmup_host_blocks;
+    double full_compact = total_compaction + avg_warm_comp;
+    double full_evict   = total_eviction   + avg_warm_evict;
+    cout << "Host write:  " << full_host    * BLK_TO_TB << "\n";
+    cout << "Compaction:  " << full_compact * BLK_TO_TB << "\n";
+    cout << "Eviction:    " << full_evict   * BLK_TO_TB
+         << " (x" << QLC_FACTOR << " = "
+         << full_evict * QLC_FACTOR * BLK_TO_TB << ")\n";
+    cout << "Total:       "
+         << (full_host + full_compact + full_evict * QLC_FACTOR) * BLK_TO_TB << "\n";
     return 0;
 }

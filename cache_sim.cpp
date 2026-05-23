@@ -7,6 +7,7 @@
 #include <sstream>
 #include <algorithm>
 #include <map>
+#include <unordered_map>
 #include <tuple>   // std::tuple
 #include <signal.h>
 #include <execinfo.h>
@@ -16,8 +17,9 @@
 #include <memory>
 #include <climits>
 
-static constexpr uint64_t CACHE_WRITE_SIZE_LIMIT = 14ULL * 1024 * 1024 * 1024 * 1024; // 4 TB
-static constexpr uint64_t PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
+static uint64_t CACHE_WRITE_SIZE_LIMIT = 14ULL * 1024 * 1024 * 1024 * 1024; // 14 TB (default, override via --cache_write_size_limit)
+static uint64_t COLD_WRITE_SIZE_LIMIT  = 0; // 0 = disabled; override via --cold_write_size_limit
+static uint64_t PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
 #define PREFILL_RATE (0.8)
 
 void signal_handler(int signum) {
@@ -233,6 +235,9 @@ int main(int argc, char* argv[]) {
     bool no_fill = true;
     uint64_t cold_capacity = 0;
     int lba_scale = 1;
+    bool remap_lba = false;
+    bool loop_trace = false;
+    long long min_trace_loops = 0;
 
     // 추가 인자 파싱
     for (int i = 3; i < argc; i++) {
@@ -273,6 +278,17 @@ int main(int argc, char* argv[]) {
             moving_avg_window = std::stod(argv[++i]);
         } else if (arg == "--gs_decision_period_segs" && i + 1 < argc) {
             gs_decision_period_segs = std::stoi(argv[++i]);
+        } else if (arg == "--cache_write_size_limit" && i + 1 < argc) {
+            CACHE_WRITE_SIZE_LIMIT = std::stoull(argv[++i]);
+            PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
+        } else if (arg == "--remap_lba") {
+            remap_lba = true;
+        } else if (arg == "--cold_write_size_limit" && i + 1 < argc) {
+            COLD_WRITE_SIZE_LIMIT = std::stoull(argv[++i]);
+        } else if (arg == "--loop_trace") {
+            loop_trace = true;
+        } else if (arg == "--min_trace_loops" && i + 1 < argc) {
+            min_trace_loops = std::stoll(argv[++i]);
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -295,6 +311,11 @@ int main(int argc, char* argv[]) {
     printf("moving_avg_type = %s\n", moving_avg_type.c_str());
     printf("moving_avg_window = %.0f blocks\n", moving_avg_window);
     printf("gs_decision_period_segs = %d\n", gs_decision_period_segs);
+    printf("cache_write_size_limit = %lu bytes (%.2f TB)\n", CACHE_WRITE_SIZE_LIMIT, CACHE_WRITE_SIZE_LIMIT / (1024.0 * 1024.0 * 1024.0 * 1024.0));
+    printf("remap_lba = %s\n", remap_lba ? "enabled (4K sequential allocation)" : "disabled");
+    printf("cold_write_size_limit = %lu bytes (%.2f TB) %s\n", COLD_WRITE_SIZE_LIMIT, COLD_WRITE_SIZE_LIMIT / (1024.0 * 1024.0 * 1024.0 * 1024.0), COLD_WRITE_SIZE_LIMIT == 0 ? "[disabled]" : "");
+    printf("loop_trace = %s\n", loop_trace ? "enabled" : "disabled");
+    printf("min_trace_loops = %lld (cold_write_size_limit honored only after this many full passes)\n", min_trace_loops);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
@@ -316,7 +337,31 @@ int main(int argc, char* argv[]) {
     long long total_read_size = 0, total_write_size = 0;
     long long read_hit_size = 0, write_hit_size = 0;
     long long cache_write_size = 0, cold_tier_write_size = 0, cold_tier_read_size = 0;
-    
+
+    // --remap_lba: 4K-aligned trace LBA → sequential mapped LBA
+    std::unordered_map<long long, long long> lba_remap;
+    long long next_remap_lba = 0;
+    auto issue_remapped = [&](long long off, long long sz, OP_TYPE op) {
+        if (!remap_lba) {
+            issue_op_to_cache(*cache, off, static_cast<int>(sz), op);
+            return;
+        }
+        long long blk = block_size;
+        long long end = off + sz;
+        for (long long o = off; o < end; o += blk) {
+            long long mapped;
+            auto it = lba_remap.find(o);
+            if (it == lba_remap.end()) {
+                mapped = next_remap_lba;
+                lba_remap.emplace(o, mapped);
+                next_remap_lba += blk;
+            } else {
+                mapped = it->second;
+            }
+            issue_op_to_cache(*cache, mapped, static_cast<int>(blk), op);
+        }
+    };
+
     std::ifstream infile(trace_file);
     if (!infile) {
         std::cerr << "File Error" << std::endl;
@@ -327,14 +372,36 @@ int main(int argc, char* argv[]) {
     std::string line;
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
-    
-    while (std::getline(infile, line) && line_count < line_count_limit) {
+    long long trace_loops = 0;
+
+    while (line_count < line_count_limit) {
+        if (!std::getline(infile, line)) {
+            if (loop_trace) {
+                trace_loops++;
+                printf("[loop_trace] EOF reached, restarting trace (loop #%lld)\n", trace_loops);
+                infile.clear();
+                infile.seekg(0);
+                if (!std::getline(infile, line)) {
+                    break;  // empty file safeguard
+                }
+            } else {
+                break;
+            }
+        }
         line_count++;
         if (line_count % 1000000 == 0) {
             print_stats(true, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
+            if (remap_lba) {
+                printf("[wss] next_remap_lba = %lld bytes (%.2f GB), unique_4k_blocks = %zu, trace_loops = %lld\n",
+                       next_remap_lba, next_remap_lba / (1024.0*1024.0*1024.0), lba_remap.size(), trace_loops);
+            }
         }
         cache->print_stats();
         if (static_cast<uint64_t>(cache_write_size) > CACHE_WRITE_SIZE_LIMIT) {
+            break;
+        }
+        if (COLD_WRITE_SIZE_LIMIT > 0 && static_cast<uint64_t>(cold_tier_write_size) > COLD_WRITE_SIZE_LIMIT
+            && trace_loops >= min_trace_loops) {
             break;
         }
         // 사용자 구현 parse_trace 함수 호출
@@ -354,7 +421,7 @@ int main(int argc, char* argv[]) {
                 total_read_size += parsed.lba_size;
             //}
             if (policy == "all" || policy == "read-only") {
-                issue_op_to_cache(*cache, parsed.lba_offset, parsed.lba_size, OP_TYPE::READ);
+                issue_remapped(parsed.lba_offset, parsed.lba_size, OP_TYPE::READ);
             }
         } else if (parsed.op_type == "W" || parsed.op_type == "WS") {
             std::tie(write_bytes_to_cache, evicted_blocks, write_hit_size) = cache->get_status();
@@ -366,7 +433,7 @@ int main(int argc, char* argv[]) {
                 cold_tier_write_size = block_size * evicted_blocks;
             //}
             if (policy == "all" || policy == "write-only") {
-                issue_op_to_cache(*cache, parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
+                issue_remapped(parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
             }
             if (policy == "write-only") {
              //   cache->print_cache_trace(parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
@@ -379,6 +446,10 @@ int main(int argc, char* argv[]) {
     calc_hit_ratio(read_hit_size, total_read_size, write_hit_size, total_write_size, final_read_hit_ratio, final_write_hit_ratio);
     
     print_stats(false, total_read, total_write, total_read_size, total_write_size, read_hit_size, write_hit_size, cache_write_size, cold_tier_write_size, cold_tier_read_size, max_cache_blocks, cache->size());
+    if (remap_lba) {
+        printf("[wss] FINAL next_remap_lba = %lld bytes (%.2f GB), unique_4k_blocks = %zu, trace_loops = %lld\n",
+               next_remap_lba, next_remap_lba / (1024.0*1024.0*1024.0), lba_remap.size(), trace_loops);
+    }
     cache->print_stats();
     return 0;
 }

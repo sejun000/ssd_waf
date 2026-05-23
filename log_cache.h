@@ -7,6 +7,7 @@
 #include "histogram.h"
 #include "emwa_ratio.h"
 #include "ghost_cache.h"
+#include "age_ghost_cache.h"
 #include "auto_tune/gp_tuner.h"
 
 #include <unordered_map>
@@ -192,9 +193,26 @@ private:
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
     EwmaRatio compaction_ratio_in_ghost_cache;
+    // Per-flush-event average valid evict (pages/event). Updated every (seg/4)
+    // tick: updateFromCumulative(flush_event_count_, evicted_blocks).
+    EwmaRatio flush_avg_ratio;
+    uint64_t  flush_event_count_ = 0;
+    // Per-compaction-event average copied valid (pages/event). Mirrors
+    // flush_avg_ratio: updateFromCumulative(compact_event_count_·seg_blocks,
+    // compacted_blocks) → EWMA value = avg valid fraction per victim.
+    EwmaRatio compact_avg_ratio;
+    uint64_t  compact_event_count_ = 0;
+    EwmaRatio flush_pred_ratio;
+    double    ghost_flush_valid_sum_ = 0.0;
+    // F_ghost: cumulative sum of age_ghost_cache.totalValidCount() snapshots
+    // sampled at every (seg/4) tick, EWMA per host write.  Represents "what
+    // would still be cached if extended by D segs".
+    EwmaRatio flush_ghost_ratio;
+    double    ghost_seg_valid_sum_ = 0.0;
     double periodic_ratio_ = 2.88;
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
+    AgeGhostCache age_ghost_cache;
     uint64_t ghost_compacted_blocks = 0;
     // GhostDelta_GC_SUM state: synthetic cumulative counter advanced at each
     // periodic tick by (timestamp_delta × u_avg/(1-u_avg)) where u_avg comes
@@ -370,6 +388,9 @@ public:
             ghost_cache.setCapacity(
                 static_cast<std::size_t>(
                     static_cast<double>(total_cache_block_count) * util_step_));
+            // age_ghost_cache is segment-granular: capacity = D segments.
+            age_ghost_cache.setCapacity(
+                static_cast<std::size_t>(gs_decision_period_segs_));
         }
     }
     void setTdeltaStep(double s) { tdelta_step_ = s; }
@@ -393,5 +414,9 @@ public:
         ghost_util_ratio                = MovingAverageRatio::Make(type, window_blocks);
         net_free_seg_ratio_             = MovingAverageRatio::Make(type, window_blocks);
         gc_valid_pages_ratio_           = MovingAverageRatio::Make(type, window_blocks);
+        flush_avg_ratio                 = MovingAverageRatio::Make(type, window_blocks);
+        compact_avg_ratio               = MovingAverageRatio::Make(type, window_blocks);
+        flush_pred_ratio                = MovingAverageRatio::Make(type, window_blocks);
+        flush_ghost_ratio               = MovingAverageRatio::Make(type, window_blocks);
     }
 };

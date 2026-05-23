@@ -40,6 +40,25 @@ ParsedRow CsvTraceParser::parseTrace(const std::string &line) {
     return result;
 }
 
+// 4-column CSV 파서 구현: op_type,lba_offset,lba_size,timestamp (dev_id 없음)
+ParsedRow Csv4ColTraceParser::parseTrace(const std::string &line) {
+    ParsedRow result;
+    std::vector<std::string> tokens = splitString(line, ',');
+    if (tokens.size() < 4) {
+        return ParsedRow();
+    }
+    result.dev_id = "0";  // synthetic dev_id (downstream checks parsed.dev_id.empty())
+    result.op_type = tokens[0];
+    try {
+        result.lba_offset = std::stoll(tokens[1]);
+        result.lba_size   = std::stoi(tokens[2]);
+        result.timestamp  = std::stod(tokens[3]);
+    } catch (...) {
+        return ParsedRow();
+    }
+    return result;
+}
+
 // blktrace 파서 구현
 ParsedRow BlktraceParser::parseTrace(const std::string &line) {
     ParsedRow result;
@@ -96,6 +115,9 @@ ITraceParser* createTraceParser(const std::string &type) {
     } else if (type == "tencent") {
         printf("TencentTraceParser\n");
         return new TencentTraceParser();
+    } else if (type == "csv4col") {
+        printf("Csv4ColTraceParser\n");
+        return new Csv4ColTraceParser();
     } else {
         return new CsvTraceParser();
     }

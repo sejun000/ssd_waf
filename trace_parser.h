@@ -17,6 +17,12 @@ public:
     ParsedRow parseTrace(const std::string &line) override;
 };
 
+// 4-column CSV (op,offset,size,timestamp) — dev_id 컬럼 없음
+class Csv4ColTraceParser : public ITraceParser {
+public:
+    ParsedRow parseTrace(const std::string &line) override;
+};
+
 // blktrace 형식 트레이스 파서를 위한 구현 클래스
 class BlktraceParser : public ITraceParser {
 public:
