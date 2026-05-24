@@ -209,6 +209,18 @@ private:
     // would still be cached if extended by D segs".
     EwmaRatio flush_ghost_ratio;
     double    ghost_seg_valid_sum_ = 0.0;
+    // 2-step lookahead candidate costs (GhostDelta_GC_SUM_Final). All three free
+    // the SAME 2δN segments of space; pick the cheapest plan, act on its first
+    // step. GG = GC×2 (ghost_sum(2δN)); FF = flush×2 (get_mth(2δN)); GF's GC leg
+    // (δN) reuses Gud, only its flush leg (get_mth(δN)) is tracked here. Each is
+    // a cumulative valid-page sum sampled every (seg/4) tick → EWMA per host
+    // write, exactly like flush_ghost_ratio.
+    EwmaRatio gg_ratio;          // ghost_sum(2δN).cum_valid
+    double    gg_ghost_sum_ = 0.0;
+    EwmaRatio ff_ratio;          // get_mth(2δN)
+    double    ff_flush_sum_ = 0.0;
+    EwmaRatio gf_flush_ratio;    // get_mth(δN)  (GF's flush leg; GC leg = Gud)
+    double    gf_flush_sum_ = 0.0;
     double periodic_ratio_ = 2.88;
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
@@ -418,5 +430,8 @@ public:
         compact_avg_ratio               = MovingAverageRatio::Make(type, window_blocks);
         flush_pred_ratio                = MovingAverageRatio::Make(type, window_blocks);
         flush_ghost_ratio               = MovingAverageRatio::Make(type, window_blocks);
+        gg_ratio                        = MovingAverageRatio::Make(type, window_blocks);
+        ff_ratio                        = MovingAverageRatio::Make(type, window_blocks);
+        gf_flush_ratio                  = MovingAverageRatio::Make(type, window_blocks);
     }
 };

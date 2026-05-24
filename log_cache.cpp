@@ -80,7 +80,10 @@ LogCache::LogCache(uint64_t              cold_capacity,
       flush_avg_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       compact_avg_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       flush_pred_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      flush_ghost_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
+      flush_ghost_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      gg_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      ff_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      gf_flush_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
 {
     periodic_ratio_ = periodic_ratio;
     segment_size_blocks = cfg_.segment_bytes / blk_sz;
@@ -594,18 +597,18 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             flush_event_count_ * segment_size_blocks, evicted_blocks);
         compact_avg_ratio.updateFromCumulative(
             compact_event_count_ * segment_size_blocks, compacted_blocks);
-        // Per seg/4 sampling of flush-related ghost quantities.
-        if (evictor) {
-            const double target_segs = util_step_ * static_cast<double>(total_segments);
-            if (target_segs > 0.0) {
-                const uint64_t top_n_valid =
-                    evictor->get_mth_score_valid_pages(target_segs);
-                ghost_flush_valid_sum_ += static_cast<double>(top_n_valid);
-            }
-        }
+        // F_inv: rate at which ghost-resident pages die, measured AT POP time.
+        //   totalPush − totalPop = Σ_popped(push_valid − pop_valid) + resident
+        //   push. push_valid−pop_valid = pages a segment lost while resident in
+        //   the ghost window (= initial − pop-time valid), which is what we want
+        //   (vs totalInitial−totalValid, a progress snapshot biased by just-
+        //   pushed segments). Fed STRAIGHT into updateFromCumulative (a
+        //   derivative) → per-host-write death rate. NOT pre-accumulated — that
+        //   double-integrates and diverges (seen before).
         flush_pred_ratio.updateFromCumulative(
             log_cache_timestamp,
-            static_cast<uint64_t>(ghost_flush_valid_sum_));
+            age_ghost_cache.totalPushValidCount() -
+            age_ghost_cache.totalPopValidCount());
         // F_ghost: sample age_ghost_cache.totalValidCount() every (seg/4) and
         // accumulate. EWMA(cum/ts) ≈ avg valid pages held in D resident segs
         // per host write.
@@ -613,6 +616,29 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         flush_ghost_ratio.updateFromCumulative(
             log_cache_timestamp,
             static_cast<uint64_t>(ghost_seg_valid_sum_));
+        // 2-step lookahead candidates. δN = util_step_·N segments freed per step.
+        //   GG: GC frees 2δN  → ghost_sum(2δN).cum_valid (valid copied).
+        //   FF: flush frees 2δN → get_mth(2δN) (valid flushed = top-2δN victims).
+        //   GF: GC frees δN (= Gud, already accumulated) + flush frees δN.
+        // Each is a cumulative valid-page sum fed to updateFromCumulative → EWMA
+        // per-host-write rate, same scale as Gud/flush_ghost_ratio.
+        const double dN = util_step_ * static_cast<double>(total_segments);
+        if (compactor) {
+            gg_ghost_sum_ +=
+                compactor->get_ghost_sum_for_free_segments(2.0 * dN).cum_valid;
+            gg_ratio.updateFromCumulative(
+                log_cache_timestamp, static_cast<uint64_t>(gg_ghost_sum_));
+        }
+        if (evictor) {
+            ff_flush_sum_ +=
+                static_cast<double>(evictor->get_mth_score_valid_pages(2.0 * dN));
+            ff_ratio.updateFromCumulative(
+                log_cache_timestamp, static_cast<uint64_t>(ff_flush_sum_));
+            gf_flush_sum_ +=
+                static_cast<double>(evictor->get_mth_score_valid_pages(dN));
+            gf_flush_ratio.updateFromCumulative(
+                log_cache_timestamp, static_cast<uint64_t>(gf_flush_sum_));
+        }
     }
     if (log_cache_timestamp % segment_size_blocks == 0) {
         if (compaction_ratio.has_value() &&
@@ -624,20 +650,34 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             const double Fu  = eviction_ratio.value();
             const double Gud = compaction_ratio_in_ghost_cache.value();
             const double Fud = eviction_ratio_in_ghost_cache.value();
+            // F_pred_rate now = per-host-write rate at which ghost-resident
+            //   pages get invalidated (totalPush − totalPop derivative).
             const double F_pred_rate  = flush_pred_ratio.has_value()
                                       ? flush_pred_ratio.value() : 0.0;
             const double F_ghost_rate = flush_ghost_ratio.has_value()
                                       ? flush_ghost_ratio.value() : 0.0;
-            // LHS = r·waf·(F_pred − F_ghost):
-            //   F_pred  ≈ ghost-sim of "if we flushed top-D evict candidates,
-            //             how many valid pages" (per host-write rate).
-            //   F_ghost ≈ valid pages currently in D recently-flushed segs (per
-            //             host-write rate, sum-of-snapshots over time).
-            //   F_pred − F_ghost = net flush saving from D-seg extension.
-            // RHS = Gud : marginal GC cost predicted by ghost compactor.
-            const double lhs = periodic_ratio_ * waf_w * (F_pred_rate - F_ghost_rate);
-            const double rhs = Gud;
-            const bool   raise = (lhs > rhs);
+            (void)F_ghost_rate;  // kept for logging / easy −F_ghost restore
+            (void)F_pred_rate;   // kept for logging (col f_frac_pred)
+            // ── Marginal next-step comparison (de-confounds util level) ──
+            // Reuse the δN vs 2δN breadths as forward differences:
+            //   G  = Gud = ghost_sum(δN)    GG = ghost_sum(2δN)
+            //   F  = get_mth(δN)            FF = get_mth(2δN)
+            //   Gnext = GG − G  (cost of the 2nd GC step)
+            //   Fnext = FF − F  (cost of the 2nd flush step)
+            // Compare GC's escalation against flush's de-escalation; flush legs
+            // carry r·waf (cold-tier write cost):
+            //   LHS = Gnext − G          = GG − 2·G
+            //   RHS = r·waf·(F − Fnext)  = r·waf·(2F − FF)
+            // do G (RAISE) if LHS < RHS, else flush (LOWER).
+            const double rwaf  = periodic_ratio_ * waf_w;
+            const double GG    = gg_ratio.has_value()       ? gg_ratio.value()       : 0.0;
+            const double FFv   = ff_ratio.has_value()       ? ff_ratio.value()       : 0.0; // get_mth(2δN)
+            const double Fv    = gf_flush_ratio.has_value() ? gf_flush_ratio.value() : 0.0; // get_mth(δN)
+            const double Gnext = GG  - Gud;
+            const double Fnext = FFv - Fv;
+            const double lhs   = Gnext - Gud;          // GG − 2·Gud
+            const double rhs   = rwaf * (Fv - Fnext);  // r·waf·(2F − FF)
+            const bool   raise = (lhs < rhs);
             const double cur_util = (total_cache_block_count > 0)
                                   ? (double)global_valid_blocks / total_cache_block_count : 0.0;
             const double prev_target = target_valid_blk_rate;
@@ -665,7 +705,7 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                             "ts segs r waf G_u F_u G_ud F_ud LHS RHS decision "
                             "cur_util tgt_before tgt_after hard_limit low_floor "
                             "comp_cum evict_cum ex_low_tgt ex_tgt_sat ex_force_flush ex_high_valid "
-                            "compact_avg flush_avg compact_evt ghost_compact_sum f_frac_pred\n");
+                            "compact_avg flush_avg compact_evt ghost_compact_sum f_frac_pred GGr FFr Fr Gnext Fnext\n");
                     }
                 }
             }
@@ -673,7 +713,7 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                 std::fprintf(g_gs_dec_fp,
                     "%lu %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %s "
                     "%.6f %.6f %.6f %d %d %lu %lu %lu %lu %lu %lu "
-                    "%.6f %.6f %lu %.0f %.6f\n",
+                    "%.6f %.6f %lu %.0f %.6f %.6f %.6f %.6f %.6f %.6f\n",
                     log_cache_timestamp, gs_decision_period_segs_,
                     periodic_ratio_, waf_w, Gu, Fu, Gud, Fud, lhs, rhs,
                     raise ? "RAISE" : "LOWER",
@@ -684,7 +724,7 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                     g_ex_force_flush_count, g_ex_high_valid_victim_count,
                     compact_avg, flush_avg,
                     compact_event_count_, ghost_compacted_blocks_sum_,
-                    F_pred_rate);
+                    F_pred_rate, GG, FFv, Fv, Gnext, Fnext);
                 std::fflush(g_gs_dec_fp);
             }
         }
