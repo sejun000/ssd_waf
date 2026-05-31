@@ -13,6 +13,7 @@ class MultiHotCold: public IStream {
 public:
     MultiHotCold(int max_gc_streams, int timestamp_granularity, bool check_created_timestamp_only, bool classify_for_host_append = false, bool classfy_for_gc_append = true, int num_host_streams = 2);
     int  Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) override;
+    int  ClassifyReadOnly(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) const override;
     void Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) override;
     void GcAppend(uint64_t blockAddr){};
     void CollectSegment(Segment *segment, uint64_t global_timestamp) override;

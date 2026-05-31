@@ -79,7 +79,9 @@ static inline bool is_old_cycle_segment(Segment *seg) {
 static double score_warm_first(Segment *seg) {
     if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
+    const double v_use = (g_ghost_v_override >= 0.0) ? g_ghost_v_override
+                                                     : static_cast<double>(seg->valid_cnt);
+    double u = v_use / segment_size;
     //printf("segment_size : %f\n",segment_size);
    // if (u > 0.8) return 0.0;  // Too full to compact efficiently
     if (g_threshold <= 0 || g_timestamp <= 0) {
@@ -101,7 +103,9 @@ static double score_warm_first(Segment *seg) {
 static double score_hot_first(Segment *seg) {
     if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
+    const double v_use = (g_ghost_v_override >= 0.0) ? g_ghost_v_override
+                                                     : static_cast<double>(seg->valid_cnt);
+    double u = v_use / segment_size;
    // if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
@@ -115,7 +119,9 @@ static double score_hot_first(Segment *seg) {
 static double score_cold_first(Segment *seg) {
     if (is_old_cycle_segment(seg)) return 0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
+    const double v_use = (g_ghost_v_override >= 0.0) ? g_ghost_v_override
+                                                     : static_cast<double>(seg->valid_cnt);
+    double u = v_use / segment_size;
   //  if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);
@@ -128,7 +134,9 @@ static double score_cold_first(Segment *seg) {
 static double score_sepbit_age(Segment *seg) {
     //if (is_old_cycle_segment(seg)) return 0.0;
     double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
-    double u = seg->valid_cnt / segment_size;
+    const double v_use = (g_ghost_v_override >= 0.0) ? g_ghost_v_override
+                                                     : static_cast<double>(seg->valid_cnt);
+    double u = v_use / segment_size;
 //    if (u > 0.8) return 0.0;
     if (g_threshold <= 0 || g_timestamp <= 0) {
         return -static_cast<double>(seg->create_timestamp);

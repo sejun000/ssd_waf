@@ -71,6 +71,35 @@ int MultiHotCold::Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_
     return stream_id + Segment::GC_STREAM_START;
 }
 
+int MultiHotCold::ClassifyReadOnly(uint64_t /*blockAddr*/, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) const {
+    // Pure computation twin of Classify(): returns the same stream id WITHOUT
+    // mutating any state. Specifically it never writes mTimestampGranularity,
+    // g_cycle_length, mStreamCycles, g_stream_cycles or mPendingVictimStreams —
+    // so it is safe to call repeatedly inside a what-if GC simulation.
+    uint64_t gran = static_cast<uint64_t>(mTimestampGranularity);
+    uint64_t fresh_interval = compute_stream_interval(0);
+    if (fresh_interval > 0) gran = fresh_interval;   // local copy only, not stored
+    if (gran == 0) gran = 1;                          // div-by-zero guard
+
+    uint64_t time_diff = global_timestamp - created_timestamp;
+    if (!isGcAppend) {
+        uint64_t lifespan = time_diff;
+        return (lifespan != 0 && lifespan < mAvgLifespan) ? 0 : 1;
+    }
+    if (mCheckCreatedTimestampOnly) {
+        time_diff = created_timestamp;
+    }
+    int raw_id = static_cast<int>(time_diff / gran);
+    int stream_id;
+    if (mCheckCreatedTimestampOnly) {
+        stream_id = raw_id % mMaxGcStreams;           // no cycle-wrap bookkeeping
+    } else {
+        stream_id = raw_id;
+        if (stream_id >= mMaxGcStreams) stream_id = mMaxGcStreams - 1;
+    }
+    return stream_id + Segment::GC_STREAM_START;
+}
+
 int MultiHotCold::GetVictimStreamId(uint64_t global_timestamp, uint64_t threshold) {
     if (!mCheckCreatedTimestampOnly) return -1;
 

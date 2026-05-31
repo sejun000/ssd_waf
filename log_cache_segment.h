@@ -17,6 +17,8 @@ public:
             bool valid = false; ///< 유효성 플래그 (1비트)
         };
         uint64_t create_timestamp = UINT64_MAX; ///< 생성 시각
+        // 직전 같은 LBA write 와의 간격 (host ticks). 0 = 처음 쓰는 LBA.
+        uint64_t update_interval  = 0;
     };
 
     explicit LogCacheSegment(std::size_t blocks_per_segment, uint64_t create_timestamp)
@@ -27,10 +29,11 @@ public:
 
     /* helpers */
     inline bool full()  override  { return write_ptr >= blocks.size(); }
-    inline void reset() override 
+    inline void reset() override
     {
         write_ptr = 0;
         valid_cnt = 0;
         for (auto &b : blocks) b.valid = false;
+        reset_invalidate_rate();
     }
 };

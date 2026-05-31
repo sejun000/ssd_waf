@@ -5,6 +5,11 @@
 class IStream {
 public:
     virtual int  Classify(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) = 0;
+    // Mutation-free twin of Classify() for what-if GC simulation. Returns the
+    // SAME stream id Classify() would, but must NOT touch any internal cycle /
+    // granularity bookkeeping (mStreamCycles, pending-victim queues, …). Default
+    // -1 = unsupported → caller should fall back to a single GC stream.
+    virtual int  ClassifyReadOnly(uint64_t blockAddr, bool isGcAppend, uint64_t global_timestamp, uint64_t created_timestamp) const { return -1; }
     virtual void Append(uint64_t blockAddr, uint64_t global_timestamp, void *arg) = 0;
     virtual void GcAppend(uint64_t blockAddr) = 0;
     virtual void CollectSegment(Segment *segment, uint64_t global_timestamp) = 0;

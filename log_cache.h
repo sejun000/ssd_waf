@@ -145,6 +145,57 @@ private:
     void update_ghost_compacted_blocks_sum();
     void update_ghost_compacted_blocks_sum_cum();  // Final: tick-based cum_valid accumulator
 
+    // ── What-if GC net-free simulation ───────────────────────────────────
+    // Walk the live compactor victim list in score order, relocating each
+    // victim's valid blocks into per-stream GC active segments (seeded from the
+    // current gc_active_seg write pointers, routed via stream_policy's
+    // mutation-free ClassifyReadOnly), until one NET segment is freed:
+    //   net_free = victims_consumed - gc_active_segs_allocated == 1.
+    // Reports the boundary victim's WT (create_timestamp) and the resulting
+    // active-seg WT under the GC "oldest-WT wins" rule. Pure read-only — mutates
+    // NO live state (LogCache, compactor heap, or stream_policy cycle state).
+    struct GcNetFreeSim {
+        bool     reached            = false;        // net_free==1 actually reached
+        int      victims            = 0;            // m: victims consumed
+        int      new_allocs         = 0;            // new gc active segs allocated
+        uint64_t cum_valid          = 0;            // total valid blocks routed to target (= true valid copied)
+        uint64_t boundary_victim_wt = 0;            // m-th victim seg create_timestamp
+        uint64_t boundary_seg_wt    = UINT64_MAX;   // min WT of active seg(s) the m-th victim landed in
+        uint64_t min_victim_wt      = UINT64_MAX;   // min create_timestamp over consumed victims
+        uint64_t active_seg_min_wt  = UINT64_MAX;   // min WT across all touched active segs
+    };
+    GcNetFreeSim simulate_gc_net_free() const;
+
+    // Σ invalidate_rate over every evictor (WT-ordered) segment with
+    // create_timestamp <= wt_hi. O(rank) scan with early-stop (evictor is WT
+    // ascending). Pair with get_victim_wt_span_for_free_segments by passing
+    // span.max_wt → prefix invalidate-rate mass up to and including victim v.
+    double sum_invalidate_rate_in_wt_range(uint64_t wt_hi) const;
+
+    // invalidate-rate signal validation: snapshot the last decision's WT≤v cohort
+    // (per-seg cumulative invalidate count + that seg's predicted rate), then next
+    // decision measure the ACTUAL invalidations on the SURVIVING cohort and log
+    // predicted-vs-actual. Keyed per-segment (and wt-verified to dodge pointer
+    // reuse) because cohort membership churns — same reasoning as the independent
+    // per-seg EWMA: summing cumulative counts over a drifting WT band is corrupted
+    // by departures, so we diff per survivor instead.
+    struct InvPredSnap { uint64_t count; uint64_t wt; double rate; };
+    std::unordered_map<Segment*, InvPredSnap> invpred_snap_;
+    uint64_t invpred_snap_ts_    = 0;   // host time at snapshot
+    uint64_t invpred_snap_maxwt_ = 0;   // vspan.max_wt at snapshot (cohort upper bound)
+    double   invpred_rate_sum_   = 0.0; // invrate_sum at snapshot (full-cohort rate)
+
+    // raw (non-EWMA) per-tick Gud vs compact: log the SAME quantities the two
+    // EWMAs smooth, but as direct first-differences between consecutive decision
+    // ticks, to confirm the back-computed raw ratio (~1.0) was not an artifact.
+    //   raw_gud     = d(ghost_compacted_blocks_sum_) / d(log_cache_timestamp)
+    //   raw_compact = d(compacted_blocks) / d(net_free_pages)
+    //   net_free_pages = d(compact_event_count_)·seg − d(compacted_blocks)
+    uint64_t rawval_prev_ts_       = 0;
+    double   rawval_prev_ghostsum_ = 0.0;
+    uint64_t rawval_prev_comp_     = 0;
+    uint64_t rawval_prev_compevt_  = 0;
+
     /* trace(optional) *****************************************************/
     bool  cache_trace_;
     FILE* trace_fp_      = nullptr;
@@ -197,6 +248,60 @@ private:
     // tick: updateFromCumulative(flush_event_count_, evicted_blocks).
     EwmaRatio flush_avg_ratio;
     uint64_t  flush_event_count_ = 0;
+    // Full-invalid victims (valid_cnt==0) freed directly via reset_segment —
+    // counted in neither compact_event_count_ nor flush_event_count_. They free a
+    // whole segment at zero cost. Conservation:
+    //   host = comp_netfree + flush_netfree + (full_invalid_reset_count_ · seg)
+    uint64_t  full_invalid_reset_count_ = 0;
+    // Per-class-num victim count from most recent ghost scan
+    // (update_ghost_compacted_blocks_sum_cum). Logged per gsdec row.
+    double last_ghost_m_by_class_[16] = {0};
+    // Σ invalidate_rate over picked victims (most recent ghost scan).
+    // 평균 = last_ghost_sum_inv_rate_ / Σ last_ghost_m_by_class_.
+    double last_ghost_sum_inv_rate_ = 0.0;
+    // Σ raw last-fold inv_rate (no EWMA) over picked victims.
+    double last_ghost_sum_inv_rate_lf_ = 0.0;
+    // REAL-victim inv_rate tracking — accumulated for each segment that actually
+    // gets compacted (post-K_VAL choice in check_and_evict_if_needed). Compare
+    // against last_ghost_sum_inv_rate_/_lf_ (predicted) to expose drift between
+    // ghost scan-time vs execution-time victim selection.
+    double   real_victim_inv_rate_cum_     = 0.0;  // Σ invalidate_rate() (EWMA)
+    double   real_victim_inv_rate_lf_cum_  = 0.0;  // Σ raw last-fold rate
+    uint64_t real_victim_compact_count_    = 0;    // # of real compactions
+    // Prev snapshots for per-gsdec-tick diff (analogous to rawval_prev_*):
+    double   rawval_prev_real_inv_rate_    = 0.0;
+    double   rawval_prev_real_inv_rate_lf_ = 0.0;
+    uint64_t rawval_prev_real_compact_     = 0;
+    // Real-victim age/u distribution — to test whether real picks include
+    // recently-sealed segments (age < 1seg) with low-u. If many fresh victims
+    // appear, ghost's predict-time view (taken before they existed) misses
+    // them → cum_valid over-prediction.
+    uint64_t real_victim_age_sum_       = 0;   // Σ age (host pages)
+    double   real_victim_u_sum_         = 0.0; // Σ u (= valid_cnt/seg_blocks)
+    uint64_t real_victim_fresh_count_   = 0;   // # with age < seg_blocks
+    double   real_victim_fresh_u_sum_   = 0.0; // Σ u over fresh victims
+    uint64_t rawval_prev_real_age_sum_     = 0;
+    double   rawval_prev_real_u_sum_       = 0.0;
+    uint64_t rawval_prev_real_fresh_count_ = 0;
+    double   rawval_prev_real_fresh_u_sum_ = 0.0;
+    // create_timestamp of first 4 ghost-picked victims (from latest ghost scan)
+    // and first 4 real-compacted victims (since last gsdec print). −1 = unused.
+    // Reset on each gsdec print of real-side. Lets us see if ghost set ⊂ real
+    // set or vice versa.
+    int64_t last_ghost_picked_ts_[4] = { -1, -1, -1, -1 };
+    // RESORT-mode cohort boundary: max create_timestamp among RESORT picks
+    // (mirrors vspan.max_wt but reflects the corrected-score pick set).
+    // 0 = not populated (RESORT disabled) → fall back to vspan.max_wt.
+    uint64_t last_ghost_resort_max_wt_ = 0;
+    int64_t real_picked_ts_[4]       = { -1, -1, -1, -1 };
+    int     real_picked_idx_         = 0;
+    // u at scan time (ghost) / execute time (real) for the same 4 picks each.
+    // Direct measurement — no derivation from raw_gud/m. NaN/0 if pick absent.
+    double  last_ghost_picked_u_[4]  = { 0.0, 0.0, 0.0, 0.0 };
+    double  real_picked_u_[4]        = { 0.0, 0.0, 0.0, 0.0 };
+    // Fractional m from get_ghost_sum_for_free_segments (= s.m, includes
+    // fractional last victim). Different from integer g_vid count (= ceil(m)).
+    double  last_ghost_m_frac_       = 0.0;
     // Per-compaction-event average copied valid (pages/event). Mirrors
     // flush_avg_ratio: updateFromCumulative(compact_event_count_·seg_blocks,
     // compacted_blocks) → EWMA value = avg valid fraction per victim.
@@ -221,6 +326,10 @@ private:
     double    ff_flush_sum_ = 0.0;
     EwmaRatio gf_flush_ratio;    // get_mth(δN)  (GF's flush leg; GC leg = Gud)
     double    gf_flush_sum_ = 0.0;
+    // λ: device blocks invalidated per host-write page (EWMA over moving_avg
+    //    window = 1 host-seg = 한 host_writes).
+    //    GS_FINAL λ-rule: GC (RAISE) if Gud < λ·r, else flush.
+    EwmaRatio lambda_ratio;
     double periodic_ratio_ = 2.88;
     EwmaRatio ghost_util_ratio;  // ghost miss rate = U(util_step)
     GhostCache ghost_cache;
@@ -298,6 +407,24 @@ private:
     /* ── Rewrite interval tracking (no-cache baseline) ──── */
     std::unordered_map<long, uint64_t> rewrite_last_ts_;  // LBA → last write ts
     std::map<uint64_t, uint64_t> rewrite_hist_;            // bucket → count
+
+    /* ── Per-block update_interval (for invrate predictor) ──── */
+    // LBA → previous-block lifetime (= invalidate-time − create-time of the
+    // block that just got invalidated). On the NEXT write of that LBA, the
+    // value is copied into block.update_interval. Cleared by the invalidate
+    // path. Evicted LBAs (no invalidate) are NOT recorded → reinsert is
+    // treated as 1st-write (update_interval = 0).
+    std::unordered_map<long, uint64_t> lba_prev_lifetime_;
+    // Histogram over 1st-write blocks (update_interval == 0): bin =
+    // min(N-1, lifetime / age_prior_bin_width_). On invalidate of a 1st-write
+    // block, hist[bin]++. Lookup later gives age-conditional invalidation
+    // distribution → used by predictor step 4.
+    static constexpr size_t AGE_PRIOR_BINS = 256;
+    std::vector<uint64_t> age_prior_inv_count_;       // hist of 1st-write lifetimes
+    uint64_t              age_prior_bin_width_ = 0;   // ticks per bin (= seg_size)
+    uint64_t              age_prior_total_first_writes_ = 0;
+    void                  init_age_prior(uint64_t bin_width);
+    void                  print_age_prior();
 
     void record_rewrite(long key);
     void print_rewrite_results();
@@ -433,5 +560,6 @@ public:
         gg_ratio                        = MovingAverageRatio::Make(type, window_blocks);
         ff_ratio                        = MovingAverageRatio::Make(type, window_blocks);
         gf_flush_ratio                  = MovingAverageRatio::Make(type, window_blocks);
+        lambda_ratio                    = MovingAverageRatio::Make(type, window_blocks);
     }
 };

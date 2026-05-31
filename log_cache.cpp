@@ -83,13 +83,15 @@ LogCache::LogCache(uint64_t              cold_capacity,
       flush_ghost_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       gg_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
       ff_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
-      gf_flush_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
+      gf_flush_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS)),
+      lambda_ratio(MovingAverageRatio::FromHalfLifeBlocks(DEFAULT_HALF_LIFE_IN_BLOCKS))
 {
     periodic_ratio_ = periodic_ratio;
     segment_size_blocks = cfg_.segment_bytes / blk_sz;
     g_segment_blocks = static_cast<double>(segment_size_blocks);
     total_segments = cache_block_count * blk_sz / cfg_.segment_bytes;
     total_cache_block_count = total_segments * segment_size_blocks;
+    init_age_prior(segment_size_blocks);   // 1 seg-life per bin
     total_capacity_bytes = cache_block_count * blk_sz;
     assert(segment_size_blocks > 0 && "segment_bytes too small");
     assert(total_segments      > 0 && "device_bytes too small");
@@ -139,6 +141,7 @@ LogCache::~LogCache()
 {
     print_lifetime_results();
     print_rewrite_results();
+    print_age_prior();
     print_utilization_distribution();
     print_segment_age_scatter();
     print_inv_time_scatter();
@@ -162,8 +165,22 @@ void LogCache::invalidate(long key, int lba_sz) {
         auto loc = mapping[key];
         if (loc.seg->blocks[loc.idx].valid)
         {
-            print_objects("invalidate", log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp);
-            record_lifetime(log_cache_timestamp - loc.seg->blocks[loc.idx].create_timestamp, true);
+            const auto& invblk = loc.seg->blocks[loc.idx];
+            const uint64_t lifetime = log_cache_timestamp - invblk.create_timestamp;
+            print_objects("invalidate", lifetime);
+            record_lifetime(lifetime, true);
+            // per-block invrate predictor (step 1-3):
+            //   * record this lifetime under the LBA so the next write of the
+            //     same LBA can stamp its block.update_interval with it.
+            //   * if this block itself was a 1st-write (update_interval == 0),
+            //     feed its observed lifetime into the global age-prior hist.
+            lba_prev_lifetime_[key] = lifetime;
+            if (invblk.update_interval == 0 && age_prior_bin_width_ > 0) {
+                size_t bin = static_cast<size_t>(lifetime / age_prior_bin_width_);
+                if (bin >= AGE_PRIOR_BINS) bin = AGE_PRIOR_BINS - 1;
+                ++age_prior_inv_count_[bin];
+                ++age_prior_total_first_writes_;
+            }
             {
                 auto cit = compacted_at_.find(key);
                 if (cit != compacted_at_.end()) {
@@ -174,6 +191,7 @@ void LogCache::invalidate(long key, int lba_sz) {
             invalidate_blocks += 1;
             loc.seg->blocks[loc.idx].valid = false;
             --loc.seg->valid_cnt;
+            loc.seg->note_invalidation();   // per-seg cumulative inval count (++ only)
             global_valid_blocks -= 1;
             record_inv_time(key);
             if (loc.seg->full()){
@@ -353,13 +371,122 @@ void LogCache::update_ghost_compacted_blocks_sum_cum() {
     }
     const double target_free_segs = util_step_ *
         static_cast<double>(total_segments);
-    auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs);
+    auto s = compactor->get_ghost_sum_for_free_segments(target_free_segs,
+                                                        log_cache_timestamp);
+    // Capture per-class breakdown for gsdec logging (even when cum_invalid==0).
+    for (int k = 0; k < 16; ++k) last_ghost_m_by_class_[k] = s.m_by_class[k];
+    last_ghost_sum_inv_rate_    = s.sum_invalidate_rate;
+    last_ghost_sum_inv_rate_lf_ = s.sum_inv_rate_last_fold;
+    for (int k = 0; k < 4; ++k) {
+        last_ghost_picked_ts_[k] = s.picked_create_ts[k];
+        last_ghost_picked_u_[k]  = s.picked_u[k];
+    }
+    last_ghost_m_frac_ = s.m;
+    last_ghost_resort_max_wt_ = s.max_picked_wt;   // 0 if RESORT off
     if (s.cum_invalid > 0.0) {
         ghost_compacted_blocks_sum_ += s.cum_valid;
         ghost_sum_initialized_       = true;
         last_ghost_sum_ts_           = log_cache_timestamp;
         last_invalidate_at_comp_     = invalidate_blocks;
     }
+}
+
+LogCache::GcNetFreeSim LogCache::simulate_gc_net_free() const
+{
+    GcNetFreeSim r;
+    const std::size_t seg_blocks = segment_size_blocks;
+    if (!compactor || seg_blocks == 0) return r;
+
+    // Per-stream simulated GC active segment: remaining free slots + running WT.
+    // Seeded from the live gc_active_seg so each one's current write_ptr counts
+    // (a victim whose valid pages fit in the leftover space allocates nothing).
+    struct SimSeg { std::size_t remaining; uint64_t wt; };
+    std::unordered_map<int, SimSeg> sim;
+    sim.reserve(gc_active_seg.size() * 2 + 8);
+    for (const auto& kv : gc_active_seg) {
+        LogCacheSegment* s   = kv.second;
+        const std::size_t used = s->write_ptr;
+        const std::size_t rem  = (seg_blocks > used) ? (seg_blocks - used) : 0;
+        sim[kv.first] = SimSeg{ rem, s->create_timestamp };
+    }
+
+    int      victims       = 0;
+    int      new_allocs    = 0;
+    uint64_t min_victim_wt = UINT64_MAX;
+    uint64_t active_min_wt = UINT64_MAX;
+
+    compactor->for_each_victim_in_order([&](Segment* base) -> bool {
+        LogCacheSegment* v = static_cast<LogCacheSegment*>(base);
+        ++victims;
+        if (v->create_timestamp < min_victim_wt) min_victim_wt = v->create_timestamp;
+
+        // Relocate every valid block, routing by its own create_timestamp.
+        uint64_t this_victim_seg_wt = UINT64_MAX;  // min WT of seg(s) THIS victim lands in
+        for (std::size_t i = 0; i < v->blocks.size(); ++i) {
+            const auto& blk = v->blocks[i];
+            if (!blk.valid) continue;
+            int sid = stream_policy
+                ? stream_policy->ClassifyReadOnly(blk.key, /*isGcAppend=*/true,
+                                                  log_cache_timestamp, blk.create_timestamp)
+                : -1;
+            if (sid < 0) sid = Segment::GC_STREAM_START;   // fallback: single GC stream
+
+            auto it = sim.find(sid);
+            if (it == sim.end()) {
+                // No live active seg for this stream → first GC write allocates one.
+                ++new_allocs;
+                it = sim.emplace(sid, SimSeg{ seg_blocks, log_cache_timestamp }).first;
+            } else if (it->second.remaining == 0) {
+                // Active seg full → allocate a fresh one for this stream.
+                ++new_allocs;
+                it->second = SimSeg{ seg_blocks, log_cache_timestamp };
+            }
+            SimSeg& ss = it->second;
+            --ss.remaining;
+            ++r.cum_valid;  // exact valid blocks routed in this sim
+            if (blk.create_timestamp < ss.wt) ss.wt = blk.create_timestamp;  // oldest-WT rule
+            if (ss.wt < this_victim_seg_wt) this_victim_seg_wt = ss.wt;
+            if (ss.wt < active_min_wt)       active_min_wt      = ss.wt;
+        }
+
+        // Victim segment is reclaimed (+1 free); allocations consumed free segs.
+        // net_free rises by at most 1 per victim, so the first time it reaches 1
+        // it is exactly 1 — that victim is the boundary.
+        if (victims - new_allocs >= 1) {
+            r.reached            = true;
+            r.victims            = victims;
+            r.new_allocs         = new_allocs;
+            r.boundary_victim_wt = v->create_timestamp;
+            r.boundary_seg_wt    = this_victim_seg_wt;
+            r.min_victim_wt      = min_victim_wt;
+            r.active_seg_min_wt  = active_min_wt;
+            return false;                            // stop scanning
+        }
+        return true;
+    });
+
+    if (!r.reached) {            // heap exhausted before reaching net_free==1
+        r.victims           = victims;
+        r.new_allocs        = new_allocs;
+        r.min_victim_wt     = min_victim_wt;
+        r.active_seg_min_wt = active_min_wt;
+    }
+    return r;
+}
+
+double LogCache::sum_invalidate_rate_in_wt_range(uint64_t wt_hi) const
+{
+    double sum = 0.0;
+    if (!evictor) return sum;
+    // evictor (score_age_evict = -create_timestamp, max-heap) hands out segments
+    // in WT-ascending order → once we pass wt_hi every later seg is also out.
+    // No lower bound: accumulate every resident seg up to victim v (wt_hi).
+    evictor->for_each_victim_in_order([&](Segment* s) -> bool {
+        if (s->get_create_time() > wt_hi) return false;   // ascending → done
+        sum += s->invalidate_rate();
+        return true;
+    });
+    return sum;
 }
 
 void LogCache::periodic_gs_predict_track() {
@@ -581,7 +708,7 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
     //   * Gud = G(u+δ) per host write (cum_valid is prediction-only marginal cost).
     if (!is_ghost_cache) return;
 
-    if (log_cache_timestamp % (segment_size_blocks / 4) == 0) {
+    if (log_cache_timestamp % segment_size_blocks == 0) {
         update_ghost_compacted_blocks_sum_cum();
         compaction_ratio.updateFromCumulative(log_cache_timestamp, compacted_blocks);
         compaction_ratio_in_ghost_cache.updateFromCumulative(
@@ -595,8 +722,18 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
         // and denominator are in pages → EWMA value = fraction (0~1).
         flush_avg_ratio.updateFromCumulative(
             flush_event_count_ * segment_size_blocks, evicted_blocks);
+        // compact_avg = per-NET-FREE-segment valid copy. denom = victims·seg −
+        //   compacted_blocks = (segs GC reclaimed − segs GC re-allocated)·seg =
+        //   NET segments freed by GC ·seg. value = u/(1−u), unit-matched to the
+        //   ghost_sum per-free prediction. (Was per-victim u, which ignored that
+        //   GC re-writes valid into fresh segs → undercounted real free cost.)
         compact_avg_ratio.updateFromCumulative(
-            compact_event_count_ * segment_size_blocks, compacted_blocks);
+            compact_event_count_ * segment_size_blocks - compacted_blocks, compacted_blocks);
+        // λ: device blocks invalidated per host-write page. invalidate_blocks =
+        //   cumulative host-overwrite/trim invalidations; log_cache_timestamp =
+        //   cumulative host-write pages. EWMA over the moving_avg window → recent
+        //   per-page invalidation rate (×seg = blocks invalidated per host-seg).
+        lambda_ratio.updateFromCumulative(log_cache_timestamp, invalidate_blocks);
         // F_inv: rate at which ghost-resident pages die, measured AT POP time.
         //   totalPush − totalPop = Σ_popped(push_valid − pop_valid) + resident
         //   push. push_valid−pop_valid = pages a segment lost while resident in
@@ -639,6 +776,16 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             gf_flush_ratio.updateFromCumulative(
                 log_cache_timestamp, static_cast<uint64_t>(gf_flush_sum_));
         }
+        // Per-segment invalidation rate: fold each resident (sealed) segment's
+        // cumulative count at this regular cadence — same updateFromCumulative
+        // pattern as the ratios above, so invrate_sum reads a recency-weighted
+        // rate while the per-event path stays a bare ++. ~O(sealed segs) per tick.
+        if (evictor) {
+            evictor->for_each_victim_in_order([this](Segment* s) -> bool {
+                s->fold_invalidate_rate(log_cache_timestamp);
+                return true;
+            });
+        }
     }
     if (log_cache_timestamp % segment_size_blocks == 0) {
         if (compaction_ratio.has_value() &&
@@ -658,26 +805,46 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                                       ? flush_ghost_ratio.value() : 0.0;
             (void)F_ghost_rate;  // kept for logging / easy −F_ghost restore
             (void)F_pred_rate;   // kept for logging (col f_frac_pred)
-            // ── Marginal next-step comparison (de-confounds util level) ──
-            // Reuse the δN vs 2δN breadths as forward differences:
-            //   G  = Gud = ghost_sum(δN)    GG = ghost_sum(2δN)
-            //   F  = get_mth(δN)            FF = get_mth(2δN)
-            //   Gnext = GG − G  (cost of the 2nd GC step)
-            //   Fnext = FF − F  (cost of the 2nd flush step)
-            // Compare GC's escalation against flush's de-escalation; flush legs
-            // carry r·waf (cold-tier write cost):
-            //   LHS = Gnext − G          = GG − 2·G
-            //   RHS = r·waf·(F − Fnext)  = r·waf·(2F − FF)
-            // do G (RAISE) if LHS < RHS, else flush (LOWER).
-            const double rwaf  = periodic_ratio_ * waf_w;
+            // ── invrate-rule: GC if its copy cost beats the natural-death credit ──
+            //   invrate_sum = Σ per-seg invalidate_rate over resident segs with
+            //   WT ≤ v, where victim v = newest seg GC must touch to free
+            //   util_step_·N. Each invalidate_rate ≈ invalidated pages per
+            //   host-write page on that seg → the sum is the host-page death rate
+            //   of the old cohort GC would reclaim. Routing that reclaim through
+            //   cold-tier flush costs invrate_sum·r writes; GC instead copies Gud
+            //   valid pages. → GC (RAISE) iff Gud < invrate_sum·r, else flush.
+            //   Computed every tick (cheap heap scans); gcsim below stays log-only.
+            const double vic_target_free =
+                util_step_ * static_cast<double>(total_segments);
+            EvictPolicy::VictimWtSpanResult vspan;
+            double invrate_sum = 0.0;
+            if (compactor) {
+                vspan = compactor->get_victim_wt_span_for_free_segments(vic_target_free);
+                // RESORT-aware: use the corrected-pick-set's max wt when active
+                // (last_ghost_resort_max_wt_ > 0), else fall back to vspan.max_wt
+                // computed from the original-score iteration.
+                const uint64_t wt_hi = (last_ghost_resort_max_wt_ > 0)
+                                       ? last_ghost_resort_max_wt_ : vspan.max_wt;
+                invrate_sum = sum_invalidate_rate_in_wt_range(wt_hi);
+                // Subtract the picked victims' own inv_rates: those segments
+                // will be GC'd (cost already in G_ud); only the NON-picked segs
+                // in the wt range forecast the LF-vs-GS eviction-saving.
+                invrate_sum -= last_ghost_sum_inv_rate_;
+                if (invrate_sum < 0.0) invrate_sum = 0.0;
+            }
+            const double lambda = lambda_ratio.has_value() ? lambda_ratio.value() : 0.0;
+            (void)lambda;  // kept for the `lambda` log column only (no longer in the rule)
+            const double lhs    = Gud;                           // GC copy cost / host page
+            const double rhs    = invrate_sum * periodic_ratio_; // invrate·r / host page
+            bool         raise  = (lhs < rhs);
+            // Marginal cols kept for logging only (not used by the λ-rule).
             const double GG    = gg_ratio.has_value()       ? gg_ratio.value()       : 0.0;
-            const double FFv   = ff_ratio.has_value()       ? ff_ratio.value()       : 0.0; // get_mth(2δN)
-            const double Fv    = gf_flush_ratio.has_value() ? gf_flush_ratio.value() : 0.0; // get_mth(δN)
+            const double FFv   = ff_ratio.has_value()       ? ff_ratio.value()       : 0.0;
+            const double Fv    = gf_flush_ratio.has_value() ? gf_flush_ratio.value() : 0.0;
             const double Gnext = GG  - Gud;
             const double Fnext = FFv - Fv;
-            const double lhs   = Gnext - Gud;          // GG − 2·Gud
-            const double rhs   = rwaf * (Fv - Fnext);  // r·waf·(2F − FF)
-            const bool   raise = (lhs < rhs);
+            // (anti-stuck cap removed: decision is now purely Gud < invrate_sum·r,
+            //  no forced flush after N consecutive RAISEs.)
             const double cur_util = (total_cache_block_count > 0)
                                   ? (double)global_valid_blocks / total_cache_block_count : 0.0;
             const double prev_target = target_valid_blk_rate;
@@ -705,15 +872,146 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                             "ts segs r waf G_u F_u G_ud F_ud LHS RHS decision "
                             "cur_util tgt_before tgt_after hard_limit low_floor "
                             "comp_cum evict_cum ex_low_tgt ex_tgt_sat ex_force_flush ex_high_valid "
-                            "compact_avg flush_avg compact_evt ghost_compact_sum f_frac_pred GGr FFr Fr Gnext Fnext\n");
+                            "compact_avg flush_avg compact_evt ghost_compact_sum f_frac_pred GGr FFr Fr Gnext Fnext lambda "
+                            "gcsim_reached gcsim_m gcsim_alloc gcsim_vic_wt gcsim_seg_wt gcsim_minvic_wt gcsim_actmin_wt "
+                            "vic_v_wt invrate_sum "
+                            "invpred_pred_full invpred_pred_surv invpred_actual invpred_nseg invpred_nsurv "
+                            "raw_gud raw_compact flush_evt full_inv_reset gcsim_cum_valid "
+                            "gud_m_c0 gud_m_c1 gud_m_c10 gud_m_c11 gud_m_c12 gud_m_c13 gud_m_c14 "
+                            "gud_sum_inv_rate gud_sum_inv_rate_lf "
+                            "real_inv_rate real_inv_rate_lf "
+                            "real_age_mean_segs real_u_mean real_fresh_frac real_fresh_u_mean "
+                            "g_vid0 g_vid1 g_vid2 g_vid3 r_vid0 r_vid1 r_vid2 r_vid3 "
+                            "g_u0 g_u1 g_u2 g_u3 r_u0 r_u1 r_u2 r_u3 "
+                            "g_m_frac\n");
                     }
                 }
             }
             if (g_gs_dec_fp) {
+                // What-if GC net-free sim — run only when the decision log is on
+                // (block-level victim scan is not free; keeps normal runs intact).
+                const GcNetFreeSim gcsim = simulate_gc_net_free();
+                auto wt_or_0 = [](uint64_t w) -> uint64_t {
+                    return (w == UINT64_MAX) ? 0UL : w;
+                };
+                // ── invalidate-rate signal validation: predicted (last snapshot) vs
+                //    actual invalidations measured over the SAME remembered cohort ──
+                double invpred_pred_full = 0.0, invpred_pred_surv = 0.0, invpred_actual = 0.0;
+                uint64_t invpred_nseg = 0, invpred_nsurv = 0;
+                if (evictor) {
+                    // (1) MEASURE: predicted vs actual on last snapshot's survivors.
+                    if (!invpred_snap_.empty() && log_cache_timestamp > invpred_snap_ts_) {
+                        const double dts = static_cast<double>(log_cache_timestamp - invpred_snap_ts_);
+                        invpred_pred_full = invpred_rate_sum_ * dts;       // full prev cohort (incl. departed)
+                        invpred_nseg      = invpred_snap_.size();
+                        evictor->for_each_victim_in_order([&](Segment* s) -> bool {
+                            if (s->get_create_time() > invpred_snap_maxwt_) return false; // WT asc → past cohort
+                            auto it = invpred_snap_.find(s);
+                            if (it != invpred_snap_.end() && it->second.wt == s->get_create_time()) {
+                                invpred_pred_surv += it->second.rate * dts;
+                                invpred_actual    += static_cast<double>(s->invalidate_count_ - it->second.count);
+                                ++invpred_nsurv;
+                            }
+                            return true;
+                        });
+                    }
+                    // (2) SNAPSHOT current cohort (WT ≤ vspan.max_wt) for the next tick.
+                    invpred_snap_.clear();
+                    evictor->for_each_victim_in_order([&](Segment* s) -> bool {
+                        if (s->get_create_time() > vspan.max_wt) return false;            // WT asc → stop at v
+                        invpred_snap_[s] = InvPredSnap{ s->invalidate_count_,
+                                                        s->get_create_time(),
+                                                        s->invalidate_rate() };
+                        return true;
+                    });
+                    invpred_snap_ts_    = log_cache_timestamp;
+                    invpred_snap_maxwt_ = vspan.max_wt;
+                    invpred_rate_sum_   = invrate_sum;
+                }
+                // ── raw (non-EWMA) Gud vs compact: direct first-differences ──
+                double raw_gud = 0.0, raw_compact = 0.0;
+                if (rawval_prev_ts_ != 0 && log_cache_timestamp > rawval_prev_ts_) {
+                    const double dts   = static_cast<double>(log_cache_timestamp - rawval_prev_ts_);
+                    const double dgs   = ghost_compacted_blocks_sum_ - rawval_prev_ghostsum_;
+                    const double dcomp = static_cast<double>(compacted_blocks - rawval_prev_comp_);
+                    const double dnetfree =
+                        static_cast<double>(compact_event_count_ - rawval_prev_compevt_)
+                        * static_cast<double>(segment_size_blocks) - dcomp;
+                    if (dts > 0.0)      raw_gud     = dgs / dts;             // valid-copy per host page (ghost)
+                    if (dnetfree > 0.0) raw_compact = dcomp / dnetfree;      // valid-copy per net-freed page
+                }
+                rawval_prev_ts_       = log_cache_timestamp;
+                rawval_prev_ghostsum_ = ghost_compacted_blocks_sum_;
+                rawval_prev_comp_     = compacted_blocks;
+                rawval_prev_compevt_  = compact_event_count_;
+
+                // Mean inv_rate per REAL compacted victim during this gsdec period.
+                // Comparable to last_ghost_sum_inv_rate_/m (ghost-picked mean).
+                double real_inv_rate = 0.0, real_inv_rate_lf = 0.0;
+                const uint64_t dcomp_real =
+                    real_victim_compact_count_ - rawval_prev_real_compact_;
+                if (dcomp_real > 0) {
+                    real_inv_rate    = (real_victim_inv_rate_cum_    - rawval_prev_real_inv_rate_)    / static_cast<double>(dcomp_real);
+                    real_inv_rate_lf = (real_victim_inv_rate_lf_cum_ - rawval_prev_real_inv_rate_lf_) / static_cast<double>(dcomp_real);
+                }
+                rawval_prev_real_inv_rate_    = real_victim_inv_rate_cum_;
+                rawval_prev_real_inv_rate_lf_ = real_victim_inv_rate_lf_cum_;
+                rawval_prev_real_compact_     = real_victim_compact_count_;
+
+                // Real-victim age/u distribution (per-period means).
+                //   real_age_mean_segs = mean age (segments) of real victims
+                //   real_u_mean        = mean u of real victims
+                //   real_fresh_frac    = fraction with age < 1 seg
+                //   real_fresh_u_mean  = mean u of fresh victims (NaN→0 if none)
+                double real_age_mean_segs = 0.0;
+                double real_u_mean        = 0.0;
+                double real_fresh_frac    = 0.0;
+                double real_fresh_u_mean  = 0.0;
+                if (dcomp_real > 0) {
+                    const uint64_t dage    = real_victim_age_sum_     - rawval_prev_real_age_sum_;
+                    const double   du      = real_victim_u_sum_       - rawval_prev_real_u_sum_;
+                    const uint64_t dfresh  = real_victim_fresh_count_ - rawval_prev_real_fresh_count_;
+                    const double   dfreshu = real_victim_fresh_u_sum_ - rawval_prev_real_fresh_u_sum_;
+                    real_age_mean_segs = static_cast<double>(dage) /
+                                         static_cast<double>(segment_size_blocks) /
+                                         static_cast<double>(dcomp_real);
+                    real_u_mean      = du / static_cast<double>(dcomp_real);
+                    real_fresh_frac  = static_cast<double>(dfresh) / static_cast<double>(dcomp_real);
+                    real_fresh_u_mean = (dfresh > 0) ? (dfreshu / static_cast<double>(dfresh)) : 0.0;
+                }
+                rawval_prev_real_age_sum_     = real_victim_age_sum_;
+                rawval_prev_real_u_sum_       = real_victim_u_sum_;
+                rawval_prev_real_fresh_count_ = real_victim_fresh_count_;
+                rawval_prev_real_fresh_u_sum_ = real_victim_fresh_u_sum_;
+
+                // Snapshot real_picked_ts_/u_ for this print, then reset for next period.
+                int64_t real_pick_log[4] = {
+                    real_picked_ts_[0], real_picked_ts_[1],
+                    real_picked_ts_[2], real_picked_ts_[3] };
+                double  real_pick_u_log[4] = {
+                    real_picked_u_[0], real_picked_u_[1],
+                    real_picked_u_[2], real_picked_u_[3] };
+                real_picked_ts_[0] = real_picked_ts_[1] =
+                real_picked_ts_[2] = real_picked_ts_[3] = -1;
+                real_picked_u_[0] = real_picked_u_[1] =
+                real_picked_u_[2] = real_picked_u_[3] = 0.0;
+                real_picked_idx_ = 0;
+
+                // vspan / invrate_sum already computed above (now drive the rule).
                 std::fprintf(g_gs_dec_fp,
                     "%lu %d %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %s "
                     "%.6f %.6f %.6f %d %d %lu %lu %lu %lu %lu %lu "
-                    "%.6f %.6f %lu %.0f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    "%.6f %.6f %lu %.0f %.6f %.6f %.6f %.6f %.6f %.6f %.6f "
+                    "%d %d %d %lu %lu %lu %lu "
+                    "%lu %.6f %.6f %.6f %.6f %lu %lu "
+                    "%.6f %.6f %lu %lu %lu "
+                    "%.4f %.4f %.4f %.4f %.4f %.4f %.4f "
+                    "%.6f %.6f "
+                    "%.6f %.6f "
+                    "%.4f %.6f %.4f %.6f "
+                    "%ld %ld %ld %ld %ld %ld %ld %ld "
+                    "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f "
+                    "%.6f\n",
                     log_cache_timestamp, gs_decision_period_segs_,
                     periodic_ratio_, waf_w, Gu, Fu, Gud, Fud, lhs, rhs,
                     raise ? "RAISE" : "LOWER",
@@ -724,7 +1022,31 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                     g_ex_force_flush_count, g_ex_high_valid_victim_count,
                     compact_avg, flush_avg,
                     compact_event_count_, ghost_compacted_blocks_sum_,
-                    F_pred_rate, GG, FFv, Fv, Gnext, Fnext);
+                    F_pred_rate, GG, FFv, Fv, Gnext, Fnext, lambda,
+                    gcsim.reached ? 1 : 0, gcsim.victims, gcsim.new_allocs,
+                    gcsim.boundary_victim_wt, wt_or_0(gcsim.boundary_seg_wt),
+                    wt_or_0(gcsim.min_victim_wt), wt_or_0(gcsim.active_seg_min_wt),
+                    vspan.max_wt, invrate_sum,
+                    invpred_pred_full, invpred_pred_surv, invpred_actual,
+                    invpred_nseg, invpred_nsurv,
+                    raw_gud, raw_compact, flush_event_count_, full_invalid_reset_count_,
+                    gcsim.cum_valid,
+                    last_ghost_m_by_class_[0],  last_ghost_m_by_class_[1],
+                    last_ghost_m_by_class_[10], last_ghost_m_by_class_[11],
+                    last_ghost_m_by_class_[12], last_ghost_m_by_class_[13],
+                    last_ghost_m_by_class_[14],
+                    last_ghost_sum_inv_rate_, last_ghost_sum_inv_rate_lf_,
+                    real_inv_rate, real_inv_rate_lf,
+                    real_age_mean_segs, real_u_mean, real_fresh_frac, real_fresh_u_mean,
+                    (long)last_ghost_picked_ts_[0], (long)last_ghost_picked_ts_[1],
+                    (long)last_ghost_picked_ts_[2], (long)last_ghost_picked_ts_[3],
+                    (long)real_pick_log[0], (long)real_pick_log[1],
+                    (long)real_pick_log[2], (long)real_pick_log[3],
+                    last_ghost_picked_u_[0], last_ghost_picked_u_[1],
+                    last_ghost_picked_u_[2], last_ghost_picked_u_[3],
+                    real_pick_u_log[0], real_pick_u_log[1],
+                    real_pick_u_log[2], real_pick_u_log[3],
+                    last_ghost_m_frac_);
                 std::fflush(g_gs_dec_fp);
             }
         }
@@ -1140,7 +1462,19 @@ void LogCache::batch_insert(int stream_id,
         record_rewrite(key);
         invalidate(key, lba_sz);
 
-        seg->blocks[seg->write_ptr] = { key, true, log_cache_timestamp };
+        // Per-block update_interval (step 1-3): stamp the new block with the
+        // lifetime of the previous version of this LBA, if recorded. 0 ⇒ 1st-
+        // write (LBA never seen, or last seen as evict).  invalidate() above
+        // is what populates lba_prev_lifetime_ — so we look up AFTER it.
+        uint64_t upd_int = 0;
+        {
+            auto it = lba_prev_lifetime_.find(key);
+            if (it != lba_prev_lifetime_.end()) {
+                upd_int = it->second;
+                lba_prev_lifetime_.erase(it);
+            }
+        }
+        seg->blocks[seg->write_ptr] = { key, true, log_cache_timestamp, upd_int };
         mapping[key]                = { seg, seg->write_ptr };
 
         ++seg->write_ptr;
@@ -1301,9 +1635,20 @@ void LogCache::check_and_evict_if_needed(int max_victims)
                                            (1 - cfg_.free_ratio_low) * (1 + additional_free_blks_ratio_by_gc)));
     g_threshold = threshold + cfg_.segment_bytes / cache_block_size;
    // printf("%d\n", low_water);
+    // Proactive top-up: keep evicting until free_pool has grown by `max_victims`
+    // NET free segments. Capture the baseline BEFORE the loop and exit once
+    // free_pool reaches baseline + max_victims — not after `max_victims` victims,
+    // because a compaction victim can net 0 free segments (it allocates a target
+    // while freeing the victim). Every victim is freed synchronously via
+    // reset_segment() (flush/reset → +1, compaction → 0/+1) and >0.95-util victims
+    // are force-flushed, so the goal is reached; `processed < total_segments` is a
+    // safety backstop against a non-terminating loop.
+    const std::size_t free_goal =
+        free_pool.size() + (max_victims > 0 ? static_cast<std::size_t>(max_victims) : 0);
     int processed = 0;
     while (free_pool.size() <= 3 ||
-           (max_victims > 0 && processed < max_victims && free_pool.size() <= 10))
+           (max_victims > 0 && free_pool.size() < free_goal &&
+            processed < static_cast<int>(total_segments)))
     {
         /* eviction 후보 수집 */
         bool compact = false;
@@ -1340,6 +1685,7 @@ void LogCache::check_and_evict_if_needed(int max_victims)
         gc_victim_count++;
         gc_victim_valid_ratio_sum += (double)victim->valid_cnt / victim->blocks.size();
         if (victim->valid_cnt == 0) {
+            ++full_invalid_reset_count_;
             reset_segment(victim);
         }
         else if (compact == false) {
@@ -1359,6 +1705,50 @@ void LogCache::check_and_evict_if_needed(int max_victims)
             }
             // Ghost compaction cost estimation
             else {
+                // Track REAL victim's inv_rate (EWMA + raw last-fold) for ghost
+                // predictor validation. Mirrors what ghost reports in
+                // last_ghost_sum_inv_rate_/_lf_ — but for segments that actually
+                // get compacted (post-K_VAL choice). Diff in gsdec print gives
+                // mean inv_rate per real victim during the period.
+                {
+                    real_victim_inv_rate_cum_ += victim->invalidate_rate();
+                    // Raw rate over the JUST-CLOSED 1-seg window [seg_ago_ts,
+                    // prev_ts]. This matches the ghost-side window exactly: at
+                    // the boundary ghost reads [prev_ts, now] which is the
+                    // same closed segment. real-side must NOT use partial
+                    // [prev_ts, log_cache_timestamp] (variable 0~1 seg).
+                    double inv_rate_lf = 0.0;
+                    if (victim->invalidate_seg_ago_ts_ > 0 &&
+                        victim->invalidate_prev_ts_ > victim->invalidate_seg_ago_ts_) {
+                        const uint64_t dU = victim->invalidate_prev_count_ - victim->invalidate_seg_ago_count_;
+                        const uint64_t dH = victim->invalidate_prev_ts_ - victim->invalidate_seg_ago_ts_;
+                        inv_rate_lf = static_cast<double>(dU) / static_cast<double>(dH);
+                    }
+                    real_victim_inv_rate_lf_cum_ += inv_rate_lf;
+                    ++real_victim_compact_count_;
+                    // Age/u distribution — test fresh-victim hypothesis (user):
+                    //   host active = 2 segs, so each 1-seg period seals ~1 new
+                    //   segment. If real victims' age < 1 seg with low u, those
+                    //   weren't visible to ghost at predict time → over-pred.
+                    const uint64_t age =
+                        log_cache_timestamp - victim->create_timestamp;
+                    const double u = static_cast<double>(victim->valid_cnt) /
+                                     static_cast<double>(segment_size_blocks);
+                    real_victim_age_sum_ += age;
+                    real_victim_u_sum_   += u;
+                    if (age < segment_size_blocks) {
+                        ++real_victim_fresh_count_;
+                        real_victim_fresh_u_sum_ += u;
+                    }
+                    // Record create_timestamp of first 4 real victims this period
+                    // (since last gsdec print). Compare against last_ghost_picked_ts_.
+                    if (real_picked_idx_ < 4) {
+                        real_picked_ts_[real_picked_idx_] =
+                            static_cast<int64_t>(victim->create_timestamp);
+                        real_picked_u_[real_picked_idx_] = u;   // directly measured
+                        ++real_picked_idx_;
+                    }
+                }
                 if (is_ghost_cache && compactor) {
                     update_ghost_compacted_blocks(victim);       // GhostDelta_GC variants
                     // GS_SUM uses per-compact reassign; GS_SUM_Final uses tick-based
@@ -1591,8 +1981,12 @@ void LogCache::evict(LogCacheSegment::Block &blk) {
         if (it != mapping.end()) {
             record_lifetime(log_cache_timestamp - it->second.seg->blocks[it->second.idx].create_timestamp, false);
             record_inv_time(index_64k);
-            auto &other_blk = it->second.seg->blocks[it->second.idx];
+            auto* other_seg = it->second.seg;
+            auto &other_blk = other_seg->blocks[it->second.idx];
             other_blk.valid = false;
+            --other_seg->valid_cnt;   // collateral seg 의 valid_cnt 도 일관성 위해 깎음.
+            // note_invalidation() 은 호출 안 함 — cold-tier eviction 은 GC-driven 이라
+            // host overwrite (invalidate_count_) 의미와 다름.
             mapping.erase(index_64k);
             global_valid_blocks -= 1;
             evicted_blocks_per_evict += 1;
@@ -1668,6 +2062,32 @@ void LogCache::record_rewrite(long key)
     } else {
         rewrite_last_ts_[key] = log_cache_timestamp;
     }
+}
+
+void LogCache::init_age_prior(uint64_t bin_width)
+{
+    age_prior_bin_width_ = bin_width > 0 ? bin_width : 1;
+    age_prior_inv_count_.assign(AGE_PRIOR_BINS, 0);
+    age_prior_total_first_writes_ = 0;
+}
+
+void LogCache::print_age_prior()
+{
+    if (age_prior_total_first_writes_ == 0) return;
+    FILE* f = fopen("age_prior_histogram.csv", "w");
+    if (!f) return;
+    fprintf(f, "bin_idx,age_low,age_high,inv_count,frac\n");
+    for (size_t b = 0; b < AGE_PRIOR_BINS; ++b) {
+        const uint64_t lo = b * age_prior_bin_width_;
+        const uint64_t hi = (b + 1) * age_prior_bin_width_;
+        const double frac = static_cast<double>(age_prior_inv_count_[b])
+                          / static_cast<double>(age_prior_total_first_writes_);
+        fprintf(f, "%zu,%lu,%lu,%lu,%.6f\n",
+                b, lo, hi, age_prior_inv_count_[b], frac);
+    }
+    fclose(f);
+    printf("[AgePrior] %zu bins (width=%lu ticks/seg) total 1st-write invs=%lu → age_prior_histogram.csv\n",
+           AGE_PRIOR_BINS, age_prior_bin_width_, age_prior_total_first_writes_);
 }
 
 void LogCache::print_rewrite_results()

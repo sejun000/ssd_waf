@@ -42,9 +42,13 @@ public:
     size_t segment_count() const override { return heap_.size(); }
     uint64_t get_mth_score_valid_pages(double m) const override;
     uint64_t get_kth_segment_valid_cnt_for_free_segments(double m) const override;
-    GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments) const override;
+    GhostSumResult get_ghost_sum_for_free_segments(double target_free_segments,
+                                                    uint64_t now = 0) override;
+    VictimWtSpanResult get_victim_wt_span_for_free_segments(double target_free_segments) const override;
+    void for_each_victim_in_order(const std::function<bool(Segment*)>& fn) const override;
 private:
-    /* 실제 점수 계산: age/u  (u==0 → ∞) */
+    /* 실제 점수 계산: age/u  (u==0 → ∞)
+     * g_ghost_v_override >= 0 일 때는 그 값을 valid_cnt 대신 사용 (RESORT path). */
     inline double score(Segment* s) const {
         if (score_func) {
             return score_func(s);
@@ -53,8 +57,11 @@ private:
             throw std::runtime_error("logical_time is not set");
         }
         const uint64_t age = *logical_time - s->get_create_time();
-        if (s->valid_cnt == 0) return std::numeric_limits<double>::infinity();
-        const double u = static_cast<double>(s->valid_cnt) / pages_in_segment;
+        const double v_use = (g_ghost_v_override >= 0.0)
+                           ? g_ghost_v_override
+                           : static_cast<double>(s->valid_cnt);
+        if (v_use == 0.0) return std::numeric_limits<double>::infinity();
+        const double u = v_use / pages_in_segment;
         return age / (u + 0.00001); // 0.00001: 0로 나누는 것 방지
     }
     static constexpr int K_VALIDATE = 10;   // top‑k 재검증
