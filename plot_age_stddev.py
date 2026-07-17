@@ -5,25 +5,25 @@ import re
 
 inv_files = {
     'Greedy': 'LOG_GREEDY_80.inv_time_scatter.20260304_131034.csv',
-    'SepBIT': 'LOG_SEPBIT_FIFO.inv_time_scatter.20260304_124656.csv',
-    'REFlash': 'LOG_GREEDY_COST_BENEFIT_80.inv_time_scatter.20260304_111119.csv',
-    'REFlash-CB': 'LOG_GREEDY_COST_BENEFIT_COLD_80.inv_time_scatter.20260304_145254.csv',
+    'SepBIT': 'LOG_SEPBIT_FIFO.inv_time_scatter.20260607_032201.csv',
+    'REFlash': 'LOG_GREEDY_COST_BENEFIT_80.inv_time_scatter.20260607_032201.csv',
+    'REFlash-CB': 'LOG_GREEDY_COST_BENEFIT_COLD_80.inv_time_scatter.20260607_051822.csv',
     'MiDAS': 'MIDAS_CACHE.inv_time_scatter.20260304_140327.csv',
 }
 
 stat_files = {
     'Greedy': 'LOG_GREEDY_80.stat.log.20260304_131034',
-    'SepBIT': 'LOG_SEPBIT_FIFO.stat.log.20260304_124656',
-    'REFlash': 'LOG_GREEDY_COST_BENEFIT_80.stat.log.20260304_111119',
-    'REFlash-CB': 'LOG_GREEDY_COST_BENEFIT_COLD_80.stat.log.20260304_145254',
+    'SepBIT': 'LOG_SEPBIT_FIFO.stat.log.20260607_032201',
+    'REFlash': 'LOG_GREEDY_COST_BENEFIT_80.stat.log.20260607_032201',
+    'REFlash-CB': 'LOG_GREEDY_COST_BENEFIT_COLD_80.stat.log.20260607_051822',
     'MiDAS': 'MIDAS_CACHE.stat.log.20260304_140327',
 }
 
 # Separate config for GC-rewritten lifetime panel
 rewritten_stat_files = {
     'Greedy':     'LOG_GREEDY_80.stat.log.20260304_131034',
-    'REFlash-CB': 'LOG_GREEDY_COST_BENEFIT_COLD_80.stat.log.20260304_145254',
-    'REFlash':    'LOG_GREEDY_COST_BENEFIT_80.stat.log.20260304_111119',
+    'REFlash-CB': 'LOG_GREEDY_COST_BENEFIT_COLD_80.stat.log.20260607_051822',
+    'REFlash':    'LOG_GREEDY_COST_BENEFIT_80.stat.log.20260607_032201',
 }
 
 colors = {'Greedy': '#FFB07C', 'SepBIT': '#87CEAB', 'MiDAS': '#C4A8D8', 'REFlash-CB': 'tab:blue', 'REFlash': 'tab:red'}
@@ -79,6 +79,10 @@ plt.rcParams.update({'font.size': 22})
 labels_order = ['Greedy', 'SepBIT', 'MiDAS', 'REFlash-CB', 'REFlash']
 rewritten_order = list(rewritten_stat_files.keys())
 
+# Display-name overrides (internal dict keys stay the same for data lookup).
+DISPLAY = {'Greedy': 'CSAL+GC'}
+disp = lambda l: DISPLAY.get(l, l)
+
 fig, (ax_inv, ax_hist, ax_bar) = plt.subplots(1, 3, figsize=(21, 4.25),
                                                gridspec_kw={'width_ratios': [2, 2, 1.5]})
 
@@ -90,7 +94,7 @@ for label in labels_order:
     vals = np.sort(df['inv_time_stddev_tb'].values)
     cdf = np.arange(1, len(vals) + 1) / len(vals)
     vals = np.clip(vals, 0, 2.0)
-    ax_inv.plot(vals, cdf, color=colors[label], linewidth=2.5, label=label)
+    ax_inv.plot(vals, cdf, color=colors[label], linewidth=2.5, label=disp(label))
 
 ax_inv.set_xlim(0, 2.0)
 ax_inv.set_ylim(0, 1.0)
@@ -113,7 +117,7 @@ for label in rewritten_order:
     counts = [buckets[i] for i in indices]
     total = sum(buckets.values())
     cdf = np.cumsum(counts) / total
-    ax_hist.plot(x_tb, cdf, color=rewritten_colors[label], linewidth=2.5, label=label)
+    ax_hist.plot(x_tb, cdf, color=rewritten_colors[label], linewidth=2.5, label=disp(label))
 
 ax_hist.set_xlim(0, max_bucket * tb_per_bucket)
 ax_hist.set_ylim(0, 1.0)
@@ -126,7 +130,7 @@ ax_hist.grid(True, alpha=0.3)
 bar_order = ['Greedy', 'SepBIT', 'MiDAS', 'REFlash-CB', 'REFlash']
 gc_tb_vals = [gc_writes_blks[l] * BLK_TO_TB for l in bar_order]
 bar_colors = [colors[l] for l in bar_order]
-bars = ax_bar.bar(bar_order, gc_tb_vals, color=bar_colors, width=0.6, edgecolor='black', linewidth=1.2)
+bars = ax_bar.bar([disp(l) for l in bar_order], gc_tb_vals, color=bar_colors, width=0.6, edgecolor='black', linewidth=1.2)
 ax_bar.set_ylabel('GC Writes (TB)')
 for bar, val in zip(bars, gc_tb_vals):
     ax_bar.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.2,

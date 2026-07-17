@@ -89,6 +89,24 @@ LogCache::LogCache(uint64_t              cold_capacity,
     periodic_ratio_ = periodic_ratio;
     segment_size_blocks = cfg_.segment_bytes / blk_sz;
     g_segment_blocks = static_cast<double>(segment_size_blocks);
+
+    // Default EWMA/SMA half-life = 4 segment-lifetimes, derived from the ACTUAL
+    // segment size so the moving-average window scales when --segment_size shrinks
+    // segment_bytes (e.g. 6GB→384MB). At the default 6 GB this equals exactly
+    // DEFAULT_HALF_LIFE_IN_BLOCKS = (262144*6)*4, so default runs stay byte-identical.
+    // The init list seeded these ratios with that constant before segment_size_blocks
+    // was known; re-seed from the runtime segment size here. setMovingAverage() may
+    // later replace a subset with the same scaled fallback.
+    moving_avg_window_ = static_cast<double>(segment_size_blocks) * 4.0;
+    for (MovingAverageRatio* r : {
+            &compaction_ratio, &eviction_ratio, &eviction_ratio_in_ghost_cache,
+            &compaction_ratio_in_ghost_cache, &ghost_util_ratio,
+            &net_free_seg_ratio_, &gc_valid_pages_ratio_,
+            &flush_avg_ratio, &compact_avg_ratio, &flush_pred_ratio,
+            &flush_ghost_ratio, &gg_ratio, &ff_ratio, &gf_flush_ratio,
+            &lambda_ratio }) {
+        *r = MovingAverageRatio::FromHalfLifeBlocks(moving_avg_window_);
+    }
     total_segments = cache_block_count * blk_sz / cfg_.segment_bytes;
     total_cache_block_count = total_segments * segment_size_blocks;
     init_age_prior(segment_size_blocks);   // 1 seg-life per bin
@@ -382,7 +400,6 @@ void LogCache::update_ghost_compacted_blocks_sum_cum() {
         last_ghost_picked_u_[k]  = s.picked_u[k];
     }
     last_ghost_m_frac_ = s.m;
-    last_ghost_resort_max_wt_ = s.max_picked_wt;   // 0 if RESORT off
     if (s.cum_invalid > 0.0) {
         ghost_compacted_blocks_sum_ += s.cum_valid;
         ghost_sum_initialized_       = true;
@@ -820,22 +837,15 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             double invrate_sum = 0.0;
             if (compactor) {
                 vspan = compactor->get_victim_wt_span_for_free_segments(vic_target_free);
-                // RESORT-aware: use the corrected-pick-set's max wt when active
-                // (last_ghost_resort_max_wt_ > 0), else fall back to vspan.max_wt
-                // computed from the original-score iteration.
-                const uint64_t wt_hi = (last_ghost_resort_max_wt_ > 0)
-                                       ? last_ghost_resort_max_wt_ : vspan.max_wt;
-                invrate_sum = sum_invalidate_rate_in_wt_range(wt_hi);
-                // Subtract the picked victims' own inv_rates: those segments
-                // will be GC'd (cost already in G_ud); only the NON-picked segs
-                // in the wt range forecast the LF-vs-GS eviction-saving.
-                invrate_sum -= last_ghost_sum_inv_rate_;
-                if (invrate_sum < 0.0) invrate_sum = 0.0;
+                // Full per-seg invalidate-rate mass over the WT ≤ v band (v = newest
+                // seg GC must touch to free util_step_·N). No victim subtraction and
+                // no RESORT pick-set: plain Σ invalidate_rate up to vspan.max_wt.
+                invrate_sum = sum_invalidate_rate_in_wt_range(vspan.max_wt);
             }
             const double lambda = lambda_ratio.has_value() ? lambda_ratio.value() : 0.0;
             (void)lambda;  // kept for the `lambda` log column only (no longer in the rule)
-            const double lhs    = Gud;                           // GC copy cost / host page
-            const double rhs    = invrate_sum * periodic_ratio_; // invrate·r / host page
+            const double lhs    = Gud;                                   // GC copy cost / host page
+            const double rhs    = invrate_sum * periodic_ratio_ * waf_w; // invrate·r·qlc_waf / host page
             bool         raise  = (lhs < rhs);
             // Marginal cols kept for logging only (not used by the λ-rule).
             const double GG    = gg_ratio.has_value()       ? gg_ratio.value()       : 0.0;
@@ -843,8 +853,13 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             const double Fv    = gf_flush_ratio.has_value() ? gf_flush_ratio.value() : 0.0;
             const double Gnext = GG  - Gud;
             const double Fnext = FFv - Fv;
-            // (anti-stuck cap removed: decision is now purely Gud < invrate_sum·r,
-            //  no forced flush after N consecutive RAISEs.)
+            // Anti-stuck cap (one-directional, LOWER→RAISE only): 15 consecutive
+            //   LOWER → force 1 RAISE. Breaks mid under-retention where the rule
+            //   sticks in flush from an inflated Gud (real victim u≈0.09 but ghost
+            //   Gud≈5.78). RAISE→LOWER leg intentionally omitted — we don't want to
+            //   force a flush while retaining. Workaround until Gud is corrected.
+            // if (!raise && consec_lower_ >= 15) raise = true;   // CAP TEMP-OFF (no-cap mid r864 재현/연장용; cap 실험 시 주석 해제)
+            consec_lower_ = raise ? 0 : (consec_lower_ + 1);
             const double cur_util = (total_cache_block_count > 0)
                                   ? (double)global_valid_blocks / total_cache_block_count : 0.0;
             const double prev_target = target_valid_blk_rate;
@@ -856,6 +871,12 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
                 target_valid_blk_rate = std::min(valid_blk_rate_hard_limit, raw_target);
             } else {
                 target_valid_blk_rate = std::max(0.0, raw_target);
+            }
+            // LOGFIFO_AFTER_6TiB hook: once warmup host write reached, force LOG_FIFO
+            // behaviour (no compaction) by pinning target_valid_blk_rate at 0.
+            if (fifo_after_warmup_pages_ > 0 &&
+                log_cache_timestamp >= fifo_after_warmup_pages_) {
+                target_valid_blk_rate = 0.0;
             }
 
             const double compact_avg = compact_avg_ratio.has_value()
@@ -1647,8 +1668,8 @@ void LogCache::check_and_evict_if_needed(int max_victims)
         free_pool.size() + (max_victims > 0 ? static_cast<std::size_t>(max_victims) : 0);
     int processed = 0;
     while (free_pool.size() <= 3 ||
-           (max_victims > 0 && free_pool.size() < free_goal &&
-            processed < static_cast<int>(total_segments)))
+           (max_victims > 0 && 
+            processed < static_cast<int>(max_victims)))
     {
         /* eviction 후보 수집 */
         bool compact = false;

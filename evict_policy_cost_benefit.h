@@ -64,7 +64,7 @@ private:
         const double u = v_use / pages_in_segment;
         return age / (u + 0.00001); // 0.00001: 0로 나누는 것 방지
     }
-    static constexpr int K_VALIDATE = 10;   // top‑k 재검증
+    static constexpr int K_VALIDATE = 50;   // top‑k 재검증 (victim selection + Gud re-sort 공용)
     CBHeap heap_;
     double (*score_func)(Segment* );
     std::unordered_map<Segment*, CBHeap::handle_type> h_;

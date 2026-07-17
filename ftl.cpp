@@ -176,8 +176,7 @@ u64 PageMappingFTL::GetOrAllocateGCActiveBlock(int streamId) {
 
 u64 PageMappingFTL::AllocateNewActiveBlock(int streamId) {
     while (freePool_.size() < GC_TRIGGER_THRESHOLD) {
-        std::size_t before = freePool_.size();
-        RunGC();
+        if (!RunGC()) break;   // no victim / all-valid: GC can't reclaim -> avoid infinite spin + log flood
     }
     if (freePool_.empty()) {
         printf("Out of space even after GC (active)\n");
@@ -222,9 +221,11 @@ bool PageMappingFTL::RunGC() {
         return false;
     }
     if (victim->valid_cnt == PAGES_PER_BLOCK) {
-        // No reclaimable space (all valid). Avoid spinning forever.
-        printf("GC victim %llu is full (%zu valid); no space can be reclaimed. Need TRIM/OP.\n",
-               (unsigned long long)victimId, victim->valid_cnt);
+        // No reclaimable space (all valid). Avoid spinning forever + log flood.
+        static uint64_t full_warn_ = 0;
+        if ((full_warn_++ & 0xFFFFFFull) == 0)
+            printf("GC victim %llu is full (%zu valid); no space can be reclaimed. Need TRIM/OP. (occurrence %llu)\n",
+                   (unsigned long long)victimId, victim->valid_cnt, (unsigned long long)full_warn_);
         return false;
     }
     // Allocate destination (spare) block

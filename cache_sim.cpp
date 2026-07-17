@@ -231,6 +231,14 @@ int main(int argc, char* argv[]) {
     std::string moving_avg_type = "ewma";
     double moving_avg_window = 0.0;   // 0 → use LogCache default
     int gs_decision_period_segs = 8;  // GS-only knob; auto-derives util_step + ghost shadow size
+    uint64_t segment_size = 0;        // LogCache segment size in bytes; 0 → built-in default (6 GB)
+    // --- synthetic cold-injection + cold-device prefill (all default OFF → 기존 동작 동일) ---
+    long long seq_inject_period   = 0;     // >0: inject 1 synthetic write per N trace writes (needs --remap_lba)
+    double    seq_inject_frac     = 0.10;  // synthetic write size = ceil_4k(frac * sum of those N trace writes' bytes)
+    long long seq_inject_warmup_bytes = 0; // gate: start injection only after this many host(cache) write bytes (0 = from t=0). lets the trace fill cold first, then background seq writes kick in.
+    double    cold_reserve_frac   = 0.10;  // reserve [0, frac*cold_capacity) for the synthetic round-robin region
+    long long cold_reserve_bytes  = 0;     // >0: absolute reserve size in bytes (overrides cold_reserve_frac)
+    bool      prefill_cold_device = false; // pre-fill the reserve region [0,reserve) via cache before main loop
     bool cache_trace = false;
     bool no_fill = true;
     uint64_t cold_capacity = 0;
@@ -278,6 +286,8 @@ int main(int argc, char* argv[]) {
             moving_avg_window = std::stod(argv[++i]);
         } else if (arg == "--gs_decision_period_segs" && i + 1 < argc) {
             gs_decision_period_segs = std::stoi(argv[++i]);
+        } else if (arg == "--segment_size" && i + 1 < argc) {
+            segment_size = std::stoull(argv[++i]);
         } else if (arg == "--cache_write_size_limit" && i + 1 < argc) {
             CACHE_WRITE_SIZE_LIMIT = std::stoull(argv[++i]);
             PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
@@ -289,6 +299,18 @@ int main(int argc, char* argv[]) {
             loop_trace = true;
         } else if (arg == "--min_trace_loops" && i + 1 < argc) {
             min_trace_loops = std::stoll(argv[++i]);
+        } else if (arg == "--seq_inject_period" && i + 1 < argc) {
+            seq_inject_period = std::stoll(argv[++i]);
+        } else if (arg == "--seq_inject_frac" && i + 1 < argc) {
+            seq_inject_frac = std::stod(argv[++i]);
+        } else if (arg == "--seq_inject_warmup_bytes" && i + 1 < argc) {
+            seq_inject_warmup_bytes = std::stoll(argv[++i]);
+        } else if (arg == "--cold_reserve_frac" && i + 1 < argc) {
+            cold_reserve_frac = std::stod(argv[++i]);
+        } else if (arg == "--cold_reserve_bytes" && i + 1 < argc) {
+            cold_reserve_bytes = std::stoll(argv[++i]);
+        } else if (arg == "--prefill_cold_device") {
+            prefill_cold_device = true;
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -311,18 +333,29 @@ int main(int argc, char* argv[]) {
     printf("moving_avg_type = %s\n", moving_avg_type.c_str());
     printf("moving_avg_window = %.0f blocks\n", moving_avg_window);
     printf("gs_decision_period_segs = %d\n", gs_decision_period_segs);
+    printf("segment_size = %lu bytes%s\n", segment_size, segment_size == 0 ? " (default 6 GB)" : "");
     printf("cache_write_size_limit = %lu bytes (%.2f TB)\n", CACHE_WRITE_SIZE_LIMIT, CACHE_WRITE_SIZE_LIMIT / (1024.0 * 1024.0 * 1024.0 * 1024.0));
     printf("remap_lba = %s\n", remap_lba ? "enabled (4K sequential allocation)" : "disabled");
     printf("cold_write_size_limit = %lu bytes (%.2f TB) %s\n", COLD_WRITE_SIZE_LIMIT, COLD_WRITE_SIZE_LIMIT / (1024.0 * 1024.0 * 1024.0 * 1024.0), COLD_WRITE_SIZE_LIMIT == 0 ? "[disabled]" : "");
     printf("loop_trace = %s\n", loop_trace ? "enabled" : "disabled");
     printf("min_trace_loops = %lld (cold_write_size_limit honored only after this many full passes)\n", min_trace_loops);
     printf("prefill = %s\n", no_fill ? "disabled" : "enabled");
+    printf("seq_inject_period = %lld %s\n", seq_inject_period, seq_inject_period > 0 ? "(synthetic cold injection ON)" : "(off)");
+    if (seq_inject_period > 0) {
+        printf("seq_inject_frac = %.4f, cold_reserve_frac = %.4f, cold_reserve_bytes = %lld\n",
+               seq_inject_frac, cold_reserve_frac, cold_reserve_bytes);
+        printf("seq_inject_warmup_bytes = %lld (%.2f TB) %s\n",
+               seq_inject_warmup_bytes,
+               seq_inject_warmup_bytes / (1024.0*1024.0*1024.0*1024.0),
+               seq_inject_warmup_bytes > 0 ? "[trace fills cold first; injection ON after this]" : "[injection from t=0]");
+    }
+    printf("prefill_cold_device = %s\n", prefill_cold_device ? "enabled" : "disabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
-    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio, util_step, moving_avg_type, moving_avg_window, gs_decision_period_segs));
+    std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio, util_step, moving_avg_type, moving_avg_window, gs_decision_period_segs, segment_size));
 
     if (!no_fill) {
         std::cout << "[prefill] start: trace=" << trace_file
@@ -330,6 +363,54 @@ int main(int argc, char* argv[]) {
                   << ", block_size=" << block_size << std::endl;
         // Prefill using trace until limit; uses same parser to avoid dup parsing logic differences.
         trace_prefill(*cache, trace_file, *parser, CACHE_WRITE_SIZE_LIMIT, block_size, cold_capacity);
+    }
+
+    // Reserved synthetic-injection region [0, R); R=0 when injection off.
+    // Trace remap addresses then start at R so the two streams never collide.
+    uint64_t inject_reserve_bytes = 0;
+    if (seq_inject_period > 0) {
+        inject_reserve_bytes = (cold_reserve_bytes > 0)
+            ? static_cast<uint64_t>(cold_reserve_bytes)                                  // absolute (e.g. 2.5 TB)
+            : static_cast<uint64_t>(cold_reserve_frac * static_cast<double>(cold_capacity)); // fraction
+        inject_reserve_bytes = (inject_reserve_bytes / block_size) * block_size; // 4K-align
+        if (inject_reserve_bytes < (uint64_t)block_size) inject_reserve_bytes = block_size;
+        printf("[seq_inject] reserve = [0, %llu) bytes (%.1f GB); trace remap starts at %llu\n",
+               (unsigned long long)inject_reserve_bytes, inject_reserve_bytes / 1e9,
+               (unsigned long long)inject_reserve_bytes);
+    }
+
+    // --prefill_cold_device: fill the synthetic reserve region [0, reserve) via the
+    // cache (cache fills then evicts to cold) so the cold dataset is warm from t=0.
+    // We MUST NOT fill the whole device: an all-unique fill makes every NAND block
+    // 100% valid, so once freePool < GC_TRIGGER_THRESHOLD the cold FTL GC can never
+    // reclaim and ftl.cpp:RunGC livelocks (see diagnosis). Warming only the reserve
+    // keeps free blocks, and the later round-robin injection overwrites this region
+    // -> invalid pages -> GC stays productive.
+    if (prefill_cold_device) {
+        uint64_t prefill_end = (inject_reserve_bytes > 0)
+                               ? inject_reserve_bytes                                  // injection on -> warm reserve
+                               : static_cast<uint64_t>(0.80 * static_cast<double>(cold_capacity)); // off -> 80%
+        const uint64_t gc_headroom = 64ull * 1024 * 1024 * 1024; // keep >=64 GB (~10 NAND blocks) free for GC
+        uint64_t pf_cap = (cold_capacity > gc_headroom) ? (cold_capacity - gc_headroom) : (cold_capacity / 2);
+        if (prefill_end > pf_cap) {
+            printf("[prefill_cold] clamping prefill %.1f GB -> %.1f GB (leaving %.0f GB GC headroom)\n",
+                   prefill_end / 1e9, pf_cap / 1e9, gc_headroom / 1e9);
+            prefill_end = pf_cap;
+        }
+        prefill_end = (prefill_end / block_size) * block_size; // 4K-align
+        std::cout << "[prefill_cold] filling [0, " << prefill_end << ") bytes (" << (prefill_end >> 30)
+                  << " GB) via cache; cold_capacity " << (cold_capacity >> 30) << " GB ..." << std::endl;
+        const uint64_t pf_chunk = 1ull * 1024 * 1024; // 1 MB per issue_op call
+        uint64_t pf_next_log = prefill_end / 20;       // ~5% steps
+        for (uint64_t off = 0; off < prefill_end; off += pf_chunk) {
+            uint64_t sz = std::min<uint64_t>(pf_chunk, prefill_end - off);
+            issue_op_to_cache(*cache, static_cast<long long>(off), static_cast<int>(sz), OP_TYPE::WRITE);
+            if (off >= pf_next_log) {
+                std::cout << "[prefill_cold] " << (off >> 30) << " / " << (prefill_end >> 30) << " GB" << std::endl;
+                pf_next_log += prefill_end / 20;
+            }
+        }
+        std::cout << "[prefill_cold] done (reserve region warmed)" << std::endl;
     }
 
     // 통계 변수 초기화
@@ -340,7 +421,7 @@ int main(int argc, char* argv[]) {
 
     // --remap_lba: 4K-aligned trace LBA → sequential mapped LBA
     std::unordered_map<long long, long long> lba_remap;
-    long long next_remap_lba = 0;
+    long long next_remap_lba = static_cast<long long>(inject_reserve_bytes);  // start above reserved [0,R)
     auto issue_remapped = [&](long long off, long long sz, OP_TYPE op) {
         if (!remap_lba) {
             issue_op_to_cache(*cache, off, static_cast<int>(sz), op);
@@ -373,6 +454,13 @@ int main(int argc, char* argv[]) {
     long long line_count = 0;
     const long long line_count_limit = 270000000000000000ULL;
     long long trace_loops = 0;
+    // synthetic cold-injection state (active only when --seq_inject_period > 0)
+    long long inject_count        = 0;   // trace writes issued since last injection
+    long long inject_accum_bytes  = 0;   // sum of those writes' bytes
+    long long inject_seq_ptr      = 0;   // round-robin pointer within [0, inject_reserve_bytes)
+    long long synthetic_write_bytes = 0; // total synthetic bytes issued (for logging)
+    bool seq_inject_started = false;     // one-time latch: logs when warmup gate opens
+    const long long SYN_MAX_BYTES = 1ll << 30; // safety cap per synthetic write (fits int)
 
     while (line_count < line_count_limit) {
         if (!std::getline(infile, line)) {
@@ -434,6 +522,32 @@ int main(int argc, char* argv[]) {
             //}
             if (policy == "all" || policy == "write-only") {
                 issue_remapped(parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
+                // synthetic cold injection: every seq_inject_period trace writes,
+                // emit 1 sequential round-robin write into reserved [0, inject_reserve_bytes).
+                if (seq_inject_period > 0 && inject_reserve_bytes > 0
+                    && (uint64_t)cache_write_size >= (uint64_t)seq_inject_warmup_bytes) {
+                    if (!seq_inject_started) {
+                        seq_inject_started = true;
+                        printf("[seq_inject] warmup %.2f TB host writes reached -> background seq injection ON\n",
+                               cache_write_size / (1024.0*1024.0*1024.0*1024.0));
+                    }
+                    inject_count++;
+                    inject_accum_bytes += parsed.lba_size;
+                    if (inject_count >= seq_inject_period) {
+                        long long syn = static_cast<long long>(seq_inject_frac * static_cast<double>(inject_accum_bytes));
+                        syn = ((syn + block_size - 1) / block_size) * block_size; // ceil to block (4K)
+                        if (syn < block_size) syn = block_size;
+                        if (syn > SYN_MAX_BYTES) syn = SYN_MAX_BYTES;
+                        if ((uint64_t)syn > inject_reserve_bytes) syn = static_cast<long long>(inject_reserve_bytes);
+                        if (inject_seq_ptr + syn > (long long)inject_reserve_bytes) inject_seq_ptr = 0; // wrap
+                        issue_op_to_cache(*cache, inject_seq_ptr, static_cast<int>(syn), OP_TYPE::WRITE);
+                        inject_seq_ptr += syn;
+                        if (inject_seq_ptr >= (long long)inject_reserve_bytes) inject_seq_ptr = 0;
+                        synthetic_write_bytes += syn;
+                        inject_count = 0;
+                        inject_accum_bytes = 0;
+                    }
+                }
             }
             if (policy == "write-only") {
              //   cache->print_cache_trace(parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
@@ -449,6 +563,11 @@ int main(int argc, char* argv[]) {
     if (remap_lba) {
         printf("[wss] FINAL next_remap_lba = %lld bytes (%.2f GB), unique_4k_blocks = %zu, trace_loops = %lld\n",
                next_remap_lba, next_remap_lba / (1024.0*1024.0*1024.0), lba_remap.size(), trace_loops);
+    }
+    if (seq_inject_period > 0) {
+        printf("[seq_inject] total synthetic = %lld bytes (%.2f GB); period=%lld frac=%.3f reserve=%llu B\n",
+               synthetic_write_bytes, synthetic_write_bytes / 1e9, seq_inject_period, seq_inject_frac,
+               (unsigned long long)inject_reserve_bytes);
     }
     cache->print_stats();
     return 0;

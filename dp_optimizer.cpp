@@ -314,14 +314,18 @@ int main(int argc, char** argv) {
     // ---- Phase 6: DP ----
     vector<vector<double>> DP(T, vector<double>(K, INF));
     vector<vector<int>> parent(T, vector<int>(K, -1));
-    // Force start at the lowest valid grid at t=0 (lowest reachable U_B boundary).
-    int start_k = -1;
+    // Free start: any reachable grid bin at t=0 can be the starting point.
+    int start_min = -1, start_max = -1;
     for (size_t k = 0; k < K; ++k) {
-        if (cost[k][0] < INF * 0.5) { start_k = (int)k; break; }
+        if (cost[k][0] < INF * 0.5) {
+            DP[0][k] = cost[k][0];
+            if (start_min < 0) start_min = (int)k;
+            start_max = (int)k;
+        }
     }
-    if (start_k >= 0) DP[0][start_k] = cost[start_k][0];
-    cerr << "Start anchor: k=" << start_k
-         << ", c=" << (start_k >= 0 ? grid[start_k] : -1.0) << "\n";
+    cerr << "Free start range: k=[" << start_min << "," << start_max << "]"
+         << ", c=[" << (start_min >= 0 ? grid[start_min] : -1.0) << ","
+         << (start_max >= 0 ? grid[start_max] : -1.0) << "]\n";
     for (size_t t = 1; t < T; ++t) {
         int max_d = max_step_bins[t];
         for (size_t k = 0; k < K; ++k) {

@@ -92,14 +92,15 @@ ax2.annotate('Sweet spot',
 lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
 ax1.legend(lines1 + lines2, labels1 + labels2,
-           loc='lower center', bbox_to_anchor=(0.5, 1.0), ncol=3,
+           loc='lower center', bbox_to_anchor=(0.5, 0.97), ncol=3,
            frameon=False, fontsize=26)
 
 ax1.grid(True, alpha=0.3, color='black', linestyle='--')
 ax1.set_axisbelow(True)
 
 plt.tight_layout()
-plt.savefig('/home/sejun000/ssd_waf/A_dp_writes_plot2.pdf', dpi=150)
+plt.savefig('/home/sejun000/ssd_waf/A_dp_writes_plot2.pdf', dpi=150,
+            bbox_inches='tight', pad_inches=0.02)
 print("Saved to A_dp_writes_plot2.pdf")
 
 min_idx = normalized_tec.index(min(normalized_tec))

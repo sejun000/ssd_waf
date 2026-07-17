@@ -239,7 +239,9 @@ private:
     bool is_ghost_cache = false;
     uint64_t bypass_blocks_threshold = 128; // 128* 4k bytes = 512K bytes
     double util_step_ = 0.02;  // ghost cache size factor + GC anchor step (per-policy override)
+    int consec_lower_ = 0;     // anti-stuck cap: consecutive LOWER run → force 1 RAISE after 15 (mid LOWER-stuck)
     int    gs_decision_period_segs_ = 8;  // GS hill-climb decision period (in segments)
+    uint64_t fifo_after_warmup_pages_ = 0;  // > 0 → force target=0 once host write reaches this many pages
     EwmaRatio compaction_ratio;
     EwmaRatio eviction_ratio;
     EwmaRatio eviction_ratio_in_ghost_cache;
@@ -289,10 +291,6 @@ private:
     // Reset on each gsdec print of real-side. Lets us see if ghost set ⊂ real
     // set or vice versa.
     int64_t last_ghost_picked_ts_[4] = { -1, -1, -1, -1 };
-    // RESORT-mode cohort boundary: max create_timestamp among RESORT picks
-    // (mirrors vspan.max_wt but reflects the corrected-score pick set).
-    // 0 = not populated (RESORT disabled) → fall back to vspan.max_wt.
-    uint64_t last_ghost_resort_max_wt_ = 0;
     int64_t real_picked_ts_[4]       = { -1, -1, -1, -1 };
     int     real_picked_idx_         = 0;
     // u at scan time (ghost) / execute time (real) for the same 4 picks each.
@@ -536,6 +534,7 @@ public:
     void setGhostReanchorStep(double s) { ghost_reanchor_step_ = s; }
     void setUtilStep(double s) { util_step_ = s; }  // post-ctor; ghost_cache size already fixed
     double getUtilStep() const { return util_step_; }
+    void setFifoAfterWarmupPages(uint64_t p) { fifo_after_warmup_pages_ = p; }
     // Replace all moving-average ratios with the given (type, window_blocks).
     // Must be called BEFORE first periodic() update for samples to be consistent.
     // AUTO-mode hooks (no-ops unless GhostDelta_GC_AUTO is selected).
@@ -543,7 +542,9 @@ public:
     void setAutotuneCsv(const std::string& path) { autotune_csv_path_ = path; }
 
     void setMovingAverage(const std::string& type, double window_blocks) {
-        if (window_blocks <= 0.0) window_blocks = (double)DEFAULT_HALF_LIFE_IN_BLOCKS;
+        // Fallback half-life scales with the actual segment size (4 segment-lifetimes).
+        // At the default 6 GB segment this == DEFAULT_HALF_LIFE_IN_BLOCKS = (262144*6)*4.
+        if (window_blocks <= 0.0) window_blocks = static_cast<double>(segment_size_blocks) * 4.0;
         moving_avg_type_ = type;
         moving_avg_window_ = window_blocks;
         compaction_ratio                = MovingAverageRatio::Make(type, window_blocks);
