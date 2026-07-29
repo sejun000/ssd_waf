@@ -61,6 +61,9 @@ public:
     void set_start_ts(const std::string& ts) { start_ts_ = ts; }
     const std::string& start_ts() const { return start_ts_; }
     void rename_stat_log(const std::string& new_name);
+    // CSAL-like mode: the cache layer does NOT send trim/deallocate to the
+    // backend FTL; stale cold copies stay valid until re-evicted (overwrite).
+    void set_cold_trim_enabled(bool on) { cold_trim_enabled_ = on; }
     PageMappingFTL ftl;
     long long write_size_to_cache;
     long long evicted_blocks;
@@ -77,6 +80,7 @@ public:
 protected:
     std::string stats_prefix_;
     std::string start_ts_;
+    bool cold_trim_enabled_ = true;
 };
 
 ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88, double util_step = 0.02, const std::string& moving_avg_type = "ewma", double moving_avg_window = 0.0, int gs_decision_period_segs = 8, uint64_t segment_bytes = 0);

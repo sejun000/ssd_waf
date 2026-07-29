@@ -821,7 +821,7 @@ void ICache::_evict_one_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type
 }
 
 void ICache::_invalidate_cold_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type) {
-    if (op_type == OP_TYPE::TRIM) {
+    if (op_type == OP_TYPE::TRIM && cold_trim_enabled_) {
         ftl.Trim(lba_offset, lba_size);
     }
 }

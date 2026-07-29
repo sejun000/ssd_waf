@@ -236,6 +236,7 @@ int main(int argc, char* argv[]) {
     long long seq_inject_period   = 0;     // >0: inject 1 synthetic write per N trace writes (needs --remap_lba)
     double    seq_inject_frac     = 0.10;  // synthetic write size = ceil_4k(frac * sum of those N trace writes' bytes)
     long long seq_inject_warmup_bytes = 0; // gate: start injection only after this many host(cache) write bytes (0 = from t=0). lets the trace fill cold first, then background seq writes kick in.
+    bool no_cold_trim = false;             // CSAL-like: cache layer sends no trim to backend FTL; stale cold copies die only on re-evict overwrite
     double    cold_reserve_frac   = 0.10;  // reserve [0, frac*cold_capacity) for the synthetic round-robin region
     long long cold_reserve_bytes  = 0;     // >0: absolute reserve size in bytes (overrides cold_reserve_frac)
     bool      prefill_cold_device = false; // pre-fill the reserve region [0,reserve) via cache before main loop
@@ -311,6 +312,8 @@ int main(int argc, char* argv[]) {
             cold_reserve_bytes = std::stoll(argv[++i]);
         } else if (arg == "--prefill_cold_device") {
             prefill_cold_device = true;
+        } else if (arg == "--no_cold_trim") {
+            no_cold_trim = true;
         }
         else {
             std::cerr << "Unknown argument: " << arg << std::endl;
@@ -356,6 +359,10 @@ int main(int argc, char* argv[]) {
     long max_cache_blocks = cache_size / block_size;
     printf("max_cache_blocks = %ld\n", max_cache_blocks);
     std::unique_ptr<ICache> cache(createCache(cache_policy, max_cache_blocks, cold_capacity, block_size, cache_trace, cache_trace_output, cold_trace_output, waf_log_file, valid_ratio, stat_log_file, periodic_ratio, util_step, moving_avg_type, moving_avg_window, gs_decision_period_segs, segment_size));
+    if (no_cold_trim) {
+        cache->set_cold_trim_enabled(false);
+        printf("no_cold_trim = ON (backend FTL gets no trim; invalidation only via re-evict overwrite)\n");
+    }
 
     if (!no_fill) {
         std::cout << "[prefill] start: trace=" << trace_file
