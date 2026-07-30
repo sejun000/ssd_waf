@@ -214,6 +214,11 @@ void LogCache::invalidate(long key, int lba_sz) {
             record_inv_time(key);
             if (loc.seg->full()){
                 evict_policy_update(loc.seg);
+                // Mirror DOGI Manager::Append: only count invalidations on
+                // already-sealed segments toward the cumulative GP numerator.
+                if (dogi_gc_trigger_) {
+                    ++dogi_total_sealed_invalid_blocks_;
+                }
             }
         }
         else{
@@ -238,6 +243,14 @@ void LogCache::evict_policy_add(LogCacheSegment *s) {
     evictor->add(s, log_cache_timestamp);
     if (compactor) {
         compactor->add(s, log_cache_timestamp);
+    }
+    if (dogi_gc_trigger_) {
+        dogi_total_sealed_blocks_ += segment_size_blocks;
+        // Per DOGI Manager::Append: at seal time, accumulate the segment's
+        // already-invalidated blocks (rewrites within this segment).
+        uint64_t seg_invalid_at_seal = (s->blocks.size() > s->valid_cnt)
+            ? (s->blocks.size() - (uint64_t)s->valid_cnt) : 0;
+        dogi_total_sealed_invalid_blocks_ += seg_invalid_at_seal;
     }
 }
 
@@ -1561,11 +1574,15 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
         assert(loc.idx < loc.seg->blocks.size());
         if (loc.seg->blocks[loc.idx].valid)
         {
-            previous_blk_create_timestamp = loc.seg->blocks[loc.idx].create_timestamp;
+            // DOGI mode: use the SEGMENT's creation timestamp (like DOGI
+            // Manager::GetSegmentAge), matching its 8-bit counter semantics.
+            previous_blk_create_timestamp = dogi_keep_seg_timestamp_
+                ? loc.seg->create_timestamp
+                : loc.seg->blocks[loc.idx].create_timestamp;
         }
     }
     int stream_id = stream_policy->Classify(key, gc, log_cache_timestamp, previous_blk_create_timestamp);
-    assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
+    assert (!gc || dogi_share_active_segments_ || stream_id >= Segment::GC_STREAM_START);
 
     // Cycle wrap detected → dummy fill old active GC segments before reuse
     if (gc) {
@@ -1582,7 +1599,7 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
 
     std::unordered_map<int, LogCacheSegment*>*  active_table = &active_seg;
     if (gc) {
-        active_table = &gc_active_seg;
+        active_table = dogi_share_active_segments_ ? &active_seg : &gc_active_seg;
     }
     auto it_stream = active_table->find(stream_id);
     if (it_stream == active_table->end())
@@ -1591,16 +1608,25 @@ LogCacheSegment* LogCache::get_segment_with_stream_policy(bool gc, uint64_t key,
             return nullptr;
         }
         seg = alloc_segment(!gc);
-        seg->class_num = stream_id; // stream id로 class num 설정
-        seg->create_timestamp = log_cache_timestamp; // 초기화
-        (*active_table)[stream_id] = seg;
-        if (gc) ++gc_active_alloc_count_;
+        // alloc_segment may have triggered GC which (in dogi_share_active_segments
+        // mode) populated active_seg[stream_id] with an evict_and_compaction
+        // target. If so, return our fresh seg to free_pool and reuse the GC's.
+        auto reit = active_table->find(stream_id);
+        if (reit != active_table->end()) {
+            free_pool.push_front(seg);
+            seg = reit->second;
+        } else {
+            seg->class_num = stream_id; // stream id로 class num 설정
+            seg->create_timestamp = log_cache_timestamp; // 초기화
+            (*active_table)[stream_id] = seg;
+            if (gc) ++gc_active_alloc_count_;
+        }
     }
     else
     {
         seg = it_stream->second;
-        assert (!gc || (gc && stream_id >= Segment::GC_STREAM_START));
-        assert (!gc || (gc && seg->get_class_num() >= Segment::GC_STREAM_START));
+        assert (!gc || dogi_share_active_segments_ || stream_id >= Segment::GC_STREAM_START);
+        assert (!gc || dogi_share_active_segments_ || seg->get_class_num() >= Segment::GC_STREAM_START);
     }
     return seg;
 }
@@ -1610,9 +1636,9 @@ LogCacheSegment* LogCache::get_segment_to_active_stream(bool gc, int stream_id, 
     LogCacheSegment *seg = nullptr;
     std::unordered_map<int, LogCacheSegment*>*  active_table = &active_seg;
     if (gc) {
-        active_table = &gc_active_seg;
-        if (stream_id < Segment::GC_STREAM_START) {
-            stream_id += Segment::GC_STREAM_START; 
+        active_table = dogi_share_active_segments_ ? &active_seg : &gc_active_seg;
+        if (!dogi_share_active_segments_ && stream_id < Segment::GC_STREAM_START) {
+            stream_id += Segment::GC_STREAM_START;
         }
     }
     auto it_stream = active_table->find(stream_id);
@@ -1622,10 +1648,19 @@ LogCacheSegment* LogCache::get_segment_to_active_stream(bool gc, int stream_id, 
             return nullptr;
         }
         seg = alloc_segment(!gc);
-        seg->class_num = stream_id; // stream id로 class num 설정
-        seg->create_timestamp = log_cache_timestamp; // 초기화
-        (*active_table)[stream_id] = seg;
-        if (gc) ++gc_active_alloc_count_;
+        // GC inside alloc_segment may have populated active_seg[stream_id]
+        // (dogi_share_active_segments path); if so, prefer that seg over the
+        // freshly allocated one to avoid orphaning the GC target.
+        auto reit = active_table->find(stream_id);
+        if (reit != active_table->end()) {
+            free_pool.push_front(seg);
+            seg = reit->second;
+        } else {
+            seg->class_num = stream_id; // stream id로 class num 설정
+            seg->create_timestamp = log_cache_timestamp; // 초기화
+            (*active_table)[stream_id] = seg;
+            if (gc) ++gc_active_alloc_count_;
+        }
     }
     else
     {
@@ -1667,9 +1702,26 @@ void LogCache::check_and_evict_if_needed(int max_victims)
     const std::size_t free_goal =
         free_pool.size() + (max_victims > 0 ? static_cast<std::size_t>(max_victims) : 0);
     int processed = 0;
-    while (free_pool.size() <= 3 ||
-           (max_victims > 0 && 
-            processed < static_cast<int>(max_victims)))
+    auto should_gc = [&]() -> bool {
+        if (dogi_gc_trigger_) {
+            // Nothing sealed to collect (all segments free or open-active):
+            // GC cannot make progress — let host writes seal segments first.
+            if (evictor->empty()) return false;
+            // Emergency: ran out of free segments, must reclaim something.
+            if (free_pool.size() <= 3) return true;
+            // Standalone DOGI Manager::GetGp(): inv / total over CURRENTLY
+            // sealed segments (both counters are decremented when a segment is
+            // collected — reset_segment). Empty denominator → GP = 0.
+            if (dogi_total_sealed_blocks_ == 0) return false;
+            double gp = (double)dogi_total_sealed_invalid_blocks_ /
+                        (double)dogi_total_sealed_blocks_;
+            return gp >= dogi_gc_threshold_;
+        }
+        return free_pool.size() <= 3 ||
+               (max_victims > 0 &&
+                processed < static_cast<int>(max_victims));
+    };
+    while (should_gc())
     {
         /* eviction 후보 수집 */
         bool compact = false;
@@ -1687,12 +1739,20 @@ void LogCache::check_and_evict_if_needed(int max_victims)
             compact = false;
         }
 
-        LogCacheSegment* victim = nullptr; 
+        LogCacheSegment* victim = nullptr;
         if (compact == true){
-            victim = (LogCacheSegment *)evictor->choose_segment();
-            threshold = log_cache_timestamp - victim->create_timestamp + 1;
-            g_threshold = threshold;
-            evictor->add(victim, log_cache_timestamp);
+            if (dogi_gc_trigger_) {
+                // DOGI collection = pure GcAppend relocation. threshold=0 turns
+                // off evict_and_compaction's age-based flush split — GC-appended
+                // blocks keep old create_timestamps, so the REFLASH-style split
+                // would leak every compacted-once block to the cold tier.
+                threshold = 0;
+            } else {
+                victim = (LogCacheSegment *)evictor->choose_segment();
+                threshold = log_cache_timestamp - victim->create_timestamp + 1;
+                g_threshold = threshold;
+                evictor->add(victim, log_cache_timestamp);
+            }
             victim = (LogCacheSegment *)compactor->choose_segment();
         }
         else {
@@ -1715,7 +1775,11 @@ void LogCache::check_and_evict_if_needed(int max_victims)
             evict_segment(victim);
         }
         else if (compact == true) {
-            if (victim->valid_cnt > 0.95 * segment_size_blocks) {
+            // DOGI: expired class-0 victims are ~full-valid BY DESIGN (age
+            // cascade / frozen filter relocates them to colder groups) — the
+            // REFLASH "pointless to compact >0.95-valid, flush instead" flip
+            // would leak exactly those segments to the cold tier.
+            if (!dogi_gc_trigger_ && victim->valid_cnt > 0.95 * segment_size_blocks) {
                 g_ex_high_valid_victim_count++;
                 compact = false;
                 compactor->add(victim, log_cache_timestamp);
@@ -1827,6 +1891,17 @@ bool LogCache::is_cache_filled() {
 
 void LogCache::reset_segment(LogCacheSegment* s)
 {
+    /* DOGI GP: a collected sealed segment leaves both GP counters
+     * (Manager::RemoveSegment — GP is over currently-sealed segments).
+     * Must run before valid_cnt/write_ptr are cleared below. */
+    if (dogi_gc_trigger_ && s->full()) {
+        const uint64_t inv = (s->blocks.size() > (uint64_t)s->valid_cnt)
+                           ? (s->blocks.size() - (uint64_t)s->valid_cnt) : 0;
+        dogi_total_sealed_blocks_ -=
+            std::min(dogi_total_sealed_blocks_, (uint64_t)s->blocks.size());
+        dogi_total_sealed_invalid_blocks_ -=
+            std::min(dogi_total_sealed_invalid_blocks_, inv);
+    }
        // erase old segment
     s->valid_cnt = 0;
     s->write_ptr = 0;
@@ -1886,19 +1961,25 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
         if (stream_policy) {
             target_seg = get_segment_with_stream_policy(true, blk.key);
         }
-        assert(target_seg->class_num >= Segment::GC_STREAM_START || !stream_policy);
+        assert(target_seg->class_num >= Segment::GC_STREAM_START || !stream_policy ||
+               dogi_share_active_segments_);
         if (target_seg->full())                 // segment 소진 -> 새 seg
         {
-            // add previous segment count 
+            // add previous segment count
             evict_policy_add(target_seg);
             int assigned_class_num = target_seg->get_class_num();
             assert(assigned_class_num >= 0);
-            gc_active_seg.erase(target_seg->get_class_num());
+            if (dogi_share_active_segments_) {
+                active_seg.erase(target_seg->get_class_num());
+            } else {
+                gc_active_seg.erase(target_seg->get_class_num());
+            }
             target_seg = get_segment_to_active_stream(true, assigned_class_num);
         }
         assert(target_seg != s);
-        // get p2L index
-        if (target_seg->create_timestamp > blk.create_timestamp) {
+        // DOGI mode: keep segment's original creation timestamp (like DOGI
+        // Manager). Default: pull segment timestamp to oldest block (legacy).
+        if (!dogi_keep_seg_timestamp_ && target_seg->create_timestamp > blk.create_timestamp) {
             target_seg->create_timestamp = blk.create_timestamp;
         }
 
@@ -1920,6 +2001,18 @@ Segment* LogCache::evict_and_compaction(LogCacheSegment* s, uint64_t threshold, 
         blk.valid = false;
     }
     assert((target_seg == nullptr && compacted_blocks_for_victim == 0) || target_seg);
+    // dogi_share_active_segments: if the very last block fit exactly into
+    // target_seg, the loop's top-of-iter full() check never ran, leaving a full
+    // but-still-active segment in active_seg where the HOST path could find it.
+    // Seal it now. (Non-dogi policies keep the legacy lazy handling.)
+    if (dogi_share_active_segments_ && target_seg && target_seg->full()) {
+        evict_policy_add(target_seg);
+        int target_class = target_seg->get_class_num();
+        auto ait = active_seg.find(target_class);
+        if (ait != active_seg.end() && ait->second == target_seg) {
+            active_seg.erase(ait);
+        }
+    }
     /*if (target_seg) {
         printf("Compaction and Evict: %lu blocks moved from segment %p to segment %p, free_pool_size %ld, valid ratio %.4f age %lu target_seg_write_ptr %lu target_create_timestamp %lu threshold %lu stream_id %d\n", 
         s->valid_cnt, s, target_seg, free_pool.size(), global_valid_blocks / (float)total_cache_block_count, log_cache_timestamp - s->create_timestamp, target_seg->write_ptr, s->create_timestamp, threshold, target_seg->get_class_num());
@@ -2006,6 +2099,10 @@ void LogCache::evict(LogCacheSegment::Block &blk) {
             auto &other_blk = other_seg->blocks[it->second.idx];
             other_blk.valid = false;
             --other_seg->valid_cnt;   // collateral seg 의 valid_cnt 도 일관성 위해 깎음.
+            // DOGI GP: sealed seg 의 block 무효화 → 분자 +1 (invalidate() 의
+            // full() 경로와 동일 규칙; active seg 는 seal 시점에 일괄 반영됨).
+            if (dogi_gc_trigger_ && other_seg->full())
+                ++dogi_total_sealed_invalid_blocks_;
             // note_invalidation() 은 호출 안 함 — cold-tier eviction 은 GC-driven 이라
             // host overwrite (invalidate_count_) 의미와 다름.
             mapping.erase(index_64k);
@@ -2309,6 +2406,17 @@ void LogCache::print_stats() {
                 cand_segs[1], g_n[1], g_mre[1], g_rmse[1], g_sn[1], g_smre[1], g_srmse[1], g_pmean[1], g_rmean[1], f_n[1], f_mre[1], f_rmse[1], f_sn[1], f_smre[1], f_srmse[1], f_pmean[1], f_rmean[1],
                 cand_segs[2], g_n[2], g_mre[2], g_rmse[2], g_sn[2], g_smre[2], g_srmse[2], g_pmean[2], g_rmean[2], f_n[2], f_mre[2], f_rmse[2], f_sn[2], f_smre[2], f_srmse[2], f_pmean[2], f_rmean[2]);
         fflush(fp_stats);
+        if (dogi_gc_trigger_) {   // DOGI GP time series + GC exception-path counters
+            const double gp = dogi_total_sealed_blocks_
+                ? (double)dogi_total_sealed_invalid_blocks_ / (double)dogi_total_sealed_blocks_
+                : 0.0;
+            printf("[dogi] gp=%.4f sealed_blks=%lu inv_blks=%lu free=%zu valid=%lu "
+                   "force_flush=%lu high_valid=%lu satisfied=%lu victims=%lu\n",
+                   gp, dogi_total_sealed_blocks_, dogi_total_sealed_invalid_blocks_,
+                   free_pool.size(), global_valid_blocks,
+                   g_ex_force_flush_count, g_ex_high_valid_victim_count,
+                   g_ex_target_satisfied_count, gc_victim_count);
+        }
         next_written_bytes += written_window_bytes;
     }
 }

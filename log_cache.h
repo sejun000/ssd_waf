@@ -207,6 +207,22 @@ private:
     uint64_t total_capacity_bytes = 0;
     uint64_t log_cache_timestamp = 0; // per 4kB block
     IStream *stream_policy = nullptr;
+
+    /* DOGI (FAST'26) standalone-Manager emulation knobs (read_cache port) ***/
+    bool dogi_gc_trigger_ = false;         // invalid-ratio (GP) based GC trigger
+    bool dogi_keep_seg_timestamp_ = false; // segment keeps its own create ts; Classify sees segment age
+    bool dogi_share_active_segments_ = false; // host/gc writes share logical-group open segments
+    double dogi_gc_threshold_ = 0.12;
+    uint64_t dogi_total_sealed_blocks_ = 0;
+    uint64_t dogi_total_sealed_invalid_blocks_ = 0;
+public:
+    void setDogiGcMode(bool trigger, double threshold = 0.12) {
+        dogi_gc_trigger_ = trigger;
+        dogi_gc_threshold_ = threshold;
+    }
+    void setDogiKeepSegTimestamp(bool on) { dogi_keep_seg_timestamp_ = on; }
+    void setDogiShareActiveSegments(bool on) { dogi_share_active_segments_ = on; }
+private:
     uint64_t global_valid_blocks = 0;
     uint64_t compacted_blocks = 0;
     uint64_t invalidate_blocks = 0;

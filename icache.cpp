@@ -16,6 +16,7 @@
 #include "evict_policy_multiqueue.h"
 #include "evict_policy_midas.h"
 #include "istream.h"
+#include "dogi_stream.h"
 #include <cassert>
 #include <string>
 #include <algorithm> 
@@ -41,6 +42,10 @@ double score_age(Segment *seg) {
 
 uint64_t g_threshold = 0;
 uint64_t g_timestamp = 0;
+
+// DOGI expired-first victim selection: hot-group BIR (blocks). Matches the
+// read_cache port: BIR[0] = hotThreshold(2) * kSegmentBlocks(98304).
+uint64_t g_dogi_hot_bir = 2 * 98304;
 
 // Score functions for CbEvictPolicy (same as icache.cpp)
 /*static double score_age_evict(Segment *seg) {
@@ -129,6 +134,30 @@ static double score_cold_first(Segment *seg) {
     if (u < 0.0001) u = 0.0001;
     // Cold-first: higher score for segments with larger age (older)
     return sqrt(g_timestamp - seg->create_timestamp) * (1 - u) / u;
+}
+
+// DOGI expired-first score (read_cache port):
+// 1) expired hot segments (class 0, age > BIR) are highest priority
+// 2) young hot segments are protected from GC selection
+// 3) everything else uses cost-benefit, matching DogiSelect more closely
+static double score_dogi_expired_first(Segment *seg) {
+    double segment_size = static_cast<double>(reinterpret_cast<LogCacheSegment*>(seg)->blocks.size());
+    double u = seg->valid_cnt / segment_size;
+    uint64_t age = g_timestamp > 0 ? (g_timestamp - seg->create_timestamp) : 0;
+
+    // Hot group (class_num 0): expired if age > BIR → highest priority
+    if (seg->class_num == 0 && age > g_dogi_hot_bir) {
+        return 1e18 + static_cast<double>(age);  // huge base + age tiebreak
+    }
+    // Standalone DogiSelect does not even consider young hot segments as victims.
+    if (seg->class_num == 0) {
+        return -1e18;
+    }
+
+    // All other segments: cost-benefit like DogiSelect
+    if (u < 0.0001) u = 0.0001;
+    double gp = 1.0 - u;  // invalid ratio
+    return gp / (1.0 - gp) * sqrt(static_cast<double>(age));
 }
 
 static double score_sepbit_age(Segment *seg) {
@@ -533,6 +562,25 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         lc->setGsDecisionPeriodSegs(1);
         lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM_Final);
         lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
+    else if (cache_type == "LOG_DOGI_HEURISTIC_88") {
+        // DOGI (FAST'26) heuristic-only baseline, ported from read_cache branch:
+        // hot filter + GC age cascade + frozen filter via DogiStream, GP-based
+        // GC trigger, shared host/GC open segments, expired-first victim score.
+        auto *dogi_stream = new DogiStream(/*num_gc_streams=*/6);
+        // Warmup: match DOGI standalone pass_time_blocks = logical_device_blocks
+        // LogicalSizeGb ~ capacity / (1+OP); pass_time_blocks = logical_bytes / 4096
+        uint64_t logical_bytes = static_cast<uint64_t>(capacity * cache_block_size / 1.13636);
+        dogi_stream->setPassTimeBlocks(logical_bytes / 4096);
+        IStream *input_stream_policy = dogi_stream;
+        auto *lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            lc_cfg, input_stream_policy, 0.88, std::make_unique<CbEvictPolicy>(score_dogi_expired_first),
+            0, false, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setDogiGcMode(true, 0.12);
+        lc->setDogiKeepSegTimestamp(true);
+        lc->setDogiShareActiveSegments(true);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
     else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GS_REPLAY") {
