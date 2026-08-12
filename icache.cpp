@@ -1,5 +1,6 @@
 #include "icache.h"
 #include "lru_cache.h"
+#include "lru_set_cache.h"
 #include "fifo_cache.h"
 #include "log_fifo_cache.h"
 #include "no_cache.h"
@@ -280,6 +281,10 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
         // "LRU.stat.log.<sec>" and concurrent hi/mid runs clobber each other).
         return attach_prefix(new LRUCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file), cache_type, start_ts, !stat_log_file.empty());
     }
+    else if (cache_type == "LRU_32WAY") {
+        // OpenCAS-like set-associative LRU: 32 ways per set, per-set eviction.
+        return attach_prefix(new LRUSetCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file, stat_log_file, 32), cache_type, start_ts, !stat_log_file.empty());
+    }
     else if (cache_type == "FIFO") {
         return attach_prefix(new FIFOCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file, cold_trace_file, waf_log_file), cache_type, start_ts);
     }
@@ -526,6 +531,17 @@ ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacit
             lc_cfg, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
         lc->setGsDecisionPeriodSegs(gs_decision_period_segs);  // BEFORE setPeriodicMode (which uses this to derive θ).
         lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM);
+        lc->setMovingAverage(moving_avg_type, moving_avg_window);
+        return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
+    }
+    else if (cache_type == "LOG_GREEDY_COST_BENEFIT_10_GS_VICTIM") {
+        // GS_FINAL 과 완전히 동일한 구성 — LHS 만 실제 compaction victim 비용 EWMA.
+        IStream *input_stream_policy = createIstreamPolicy("multi_hotcold_3");
+        auto* lc = new LogCache(cold_capacity, capacity, cache_block_size, _cache_trace, trace_file,
+            cold_trace_file, waf_log_file, std::make_unique<CbEvictPolicy>(score_age_evict),
+            lc_cfg, input_stream_policy, 0.5, std::make_unique<CbEvictPolicy>(score_warm_first), 0, true, stat_log_file, 0, 0, 0, periodic_ratio, util_step);
+        lc->setGsDecisionPeriodSegs(gs_decision_period_segs);
+        lc->setPeriodicMode(PeriodicMode::GhostDelta_GC_SUM_Victim);
         lc->setMovingAverage(moving_avg_type, moving_avg_window);
         return attach_prefix(lc, cache_type, start_ts, !stat_log_file.empty());
     }
