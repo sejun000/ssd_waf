@@ -43,6 +43,10 @@ enum class PeriodicMode {
     GhostDelta_GC_SUM,  // G(u+θ) via cumulative CB-sorted scan: m s.t. Σ(seg-v_i)=θ·N·seg
     GhostDelta_GC_SUM_Replay, // Replay: load gsdec.log, force target = log.cur_util[i] + util_step_
     GhostDelta_GC_SUM_Final,  // cum_valid accumulator + LHS=r·waf·δ + RHS=Gud−Gu
+    GhostDelta_GC_SUM_Victim, // GS_FINAL 과 동일하되 LHS 를 ghost 추정 Gud 대신
+                              // 실제 compaction victim 의 최근 비용 v/(1−v) EWMA 로 대체.
+                              // (ghost Gud 는 p25 1.07~p90 12.11 로 널뛰는데 실제 victim
+                              //  비용은 1.8 근처로 안정적 → 결정 노이즈 제거 + 과대평가 해소)
 };
 
 class LogCache final : public ICache
@@ -233,6 +237,10 @@ private:
     uint64_t evicted_segment_age = 0;
     uint64_t gc_victim_count = 0;
     double gc_victim_valid_ratio_sum = 0.0;
+    // GhostDelta_GC_SUM_Victim 의 LHS: 실제 compaction victim 의 GC 복사 비용
+    //   v/(1−v) (= 1페이지 확보당 복사 페이지 수, ghost Gud 와 같은 단위) 을
+    //   per-seg invalidate_rate 와 같은 고정-α EWMA (α=0.1) 로 평활.
+    Ewma compaction_victim_cost_ewma_{Segment::INVAL_RATE_ALPHA};
     uint64_t dummy_fill_segment_count = 0;
 
     double target_valid_blk_rate = 0.0; // ratio of write to QLC
@@ -531,7 +539,8 @@ public:
         periodic_mode_ = m;
         if ((m == PeriodicMode::GhostDelta_GC_SUM ||
              m == PeriodicMode::GhostDelta_GC_SUM_Replay ||
-             m == PeriodicMode::GhostDelta_GC_SUM_Final) &&
+             m == PeriodicMode::GhostDelta_GC_SUM_Final ||
+             m == PeriodicMode::GhostDelta_GC_SUM_Victim) &&
             total_cache_block_count > 0 && segment_size_blocks > 0) {
             util_step_ = static_cast<double>(segment_size_blocks * gs_decision_period_segs_)
                        / static_cast<double>(total_cache_block_count);

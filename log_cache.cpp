@@ -293,8 +293,9 @@ void LogCache::periodic() {
     } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM_Replay) {
         periodic_ghost_delta_gc_sum_replay();
         periodic_gs_predict_track();    // keep tracker active so stats columns stay populated
-    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM_Final) {
-        periodic_ghost_delta_gc_sum_final();
+    } else if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM_Final ||
+               periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM_Victim) {
+        periodic_ghost_delta_gc_sum_final();   // Victim 모드는 같은 함수에서 LHS 만 교체
     } else {
         periodic_ghost_delta();
     }
@@ -857,7 +858,15 @@ void LogCache::periodic_ghost_delta_gc_sum_final() {
             }
             const double lambda = lambda_ratio.has_value() ? lambda_ratio.value() : 0.0;
             (void)lambda;  // kept for the `lambda` log column only (no longer in the rule)
-            const double lhs    = Gud;                                   // GC copy cost / host page
+            // LHS = GC copy cost per freed page. GS_FINAL 은 ghost 시뮬 추정(Gud)을
+            //   쓰는데 이는 p25 1.07 ~ p90 12.11 로 널뛰고 (u→1 꼬리에서 발산) 평균이
+            //   실제보다 ~3배 크다. Victim 모드는 컴팩터가 실제로 고른 victim 의
+            //   v/(1−v) EWMA 를 쓴다 — RHS 가 이미 실제 victim 밴드 기준이라 정의역도 맞음.
+            double lhs = Gud;                                            // GC copy cost / host page
+            if (periodic_mode_ == PeriodicMode::GhostDelta_GC_SUM_Victim &&
+                compaction_victim_cost_ewma_.has_value()) {
+                lhs = compaction_victim_cost_ewma_.value();
+            }
             const double rhs    = invrate_sum * periodic_ratio_ * waf_w; // invrate·r·qlc_waf / host page
             bool         raise  = (lhs < rhs);
             // Marginal cols kept for logging only (not used by the λ-rule).
@@ -1765,6 +1774,14 @@ void LogCache::check_and_evict_if_needed(int max_victims)
         assert (victim != nullptr);
         gc_victim_count++;
         gc_victim_valid_ratio_sum += (double)victim->valid_cnt / victim->blocks.size();
+        if (compact) {
+            // Compaction victim 만 집계 (eviction victim 은 GC 복사 비용이 아님).
+            // cost = v/(1−v) = 1페이지 확보당 복사 페이지 수 (ghost Gud 와 동일 단위).
+            // v→1 발산은 클램프 — ghost 가 겪던 꼬리 폭발을 재현하지 않기 위함.
+            const double denom = (double)victim->blocks.size();
+            const double v = (denom > 0.0) ? (double)victim->valid_cnt / denom : 0.0;
+            compaction_victim_cost_ewma_.update((v < 0.99) ? v / (1.0 - v) : 99.0);
+        }
         if (victim->valid_cnt == 0) {
             ++full_invalid_reset_count_;
             reset_segment(victim);
