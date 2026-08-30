@@ -72,6 +72,10 @@ public:
     void PrintStats() const;
     u64 GetHostWritePages();
     u64 GetNandWritePages();
+    // Zero the host/NAND write counters. Used after a direct backend prefill so
+    // the prefill traffic doesn't land in the measured WAF (the prefill stands in
+    // for data that was already there before the experiment started).
+    void ResetWriteCounters() { host_write_pages = 0; nand_write_pages = 0; }
 
 private:
     // helpers

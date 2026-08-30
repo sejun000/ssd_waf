@@ -240,11 +240,14 @@ int main(int argc, char* argv[]) {
     double    cold_reserve_frac   = 0.10;  // reserve [0, frac*cold_capacity) for the synthetic round-robin region
     long long cold_reserve_bytes  = 0;     // >0: absolute reserve size in bytes (overrides cold_reserve_frac)
     bool      prefill_cold_device = false; // pre-fill the reserve region [0,reserve) via cache before main loop
+    bool      prefill_cold_direct = false; // pre-fill [0,reserve) straight into the backend FTL (cache bypassed)
     bool cache_trace = false;
     bool no_fill = true;
     uint64_t cold_capacity = 0;
     int lba_scale = 1;
     bool remap_lba = false;
+    int  cold_oracle_streams = 0;          // >0: oracle death-time cold placement (needs --remap_lba)
+    uint64_t trace_page_clock = 0;         // host write pages seen from the trace (inject excluded)
     bool loop_trace = false;
     long long min_trace_loops = 0;
 
@@ -294,6 +297,8 @@ int main(int argc, char* argv[]) {
             PREFILL_LOG_INTERVAL   = CACHE_WRITE_SIZE_LIMIT / 100;
         } else if (arg == "--remap_lba") {
             remap_lba = true;
+        } else if (arg == "--cold_oracle_streams" && i + 1 < argc) {
+            cold_oracle_streams = std::stoi(argv[++i]);
         } else if (arg == "--cold_write_size_limit" && i + 1 < argc) {
             COLD_WRITE_SIZE_LIMIT = std::stoull(argv[++i]);
         } else if (arg == "--loop_trace") {
@@ -312,6 +317,8 @@ int main(int argc, char* argv[]) {
             cold_reserve_bytes = std::stoll(argv[++i]);
         } else if (arg == "--prefill_cold_device") {
             prefill_cold_device = true;
+        } else if (arg == "--prefill_cold_direct") {
+            prefill_cold_direct = true;
         } else if (arg == "--no_cold_trim") {
             no_cold_trim = true;
         }
@@ -353,6 +360,7 @@ int main(int argc, char* argv[]) {
                seq_inject_warmup_bytes > 0 ? "[trace fills cold first; injection ON after this]" : "[injection from t=0]");
     }
     printf("prefill_cold_device = %s\n", prefill_cold_device ? "enabled" : "disabled");
+    printf("prefill_cold_direct = %s\n", prefill_cold_direct ? "enabled (backend FTL, cache bypassed)" : "disabled");
     assert (cold_capacity > 0);
     // Factory 함수를 이용해 적절한 TraceParser 생성
     ITraceParser* parser = createTraceParser(trace_format);
@@ -375,7 +383,7 @@ int main(int argc, char* argv[]) {
     // Reserved synthetic-injection region [0, R); R=0 when injection off.
     // Trace remap addresses then start at R so the two streams never collide.
     uint64_t inject_reserve_bytes = 0;
-    if (seq_inject_period > 0) {
+    if (seq_inject_period > 0 || prefill_cold_direct) {
         inject_reserve_bytes = (cold_reserve_bytes > 0)
             ? static_cast<uint64_t>(cold_reserve_bytes)                                  // absolute (e.g. 2.5 TB)
             : static_cast<uint64_t>(cold_reserve_frac * static_cast<double>(cold_capacity)); // fraction
@@ -384,6 +392,29 @@ int main(int argc, char* argv[]) {
         printf("[seq_inject] reserve = [0, %llu) bytes (%.1f GB); trace remap starts at %llu\n",
                (unsigned long long)inject_reserve_bytes, inject_reserve_bytes / 1e9,
                (unsigned long long)inject_reserve_bytes);
+    }
+
+    // --prefill_cold_direct: write [0, reserve) straight into the backend FTL,
+    // bypassing the cache entirely — it stands for data that was already resident
+    // on the capacity tier before the experiment (another tenant, older dataset).
+    // Unlike --prefill_cold_device this never touches the cache, so the compactor
+    // heap and the hill-climb state start clean. The region is the same reserve
+    // the trace remap skips, so trace LBAs can never collide with it.
+    // Counters are zeroed afterwards: the prefill is initial state, not traffic.
+    // NOTE: this data is never rewritten, so its NAND blocks stay 100% valid and
+    // GC never picks them — size it so prefill + trace-resident + GC headroom fit.
+    if (prefill_cold_direct) {
+        const uint64_t pf_chunk = 1ull << 20;   // 1 MB per FTL write
+        printf("[prefill_direct] writing [0, %.1f GB) straight to the backend FTL "
+               "(cold_capacity %.1f GB)\n",
+               inject_reserve_bytes / 1e9, cold_capacity / 1e9);
+        for (uint64_t off = 0; off < inject_reserve_bytes; off += pf_chunk) {
+            const uint64_t sz = std::min<uint64_t>(pf_chunk, inject_reserve_bytes - off);
+            cache->ftl.Write(off, sz, 0);
+        }
+        cache->ftl.ResetWriteCounters();
+        printf("[prefill_direct] done (%.1f%% of the device is now static data)\n",
+               100.0 * inject_reserve_bytes / static_cast<double>(cold_capacity));
     }
 
     // --prefill_cold_device: fill the synthetic reserve region [0, reserve) via the
@@ -418,6 +449,25 @@ int main(int argc, char* argv[]) {
             }
         }
         std::cout << "[prefill_cold] done (reserve region warmed)" << std::endl;
+    }
+
+    // --cold_oracle_streams K: build the death-time index (one extra scan of the
+    // trace) and hand it to the cache so cold writes get steered by remaining
+    // lifetime. Requires --remap_lba: the index is keyed by the same dense,
+    // first-touch block ids the remap allocates.
+    OracleLifetime cold_oracle;
+    if (cold_oracle_streams > 0) {
+        if (!remap_lba) {
+            std::cerr << "--cold_oracle_streams requires --remap_lba" << std::endl;
+            return 1;
+        }
+        printf("[oracle] building death-time index (K=%d)...\n", cold_oracle_streams);
+        if (!cold_oracle.Build(trace_file, trace_format, block_size, loop_trace)) {
+            std::cerr << "[oracle] index build failed" << std::endl;
+            return 1;
+        }
+        cache->set_cold_oracle(&cold_oracle, cold_oracle_streams,
+                               inject_reserve_bytes, (uint64_t)block_size);
     }
 
     // 통계 변수 초기화
@@ -528,6 +578,13 @@ int main(int argc, char* argv[]) {
                 cold_tier_write_size = block_size * evicted_blocks;
             //}
             if (policy == "all" || policy == "write-only") {
+                // Oracle clock: trace write pages only (inject excluded), the unit
+                // OracleLifetime's index is built in. Advanced BEFORE the write so
+                // "next write strictly after now" excludes this very write.
+                if (cold_oracle_streams > 0) {
+                    trace_page_clock += (parsed.lba_size + block_size - 1) / block_size;
+                    cache->set_trace_page_clock(trace_page_clock);
+                }
                 issue_remapped(parsed.lba_offset, parsed.lba_size, OP_TYPE::WRITE);
                 // synthetic cold injection: every seq_inject_period trace writes,
                 // emit 1 sequential round-robin write into reserved [0, inject_reserve_bytes).

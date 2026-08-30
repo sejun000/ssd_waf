@@ -12,6 +12,7 @@
 #include <string>
 #include <iostream>
 #include "ftl.h"
+#include "oracle_lifetime.h"
 #include "common.h"
 
 struct CacheEntry {
@@ -64,6 +65,21 @@ public:
     // CSAL-like mode: the cache layer does NOT send trim/deallocate to the
     // backend FTL; stale cold copies stay valid until re-evicted (overwrite).
     void set_cold_trim_enabled(bool on) { cold_trim_enabled_ = on; }
+    // Oracle death-time placement (experiment A): when set, cold writes are
+    // steered to one of `streams` backend streams by the block's remaining
+    // lifetime (= host pages until the next write to it, which is exactly when
+    // its cold copy gets trimmed). Off → every cold write keeps using stream 0.
+    // `reserve` is the synthetic seq-inject region [0, reserve): those blocks
+    // are rewritten round-robin with a fixed, uniformly long period, so they go
+    // to the coldest stream (which is also where they belong).
+    void set_cold_oracle(const OracleLifetime* o, int streams, uint64_t reserve,
+                         uint64_t block_size) {
+        cold_oracle_ = o; cold_oracle_streams_ = streams;
+        cold_oracle_reserve_ = reserve; cold_oracle_block_ = block_size;
+    }
+    // Host-write clock in trace pages (inject excluded) — same unit the oracle
+    // index is built in. Advanced by the replay loop.
+    void set_trace_page_clock(uint64_t p) { trace_page_clock_ = p; }
     PageMappingFTL ftl;
     long long write_size_to_cache;
     long long evicted_blocks;
@@ -78,9 +94,18 @@ public:
     FILE *fp_stats = nullptr;
     FILE *fp_object = nullptr;
 protected:
+    // Bin the block's remaining lifetime into [0, streams) — 0 = dies soonest.
+    // Log-spaced so the bins stay meaningful across the 4-orders-of-magnitude
+    // lifetime spread; blocks with no future write land in the coldest bin.
+    int cold_oracle_stream_for(uint64_t lba_offset) const;
     std::string stats_prefix_;
     std::string start_ts_;
     bool cold_trim_enabled_ = true;
+    const OracleLifetime* cold_oracle_ = nullptr;
+    int      cold_oracle_streams_ = 0;
+    uint64_t cold_oracle_reserve_ = 0;
+    uint64_t cold_oracle_block_   = 4096;
+    uint64_t trace_page_clock_    = 0;
 };
 
 ICache* createCache(std::string cache_type, long capacity, uint64_t cold_capacity, int cache_block_size, bool _cache_trace, const std::string &trace_file, const std::string &cold_trace_file, std::string &waf_log_file, double valid_rate_threshold = 0.0, std::string stat_log_file = "", double periodic_ratio = 2.88, double util_step = 0.02, const std::string& moving_avg_type = "ewma", double moving_avg_window = 0.0, int gs_decision_period_segs = 8, uint64_t segment_bytes = 0);

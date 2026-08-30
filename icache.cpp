@@ -870,10 +870,27 @@ void ICache::rename_stat_log(const std::string& new_name) {
     }
 }
 
+int ICache::cold_oracle_stream_for(uint64_t lba_offset) const {
+    const int K = cold_oracle_streams_;
+    if (!cold_oracle_ || !cold_oracle_->enabled() || K <= 1) return 0;
+    // seq-inject reserve region: fixed round-robin period, uniformly long-lived.
+    if (lba_offset < cold_oracle_reserve_) return K - 1;
+    const uint64_t id  = (lba_offset - cold_oracle_reserve_) / cold_oracle_block_;
+    const uint64_t nxt = cold_oracle_->NextWriteTime(id, trace_page_clock_);
+    if (nxt == OracleLifetime::kNever || nxt <= trace_page_clock_) return K - 1;
+    const uint64_t rem = nxt - trace_page_clock_;
+    // Log2 bins one cache-fill wide at the bottom (1 GiB of host writes), so bin
+    // 0 = "dies within a cache fill" up to bin K-1 = "outlives everything".
+    const uint64_t base = (1ull << 18);              // 262144 pages = 1 GiB
+    int bin = 0;
+    for (uint64_t th = base; bin < K - 1 && rem >= th; th <<= 2) ++bin;
+    return bin;
+}
+
 void ICache::_evict_one_block(uint64_t lba_offset, int lba_size, OP_TYPE op_type) {
-    if (op_type == OP_TYPE::WRITE) { 
+    if (op_type == OP_TYPE::WRITE) {
         //printf("Evicting block at offset: %lu, size: %d\n", lba_offset, lba_size);
-        ftl.Write(lba_offset, lba_size, 0); // 0은 stream ID로 가정
+        ftl.Write(lba_offset, lba_size, cold_oracle_stream_for(lba_offset));
     }
     if (write_size_to_cache > next_write_size_to_cache) {
         next_write_size_to_cache += TEN_GB;
